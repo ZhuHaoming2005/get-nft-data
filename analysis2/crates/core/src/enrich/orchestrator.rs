@@ -17,7 +17,7 @@ use super::legit_detect;
 use super::mint_payment;
 use super::opensea;
 use super::types::{
-    ApiKeys, EvidenceBundle, EvidenceStatus, HttpLimits, SaleEvent, TransferEvent, day_bucket,
+    ApiKeys, EvidenceBundle, EvidenceStatus, HttpLimits, SaleEvent, TransferEvent,
     finalize_legit_signals,
 };
 use super::value_flow;
@@ -35,6 +35,19 @@ pub async fn enrich_candidates(
     limits: &HttpLimits,
     progress: &dyn ProgressObserver,
 ) -> Result<AHashMap<ContractId, EvidenceBundle>, Analysis2Error> {
+    enrich_candidates_with_hook(registry, store, keys, limits, progress, None).await
+}
+
+/// Like [`enrich_candidates`], but invokes `on_bundle` after each candidate is
+/// finalized (for incremental disk checkpoints).
+pub async fn enrich_candidates_with_hook(
+    registry: &CandidateRegistry,
+    store: &ResidentStore,
+    keys: &ApiKeys,
+    limits: &HttpLimits,
+    progress: &dyn ProgressObserver,
+    mut on_bundle: Option<&mut dyn FnMut(&EvidenceBundle) -> Result<(), Analysis2Error>>,
+) -> Result<AHashMap<ContractId, EvidenceBundle>, Analysis2Error> {
     let client = HttpClient::with_retries(limits.concurrency.max(1), limits.retries)?;
     progress.set_stage("enrich_legit");
     let preflight =
@@ -42,6 +55,17 @@ pub async fn enrich_candidates(
             .await?;
     let candidates = preflight.candidates_to_enrich;
     let mut out = preflight.evidence;
+    let enrich_set: ahash::AHashSet<ContractId> = candidates.iter().copied().collect();
+
+    // Persist legit-only preflight rows immediately so a cancel mid-HTTP still
+    // keeps relation_legit for fully-legit candidates that skip deep enrich.
+    if let Some(cb) = on_bundle.as_mut() {
+        for (&cid, bundle) in &out {
+            if !enrich_set.contains(&cid) {
+                cb(bundle)?;
+            }
+        }
+    }
 
     progress.set_stage("enrich");
     progress.begin_phase("enrich_candidates", Some(candidates.len() as u64));
@@ -80,6 +104,9 @@ pub async fn enrich_candidates(
             bundle.legit = std::mem::take(&mut preflight.legit);
         }
         finalize_legit_signals(&mut bundle);
+        if let Some(cb) = on_bundle.as_mut() {
+            cb(&bundle)?;
+        }
         out.insert(contract_id, bundle);
         progress.add_completed(1);
     }
@@ -189,19 +216,10 @@ async fn enrich_evm(
         }
     }
 
-    // Prices only need day buckets; receipts only need tx hashes. Run both
-    // before mutating the transfer/sale vectors so one RTT is removed from
-    // the EVM critical path.
-    let day_buckets = collect_day_buckets(&transfers.value, &sales.value);
+    // Spot price (run-time) + receipt gas are independent of each other.
     let tx_hashes = alchemy::collect_unique_tx_hashes(&transfers.value, &sales.value);
     let (prices, gas) = tokio::join!(
-        alchemy::fetch_prices(
-            client,
-            &limits.endpoints,
-            keys.alchemy(),
-            chain,
-            &day_buckets,
-        ),
+        alchemy::fetch_prices(client, &limits.endpoints, keys.alchemy(), chain, &[]),
         alchemy::fetch_receipt_gas(
             client,
             &limits.endpoints,
@@ -367,15 +385,8 @@ async fn enrich_solana(
     )
     .await;
 
-    let day_buckets = collect_day_buckets(&transfers, &sales);
-    let prices = alchemy::fetch_prices(
-        client,
-        &limits.endpoints,
-        keys.alchemy(),
-        chain,
-        &day_buckets,
-    )
-    .await;
+    let prices =
+        alchemy::fetch_prices(client, &limits.endpoints, keys.alchemy(), chain, &[]).await;
     apply_prices_to_sales(&mut sales, &prices.value, chain);
 
     apply_outcome(
@@ -574,44 +585,33 @@ async fn collect_evm_mint_payment_extras(
     out
 }
 
-fn collect_day_buckets(transfers: &[TransferEvent], sales: &[SaleEvent]) -> Vec<i64> {
-    let mut days = std::collections::BTreeSet::new();
-    for event in transfers {
-        if let Some(ts) = event.timestamp {
-            days.insert(day_bucket(ts));
-        }
-    }
-    for event in sales {
-        if let Some(ts) = event.timestamp {
-            days.insert(day_bucket(ts));
-        }
-    }
-    days.into_iter().collect()
-}
-
 fn apply_prices_to_sales(
     sales: &mut [SaleEvent],
     prices: &[super::types::PriceBucket],
     chain: &str,
 ) {
-    if prices.is_empty() {
-        return;
-    }
-    let by_day: AHashMap<i64, f64> = prices
+    // Single run-time spot rate for the chain (not historical day buckets).
+    let Some(rate) = prices
         .iter()
-        .filter(|p| p.chain == chain)
-        .map(|p| (p.day_utc, p.usd_per_native))
-        .collect();
+        .find(|p| p.chain == chain && p.usd_per_native > 0.0)
+        .map(|p| p.usd_per_native)
+        .or_else(|| {
+            prices
+                .iter()
+                .find(|p| p.usd_per_native > 0.0)
+                .map(|p| p.usd_per_native)
+        })
+    else {
+        return;
+    };
     for sale in sales {
         if sale.usd_amount.is_some() {
             continue;
         }
-        let (Some(ts), Some(native)) = (sale.timestamp, sale.native_amount) else {
+        let Some(native) = sale.native_amount else {
             continue;
         };
-        if let Some(rate) = by_day.get(&day_bucket(ts)) {
-            sale.usd_amount = Some(native * rate);
-        }
+        sale.usd_amount = Some(native * rate);
     }
 }
 
@@ -1093,7 +1093,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prices_complete_when_day_buckets_returned() {
+    async fn prices_complete_when_spot_rate_returned() {
         let server = MockServer::start_async().await;
         let _rpc = server
             .mock_async(|when, then| {
@@ -1139,11 +1139,15 @@ mod tests {
             .await;
         let _prices = server
             .mock_async(|when, then| {
-                when.method(POST).path_contains("/tokens/historical");
+                when.method(GET).path_contains("/tokens/by-symbol");
                 then.status(200).json_body(json!({
                     "data": [{
-                        "timestamp": "2024-01-01T00:00:00Z",
-                        "value": "2500.5"
+                        "symbol": "ETH",
+                        "prices": [{
+                            "currency": "usd",
+                            "value": "2500.5",
+                            "lastUpdatedAt": "2024-01-01T00:00:00Z"
+                        }]
                     }]
                 }));
             })

@@ -19,7 +19,7 @@ pub use http::{
 };
 pub use legit_detect::attach_relation_legit;
 pub use opensea::{parse_top_collections, OpenSeaRankedItem};
-pub use orchestrator::enrich_candidates;
+pub use orchestrator::{enrich_candidates, enrich_candidates_with_hook};
 pub use types::{
     finalize_legit_signals, ApiKeys, EvidenceBundle, EvidenceObservation, EvidenceQuality,
     EvidenceStatus, HolderRecord, HttpLimits, LegitSignals, PriceBucket, ProviderEndpoints,

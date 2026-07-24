@@ -18,9 +18,11 @@ pub use dedup_cache::{
     DedupCacheParams, DEFAULT_DEDUP_CACHE_FILE, DEDUP_CACHE_VERSION,
 };
 pub use evidence_cache::{
-    build_evidence_cache, default_evidence_cache_path, evidence_cache_params, load_evidence_cache,
+    build_evidence_cache, default_evidence_cache_path, evidence_cache_artifacts_present,
+    evidence_cache_params, load_evidence_cache, load_evidence_cache_resumable,
     rematerialize_evidence, validate_evidence_cache, write_evidence_cache, EvidenceCacheFile,
-    EvidenceCacheParams, DEFAULT_EVIDENCE_CACHE_FILE, EVIDENCE_CACHE_VERSION,
+    EvidenceCacheParams, EvidenceCacheSink, DEFAULT_EVIDENCE_CACHE_BATCH,
+    DEFAULT_EVIDENCE_CACHE_FILE, EVIDENCE_CACHE_VERSION,
 };
 pub use json::{
     build_seed_dedup_report, load_seeds_json, resolve_seed_contract, seed_dir_name,

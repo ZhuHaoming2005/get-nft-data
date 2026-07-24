@@ -80,7 +80,7 @@ pub struct TransferEvent {
     /// Native payment attached to a paid mint (same tx), when known.
     #[serde(default)]
     pub mint_payment_native: Option<f64>,
-    /// USD conversion of [`mint_payment_native`] via day bucket prices.
+    /// USD conversion of [`mint_payment_native`] via run-time spot prices.
     #[serde(default)]
     pub mint_payment_usd: Option<f64>,
 }

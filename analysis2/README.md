@@ -120,18 +120,24 @@ After URI/Name/Metadata queries finish, `run` always writes a portable checkpoin
 (override with `--dedup-cache PATH`). Edges are stored with stable chain/address/token
 identities (not process-local ids).
 
-### Evidence cache (skip re-enrich)
+### Evidence cache (skip re-enrich / resume after interrupt)
 
-After enrich finishes, `run` also writes:
+While enrich runs, network results are checkpointed **in batches** (default every 16
+candidates):
 
 ```text
-<output-dir>/evidence_cache.json
+<output-dir>/evidence_cache.json       # full snapshot (rewritten each flush)
+<output-dir>/evidence_cache.jsonl      # append-only per-candidate lines
+<output-dir>/evidence_cache.meta.json  # version + params
 ```
 
-(override with `--evidence-cache PATH`). Bundles are keyed by stable chain/address;
-`contract_id` is remapped on load. With `--reuse-evidence`, candidates already in the
-cache skip HTTP; only missing candidates are fetched. Seeds, pagination limits, and
-API-key *presence* must match the cache.
+(override base path with `--evidence-cache PATH`). Bundles use stable chain/address;
+`contract_id` is remapped on load.
+
+On the next `run` with the same output dir / params, the cache is **auto-resumed**
+(even without `--reuse-evidence`): already-cached candidates skip HTTP; only missing
+ones are fetched. `--reuse-evidence` makes a missing/invalid cache a hard error.
+Seeds, pagination limits, and API-key *presence* must match the cache.
 
 ### Fast re-run (dedup + evidence)
 

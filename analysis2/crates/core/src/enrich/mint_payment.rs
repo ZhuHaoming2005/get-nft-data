@@ -2,7 +2,7 @@
 
 use ahash::AHashMap;
 
-use super::types::{day_bucket, PriceBucket, TransferEvent, ValueFlowEdge};
+use super::types::{PriceBucket, TransferEvent, ValueFlowEdge};
 
 fn norm_tx(tx: &str) -> String {
     tx.trim().to_ascii_lowercase()
@@ -12,17 +12,16 @@ fn norm_addr(addr: &str) -> String {
     addr.trim().to_ascii_lowercase()
 }
 
-fn usd_for_ts(prices: &[PriceBucket], chain: &str, ts: Option<i64>, native: f64) -> Option<f64> {
-    let ts = ts?;
-    let day = day_bucket(ts);
-    let rate = prices.iter().find(|p| {
-        p.day_utc == day
-            && (p.symbol.eq_ignore_ascii_case("ETH")
-                || p.symbol.eq_ignore_ascii_case("MATIC")
-                || p.symbol.eq_ignore_ascii_case("POL")
-                || p.symbol.eq_ignore_ascii_case("SOL")
-                || chain_matches_symbol(chain, &p.symbol))
-    })?;
+/// Convert native amount with the run-time spot rate (any matching chain bucket).
+fn usd_for_runtime(prices: &[PriceBucket], chain: &str, native: f64) -> Option<f64> {
+    let rate = prices
+        .iter()
+        .find(|p| chain_matches_symbol(chain, &p.symbol) && p.usd_per_native > 0.0)
+        .or_else(|| {
+            prices
+                .iter()
+                .find(|p| p.chain.eq_ignore_ascii_case(chain) && p.usd_per_native > 0.0)
+        })?;
     if rate.usd_per_native > 0.0 {
         Some(native * rate.usd_per_native)
     } else {
@@ -94,14 +93,7 @@ pub fn attach_mint_payments(
             continue;
         }
         transfer.mint_payment_native = Some(native);
-        transfer.mint_payment_usd = usd_for_ts(prices, chain, transfer.timestamp, native)
-            .or_else(|| {
-                // Fall back to first matching chain price bucket.
-                prices
-                    .iter()
-                    .find(|p| chain_matches_symbol(chain, &p.symbol) && p.usd_per_native > 0.0)
-                    .map(|p| native * p.usd_per_native)
-            });
+        transfer.mint_payment_usd = usd_for_runtime(prices, chain, native);
     }
 }
 
@@ -140,13 +132,13 @@ mod tests {
         }];
         let prices = vec![PriceBucket {
             chain: "ethereum".into(),
-            day_utc: day_bucket(1_700_000_000),
+            day_utc: 0,
             symbol: "ETH".into(),
             usd_per_native: 2000.0,
         }];
         attach_mint_payments(&mut transfers, &flows, &prices, "ethereum", &AHashMap::new());
         assert_eq!(transfers[0].mint_payment_native, Some(0.05));
-        assert_eq!(transfers[0].mint_payment_usd, Some(100.0));
+        assert_eq!(transfers[0].mint_payment_usd, Some(100.0)); // 0.05 * 2000
     }
 
     #[test]

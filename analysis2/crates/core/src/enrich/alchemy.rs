@@ -1,6 +1,8 @@
 //! Alchemy NFT / transfers / sales / prices / receipt-gas / native EXTERNAL clients.
 
-use ahash::AHashMap;
+use std::sync::{Mutex, OnceLock};
+
+use ahash::{AHashMap, AHashSet};
 use serde_json::{json, Value};
 
 use super::http::HttpClient;
@@ -8,6 +10,47 @@ use super::types::{
     day_bucket, now_unix, status_from_count, EvidenceObservation, EvidenceStatus, HolderRecord,
     PriceBucket, ProviderEndpoints, SaleEvent, TransferEvent,
 };
+
+/// Chains where Alchemy NFT `getNFTSales` returned "not enabled for that chain"
+/// (e.g. Base). Remembered process-wide so we do not re-hit the endpoint for
+/// every candidate after the first failure.
+fn nft_sales_disabled_chains() -> &'static Mutex<AHashSet<String>> {
+    static SET: OnceLock<Mutex<AHashSet<String>>> = OnceLock::new();
+    SET.get_or_init(|| Mutex::new(AHashSet::new()))
+}
+
+fn is_nft_sales_disabled_for_chain(chain: &str) -> bool {
+    let key = chain.trim().to_ascii_lowercase();
+    nft_sales_disabled_chains()
+        .lock()
+        .map(|set| set.contains(&key))
+        .unwrap_or(false)
+}
+
+fn remember_nft_sales_disabled(chain: &str) {
+    let key = chain.trim().to_ascii_lowercase();
+    if key.is_empty() {
+        return;
+    }
+    if let Ok(mut set) = nft_sales_disabled_chains().lock() {
+        if set.insert(key.clone()) {
+            eprintln!(
+                "[api/warn] source=alchemy request_key=alchemy_sales chain={key} \
+                 action=disable_endpoint reason=not_enabled_on_network \
+                 note=subsequent_candidates_skip_alchemy_sales"
+            );
+        }
+    }
+}
+
+/// Alchemy 400 body: endpoint not enabled for this chain/network.
+pub(crate) fn is_nft_sales_chain_disabled_error(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("isn't enabled for that chain")
+        || lower.contains("is not enabled for that chain")
+        || lower.contains("isn't enabled for that network")
+        || lower.contains("not enabled for that chain or network")
+}
 
 /// Parsed native EXTERNAL transfer from `alchemy_getAssetTransfers`.
 #[derive(Clone, Debug, Default)]
@@ -320,6 +363,11 @@ async fn fetch_holders_pages(
 }
 
 /// Fetch NFT sales via Alchemy `getNFTSales`.
+///
+/// Some networks (notably Base) return HTTP 400 "endpoint isn't enabled for
+/// that chain". After the first such response for a chain, later candidates
+/// skip Alchemy sales (`NotRequested`) so OpenSea can still act as fallback
+/// without thousands of identical 400s.
 pub async fn fetch_sales(
     client: &HttpClient,
     endpoints: &ProviderEndpoints,
@@ -331,6 +379,9 @@ pub async fn fetch_sales(
     let Some(api_key) = api_key else {
         return FetchOutcome::skipped("alchemy_sales");
     };
+    if is_nft_sales_disabled_for_chain(chain) {
+        return FetchOutcome::skipped("alchemy_sales");
+    }
     let Some(base) = endpoints.alchemy_nft(chain, api_key, "getNFTSales") else {
         return FetchOutcome::failed(
             "alchemy",
@@ -358,6 +409,13 @@ pub async fn fetch_sales(
             Ok(v) => v,
             Err(e) => {
                 if sales.is_empty() {
+                    let msg = e.to_string();
+                    if is_nft_sales_chain_disabled_error(&msg) {
+                        remember_nft_sales_disabled(chain);
+                        // NotRequested: preferred provider unavailable on this
+                        // network → OpenSea last-resort path can still run.
+                        return FetchOutcome::skipped("alchemy_sales");
+                    }
                     return FetchOutcome::failed("alchemy", "alchemy_sales", e);
                 }
                 truncated = true;
@@ -389,83 +447,77 @@ pub async fn fetch_sales(
     FetchOutcome::ok(sales, count, truncated, "alchemy", "alchemy_sales")
 }
 
-/// Fetch Alchemy historical prices for native symbols over UTC day buckets.
+/// Fetch **current** (run-time) USD price for the chain native token.
+///
+/// Historical day-bucket pricing is intentionally not used: Alchemy limits
+/// `1d` historical ranges to 365 points, and cross-event valuation is simpler
+/// and more stable with a single spot rate taken when enrich runs.
+///
+/// `day_buckets` is ignored for the API call (kept on the signature so call
+/// sites stay stable). The returned bucket uses `day_utc = day_bucket(now)`.
 pub async fn fetch_prices(
     client: &HttpClient,
     endpoints: &ProviderEndpoints,
     api_key: Option<&str>,
     chain: &str,
-    day_buckets: &[i64],
+    _day_buckets: &[i64],
 ) -> FetchOutcome<Vec<PriceBucket>> {
     let Some(api_key) = api_key else {
         return FetchOutcome::skipped("alchemy_prices");
     };
-    if day_buckets.is_empty() {
-        return FetchOutcome::skipped("alchemy_prices");
-    }
     let symbol = native_symbol(chain);
-    let start = *day_buckets.iter().min().unwrap_or(&0);
-    let end = *day_buckets.iter().max().unwrap_or(&0);
     let url = format!(
-        "{}/{}/tokens/historical",
+        "{}/{}/tokens/by-symbol?symbols={}",
         endpoints.alchemy_prices.trim_end_matches('/'),
-        api_key
+        api_key,
+        symbol
     );
-    let body = json!({
-        "symbol": symbol,
-        "startTime": rfc3339(start),
-        "endTime": rfc3339(end.saturating_add(86_399)),
-        "interval": "1d",
-        "withMarketData": false
-    });
-    let payload = match client.post_json(&url, &[], &body).await {
+    let payload = match client.get_json(&url, &[]).await {
         Ok(v) => v,
         Err(e) => return FetchOutcome::failed("alchemy", "alchemy_prices", e),
     };
     if let Some(error) = payload.get("error") {
         return FetchOutcome::failed("alchemy", "alchemy_prices", error.to_string());
     }
-    let wanted: std::collections::BTreeSet<i64> = day_buckets.iter().copied().collect();
-    let mut prices = Vec::new();
-    for row in payload
-        .get("data")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let Some(ts) = row
-            .get("timestamp")
-            .and_then(Value::as_str)
-            .and_then(parse_rfc3339)
-        else {
-            continue;
-        };
-        let day = day_bucket(ts);
-        if !wanted.contains(&day) {
-            continue;
-        }
-        let Some(usd) = json_f64(row.get("value")) else {
-            continue;
-        };
-        prices.push(PriceBucket {
-            chain: chain.to_owned(),
-            day_utc: day,
-            symbol: symbol.to_owned(),
-            usd_per_native: usd,
-        });
-    }
-    let missing = wanted.len().saturating_sub(prices.len());
-    let truncated = missing > 0 && !prices.is_empty();
-    let failed_partial = missing > 0 && prices.is_empty();
-    if failed_partial {
+    let Some(usd) = parse_by_symbol_usd(&payload, symbol) else {
         return FetchOutcome::failed(
             "alchemy",
             "alchemy_prices",
-            "no overlapping historical price buckets",
+            format!("no current USD price for symbol {symbol}"),
         );
-    }
-    let count = prices.len();
-    FetchOutcome::ok(prices, count, truncated, "alchemy", "alchemy_prices")
+    };
+    let prices = vec![PriceBucket {
+        chain: chain.to_owned(),
+        day_utc: day_bucket(now_unix()),
+        symbol: symbol.to_owned(),
+        usd_per_native: usd,
+    }];
+    FetchOutcome::ok(prices, 1, false, "alchemy", "alchemy_prices")
+}
+
+/// Parse Alchemy `tokens/by-symbol` current-price response.
+pub(crate) fn parse_by_symbol_usd(payload: &Value, symbol: &str) -> Option<f64> {
+    payload
+        .get("data")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|item| {
+            item.get("symbol")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.eq_ignore_ascii_case(symbol))
+        })?
+        .get("prices")
+        .and_then(Value::as_array)?
+        .iter()
+        .find(|price| {
+            price
+                .get("currency")
+                .and_then(Value::as_str)
+                .is_some_and(|c| c.eq_ignore_ascii_case("usd"))
+        })?
+        .get("value")
+        .and_then(|v| json_f64(Some(v)))
+        .filter(|rate| rate.is_finite() && *rate > 0.0)
 }
 
 pub fn parse_alchemy_transfer(item: &Value, fallback_contract: &str) -> Vec<TransferEvent> {
@@ -727,14 +779,6 @@ fn native_symbol(chain: &str) -> &'static str {
         "solana" => "SOL",
         _ => "ETH",
     }
-}
-
-fn rfc3339(ts: i64) -> String {
-    use chrono::{SecondsFormat, TimeZone, Utc};
-    Utc.timestamp_opt(ts, 0)
-        .single()
-        .map(|v| v.to_rfc3339_opts(SecondsFormat::Secs, true))
-        .unwrap_or_else(|| "1970-01-01T00:00:00Z".into())
 }
 
 fn urlencoding_minimal(value: &str) -> String {
@@ -1285,6 +1329,21 @@ mod receipt_gas_tests {
     }
 
     #[test]
+    fn parse_by_symbol_usd_reads_current_price() {
+        let payload = json!({
+            "data": [{
+                "symbol": "ETH",
+                "prices": [
+                    { "currency": "eur", "value": "2000" },
+                    { "currency": "usd", "value": "2500.5" }
+                ]
+            }]
+        });
+        assert_eq!(parse_by_symbol_usd(&payload, "ETH"), Some(2500.5));
+        assert_eq!(parse_by_symbol_usd(&payload, "SOL"), None);
+    }
+
+    #[test]
     fn oversize_holders_failure_is_detected_for_fallback() {
         let oversize = FetchOutcome::<Vec<HolderRecord>>::failed(
             "alchemy",
@@ -1332,6 +1391,13 @@ mod sales_fallback_tests {
             usd_amount: None,
             currency_symbol: Some("ETH".into()),
         }
+    }
+
+    #[test]
+    fn detects_alchemy_sales_disabled_on_chain_message() {
+        let msg = r#"HTTP 400 Bad Request body={"error":{"message":"This endpoint isn't enabled for that chain or network just yet - please contact the Alchemy team for support!"}}"#;
+        assert!(super::is_nft_sales_chain_disabled_error(msg));
+        assert!(!super::is_nft_sales_chain_disabled_error("HTTP 500 internal"));
     }
 
     #[test]

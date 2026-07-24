@@ -7,16 +7,17 @@ use ahash::AHashMap;
 use analysis2_core::{
     analyze_candidate, build_contract_nft_map, build_dedup_cache, build_evidence_cache,
     build_seed_analysis_rollup, build_seed_dedup_report, default_dedup_cache_path,
-    default_evidence_cache_path, enrich_candidates, evidence_cache_params, load_dedup_cache,
-    load_evidence_cache, load_resident_store_uri_ready, load_seeds_json,
-    query_metadata_for_seed_with_scratch, query_name_for_seed_with_scratch,
-    query_uri_for_seed_with_scratch, rematerialize_dedup_batch, rematerialize_evidence,
-    resolve_seed_contract, scopes_complete_for_seed, validate_dedup_cache, validate_evidence_cache,
-    write_candidate_json, write_dedup_cache, write_dedup_outputs, write_evidence_cache,
-    write_run_outputs, Analysis2Error, ApiKeys, CandidateAnalysis, CandidateRegistry, ContractId,
-    DedupCacheParams, DedupRunParams, EvidenceBundle, FailureRecord, HitGraph, HttpLimits,
-    LoadOptions, MetadataQueryScratch, NameQueryScratch, PaperConfig, PendingDedupLoad,
-    ProgressObserver, ResidentStore, SeedFullReport, SeedRecord, UriQueryScratch,
+    default_evidence_cache_path, enrich_candidates_with_hook, evidence_cache_artifacts_present,
+    evidence_cache_params, load_dedup_cache, load_evidence_cache_resumable,
+    load_resident_store_uri_ready, load_seeds_json, query_metadata_for_seed_with_scratch,
+    query_name_for_seed_with_scratch, query_uri_for_seed_with_scratch, rematerialize_dedup_batch,
+    rematerialize_evidence, resolve_seed_contract, scopes_complete_for_seed, validate_dedup_cache,
+    validate_evidence_cache, write_candidate_json, write_dedup_cache, write_dedup_outputs,
+    write_evidence_cache, write_run_outputs, Analysis2Error, ApiKeys, CandidateAnalysis,
+    CandidateRegistry, ContractId, DedupCacheParams, DedupRunParams, EvidenceBundle,
+    EvidenceCacheSink, FailureRecord, HitGraph, HttpLimits, LoadOptions, MetadataQueryScratch,
+    NameQueryScratch, PaperConfig, PendingDedupLoad, ProgressObserver, ResidentStore,
+    SeedFullReport, SeedRecord, UriQueryScratch, DEFAULT_EVIDENCE_CACHE_BATCH,
 };
 use rayon::prelude::*;
 
@@ -586,32 +587,50 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         &limits,
     );
 
-    let mut evidence = if config.reuse_evidence {
-        if !evidence_path.is_file() {
-            return Err(Analysis2Error::invalid(format!(
-                "--reuse-evidence requires existing cache file {}",
-                evidence_path.display()
-            )));
-        }
+    // Auto-resume from incremental jsonl/snapshot when present and params match.
+    // `--reuse-evidence` makes a missing cache fatal; otherwise a bad cache is skipped.
+    let mut evidence = AHashMap::new();
+    let cache_exists = evidence_cache_artifacts_present(&evidence_path);
+    if cache_exists || config.reuse_evidence {
         progress.begin_phase("load_evidence_cache", Some(1));
-        let cache = load_evidence_cache(&evidence_path)?;
-        validate_evidence_cache(&cache, &evidence_params)?;
-        let map = rematerialize_evidence(&store, &cache)?;
+        match load_evidence_cache_resumable(&evidence_path) {
+            Ok(cache) => {
+                if let Err(e) = validate_evidence_cache(&cache, &evidence_params) {
+                    if config.reuse_evidence {
+                        return Err(e);
+                    }
+                    eprintln!("evidence: ignoring incompatible cache: {e}");
+                } else {
+                    evidence = rematerialize_evidence(&store, &cache)?;
+                    eprintln!(
+                        "evidence: resumed cache {} ({} bundles)",
+                        evidence_path.display(),
+                        evidence.len()
+                    );
+                }
+            }
+            Err(e) => {
+                if config.reuse_evidence {
+                    return Err(Analysis2Error::invalid(format!(
+                        "--reuse-evidence requires cache at {}: {e}",
+                        evidence_path.display()
+                    )));
+                }
+                eprintln!("evidence: no usable cache yet ({e})");
+            }
+        }
         progress.add_completed(1);
-        eprintln!(
-            "evidence: reused cache {} ({} bundles)",
-            evidence_path.display(),
-            map.len()
-        );
-        map
-    } else {
-        AHashMap::new()
-    };
+    }
 
     let evidence = match &config.enrich_override {
         Some(hook) => {
             // Test / offline hooks replace evidence entirely (still written to cache).
-            hook(&registry, &store, progress)?
+            let map = hook(&registry, &store, progress)?;
+            progress.begin_phase("write_evidence_cache", Some(1));
+            let evidence_file = build_evidence_cache(evidence_params, &map);
+            write_evidence_cache(&evidence_path, &evidence_file)?;
+            progress.add_completed(1);
+            map
         }
         None => {
             let missing: ahash::AHashSet<ContractId> = registry
@@ -625,41 +644,65 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                     "evidence: all {} candidates covered by cache; skipping HTTP enrich",
                     registry.candidate_contract_count()
                 );
+                // Refresh compact snapshot from in-memory set.
+                progress.begin_phase("write_evidence_cache", Some(1));
+                let evidence_file = build_evidence_cache(evidence_params, &evidence);
+                write_evidence_cache(&evidence_path, &evidence_file)?;
+                progress.add_completed(1);
                 evidence
             } else {
                 let subset = registry.filter_candidates(&missing);
                 eprintln!(
-                    "evidence: fetching {} / {} candidates via HTTP",
+                    "evidence: fetching {} / {} candidates via HTTP (batch flush every {})",
                     subset.candidate_contract_count(),
-                    registry.candidate_contract_count()
+                    registry.candidate_contract_count(),
+                    DEFAULT_EVIDENCE_CACHE_BATCH
                 );
+                let mut sink = EvidenceCacheSink::create(
+                    &evidence_path,
+                    evidence_params.clone(),
+                    DEFAULT_EVIDENCE_CACHE_BATCH,
+                )?;
+                // Seed in-memory snapshot index only (do not re-append jsonl).
+                for bundle in evidence.values() {
+                    sink.note_cached(bundle);
+                }
+
                 let runtime = tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .build()
                     .map_err(|e| Analysis2Error::http(format!("tokio runtime: {e}")))?;
-                let fetched = runtime.block_on(enrich_candidates(
-                    &subset,
-                    &store,
-                    &config.api_keys,
-                    &limits,
-                    progress,
-                ))?;
+                let fetch_result = {
+                    let mut on_bundle =
+                        |bundle: &EvidenceBundle| -> Result<(), Analysis2Error> {
+                            sink.push(bundle)
+                        };
+                    runtime.block_on(enrich_candidates_with_hook(
+                        &subset,
+                        &store,
+                        &config.api_keys,
+                        &limits,
+                        progress,
+                        Some(&mut on_bundle),
+                    ))
+                };
+                // Flush even on cancel / error so partial progress is reusable.
+                match sink.finish() {
+                    Ok(final_cache) => {
+                        eprintln!(
+                            "evidence: checkpoint {} ({} bundles on disk)",
+                            evidence_path.display(),
+                            final_cache.bundles.len()
+                        );
+                    }
+                    Err(e) => eprintln!("evidence: final cache flush failed: {e}"),
+                }
+                let fetched = fetch_result?;
                 evidence.extend(fetched);
                 evidence
             }
         }
     };
-
-    // Always persist so a later `--reuse-evidence` can skip HTTP.
-    progress.begin_phase("write_evidence_cache", Some(1));
-    let evidence_file = build_evidence_cache(evidence_params, &evidence);
-    write_evidence_cache(&evidence_path, &evidence_file)?;
-    progress.add_completed(1);
-    eprintln!(
-        "evidence: wrote cache {} ({} bundles)",
-        evidence_path.display(),
-        evidence_file.bundles.len()
-    );
 
     progress.check_cancelled()?;
     progress.set_stage("analyze");

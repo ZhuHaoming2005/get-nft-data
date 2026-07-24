@@ -614,7 +614,7 @@ pub fn write_run_outputs(
             "incomplete_seed_count": incomplete.len() as u64,
             "formal_denominator_excludes_incomplete": true,
         }),
-        pricing_policy: "alchemy_prices_utc_day_usd_only_cross_chain".into(),
+        pricing_policy: "alchemy_spot_runtime_usd_only_cross_chain".into(),
         stage_timings: json!([]),
     };
     write_json(&output_dir.join("run_manifest.json"), &manifest)?;
