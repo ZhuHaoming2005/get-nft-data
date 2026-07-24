@@ -18,13 +18,18 @@ const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub const OPENSEA_RATE_LIMIT_BURST: usize = 4;
 pub const OPENSEA_RATE_LIMIT_REFILL_MS: u64 = 300;
-pub const HELIUS_RATE_LIMIT_BURST: usize = 7;
-pub const HELIUS_RATE_LIMIT_REFILL_MS: u64 = 150;
+/// Helius sustained cap: 5 req/s (one token every 200 ms, burst 5).
+pub const HELIUS_RATE_LIMIT_BURST: usize = 5;
+pub const HELIUS_RATE_LIMIT_REFILL_MS: u64 = 200;
+/// Shared cool-down applied to a provider bucket after HTTP 429 / rate-limit.
+pub const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct TokenBucketState {
     tokens: f64,
     last_refill: Instant,
+    /// When set, every `acquire` waits until this instant (global 429 pause).
+    cool_down_until: Option<Instant>,
 }
 
 /// Token-bucket rate gate without a background task (safe to construct outside
@@ -38,14 +43,24 @@ pub struct TokenBucketRateLimiter {
 
 impl TokenBucketRateLimiter {
     pub fn new(max_burst: usize, refill_interval: Duration) -> Self {
+        Self::with_initial_tokens(max_burst, refill_interval, 1.0)
+    }
+
+    /// Start with a full bucket (used when concurrency is the primary throttle).
+    pub fn new_full(max_burst: usize, refill_interval: Duration) -> Self {
+        let max_burst_f = max_burst.max(1) as f64;
+        Self::with_initial_tokens(max_burst, refill_interval, max_burst_f)
+    }
+
+    fn with_initial_tokens(max_burst: usize, refill_interval: Duration, initial: f64) -> Self {
         let max_burst = max_burst.max(1) as f64;
-        // Start with one token (matches top_contract AsyncApiClient).
         Self {
             max_burst,
             refill_interval: refill_interval.max(Duration::from_millis(1)),
             state: Arc::new(Mutex::new(TokenBucketState {
-                tokens: 1.0,
+                tokens: initial.clamp(0.0, max_burst),
                 last_refill: Instant::now(),
+                cool_down_until: None,
             })),
         }
     }
@@ -58,6 +73,7 @@ impl TokenBucketRateLimiter {
         )
     }
 
+    /// Helius default: 5 req/s (burst 5, 200 ms per token).
     pub fn helius_default() -> Self {
         Self::new(
             HELIUS_RATE_LIMIT_BURST,
@@ -65,7 +81,29 @@ impl TokenBucketRateLimiter {
         )
     }
 
-    /// Wait until a rate token is available, then consume one.
+    /// No RPS cap: concurrency semaphore is the throttle; still supports 429 cool-down.
+    pub fn concurrency_only() -> Self {
+        // Large burst + 1 ms refill ≈ unlimited steady-state RPS.
+        Self::new_full(10_000, Duration::from_millis(1))
+    }
+
+    /// Block *all* subsequent acquires for at least `duration` (429 cool-down).
+    ///
+    /// Extends an existing cool-down if one is already active; drains tokens so
+    /// traffic cannot immediately resume at full burst after the pause.
+    pub fn note_rate_limited(&self, duration: Duration) {
+        if let Ok(mut state) = self.state.lock() {
+            let until = Instant::now() + duration;
+            state.cool_down_until = Some(match state.cool_down_until {
+                Some(prev) if prev > until => prev,
+                _ => until,
+            });
+            state.tokens = 0.0;
+            state.last_refill = Instant::now();
+        }
+    }
+
+    /// Wait until cool-down (if any) ends and a rate token is available, then consume one.
     pub async fn acquire(&self) -> Result<(), Analysis2Error> {
         loop {
             let wait = {
@@ -73,19 +111,35 @@ impl TokenBucketRateLimiter {
                     .state
                     .lock()
                     .map_err(|_| Analysis2Error::http("rate limiter poisoned"))?;
-                let elapsed = state.last_refill.elapsed();
-                if !elapsed.is_zero() {
-                    let add = elapsed.as_secs_f64() / self.refill_interval.as_secs_f64();
-                    state.tokens = (state.tokens + add).min(self.max_burst);
-                    state.last_refill = Instant::now();
-                }
-                if state.tokens >= 1.0 {
-                    state.tokens -= 1.0;
-                    None
+                let now = Instant::now();
+
+                // Global 429 cool-down: every concurrent caller parks until it ends.
+                if let Some(until) = state.cool_down_until {
+                    if now < until {
+                        Some(until.saturating_duration_since(now))
+                    } else {
+                        // Cool-down finished: resume with a single token (not a full burst).
+                        state.cool_down_until = None;
+                        state.tokens = 1.0;
+                        state.last_refill = now;
+                        state.tokens -= 1.0;
+                        None
+                    }
                 } else {
-                    let need = 1.0 - state.tokens;
-                    let wait_secs = need * self.refill_interval.as_secs_f64();
-                    Some(Duration::from_secs_f64(wait_secs.max(0.001)))
+                    let elapsed = state.last_refill.elapsed();
+                    if !elapsed.is_zero() {
+                        let add = elapsed.as_secs_f64() / self.refill_interval.as_secs_f64();
+                        state.tokens = (state.tokens + add).min(self.max_burst);
+                        state.last_refill = Instant::now();
+                    }
+                    if state.tokens >= 1.0 {
+                        state.tokens -= 1.0;
+                        None
+                    } else {
+                        let need = 1.0 - state.tokens;
+                        let wait_secs = need * self.refill_interval.as_secs_f64();
+                        Some(Duration::from_secs_f64(wait_secs.max(0.001)))
+                    }
                 }
             };
             match wait {
@@ -96,16 +150,38 @@ impl TokenBucketRateLimiter {
     }
 }
 
-/// Concurrent HTTP helper with finite retries.
+/// One API provider's independent concurrency pool + rate / 429 cool-down gate.
+///
+/// Lanes never share semaphores or cool-downs: saturating Alchemy does not block
+/// OpenSea / Helius / Etherscan, and a Helius 429 pause does not slow Alchemy.
+#[derive(Clone, Debug)]
+struct ProviderLane {
+    name: &'static str,
+    in_flight: Arc<Semaphore>,
+    limiter: TokenBucketRateLimiter,
+}
+
+impl ProviderLane {
+    fn new(name: &'static str, concurrency: usize, limiter: TokenBucketRateLimiter) -> Self {
+        Self {
+            name,
+            in_flight: Arc::new(Semaphore::new(concurrency.max(1))),
+            limiter,
+        }
+    }
+}
+
+/// Concurrent HTTP helper with **per-provider** concurrency and rate control.
 #[derive(Clone)]
 pub struct HttpClient {
     http: reqwest::Client,
-    in_flight: Arc<Semaphore>,
     retries: usize,
-    /// Shared OpenSea rate limiter (all clones share one bucket).
-    opensea_limiter: TokenBucketRateLimiter,
-    /// Shared Helius rate limiter (independent of OpenSea; all clones share one bucket).
-    helius_limiter: TokenBucketRateLimiter,
+    alchemy: ProviderLane,
+    opensea: ProviderLane,
+    helius: ProviderLane,
+    etherscan: ProviderLane,
+    /// Magic Eden / other non-primary providers.
+    other: ProviderLane,
 }
 
 impl HttpClient {
@@ -114,80 +190,171 @@ impl HttpClient {
     }
 
     pub fn with_retries(concurrency: usize, retries: usize) -> Result<Self, Analysis2Error> {
+        let n = concurrency.max(1);
+        // Each provider gets its own pool of size `n` (Alchemy uses the CLI
+        // --http-concurrency value; others are independent and not shared).
+        let opensea_n = n.max(OPENSEA_RATE_LIMIT_BURST);
+        let helius_n = n.max(HELIUS_RATE_LIMIT_BURST);
+        let etherscan_n = n;
+        let other_n = n;
+        let pool_idle = n
+            .saturating_add(opensea_n)
+            .saturating_add(helius_n)
+            .saturating_add(etherscan_n)
+            .saturating_add(other_n)
+            .max(1);
+
         let http = reqwest::Client::builder()
             .timeout(DEFAULT_TIMEOUT)
             .connect_timeout(DEFAULT_CONNECT_TIMEOUT)
             .pool_idle_timeout(Duration::from_secs(90))
-            .pool_max_idle_per_host(concurrency.max(1))
+            .pool_max_idle_per_host(pool_idle)
             .tcp_keepalive(Duration::from_secs(60))
             .tcp_nodelay(true)
             .build()
             .map_err(|e| Analysis2Error::http(e.to_string()))?;
         Ok(Self {
             http,
-            in_flight: Arc::new(Semaphore::new(concurrency.max(1))),
             retries,
-            opensea_limiter: TokenBucketRateLimiter::opensea_default(),
-            helius_limiter: TokenBucketRateLimiter::helius_default(),
+            alchemy: ProviderLane::new("alchemy", n, TokenBucketRateLimiter::concurrency_only()),
+            opensea: ProviderLane::new(
+                "opensea",
+                opensea_n,
+                TokenBucketRateLimiter::opensea_default(),
+            ),
+            helius: ProviderLane::new(
+                "helius",
+                helius_n,
+                TokenBucketRateLimiter::helius_default(),
+            ),
+            etherscan: ProviderLane::new(
+                "etherscan",
+                etherscan_n,
+                TokenBucketRateLimiter::concurrency_only(),
+            ),
+            other: ProviderLane::new("other", other_n, TokenBucketRateLimiter::concurrency_only()),
         })
     }
 
+    /// Generic GET on the independent "other" lane (Magic Eden, misc).
     pub async fn get_json(
         &self,
         url: &str,
         headers: &[(&str, &str)],
     ) -> Result<Value, Analysis2Error> {
-        self.request(reqwest::Method::GET, url, headers, None).await
+        self.request_on_lane(reqwest::Method::GET, url, headers, None, &self.other)
+            .await
     }
 
-    /// GET that first consumes an OpenSea rate token (≤ ~4 req/s strategy).
+    pub async fn get_json_alchemy(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Value, Analysis2Error> {
+        self.request_on_lane(reqwest::Method::GET, url, headers, None, &self.alchemy)
+            .await
+    }
+
+    pub async fn post_json_alchemy(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> Result<Value, Analysis2Error> {
+        self.request_on_lane(
+            reqwest::Method::POST,
+            url,
+            headers,
+            Some(body),
+            &self.alchemy,
+        )
+        .await
+    }
+
+    /// GET on the OpenSea lane (≤ ~4 req/s + provider-local 429 cool-down).
     pub async fn get_json_opensea(
         &self,
         url: &str,
         headers: &[(&str, &str)],
     ) -> Result<Value, Analysis2Error> {
-        self.opensea_limiter.acquire().await?;
-        self.get_json(url, headers).await
+        self.request_on_lane(reqwest::Method::GET, url, headers, None, &self.opensea)
+            .await
     }
 
+    /// Generic POST on the "other" lane.
     pub async fn post_json(
         &self,
         url: &str,
         headers: &[(&str, &str)],
         body: &Value,
     ) -> Result<Value, Analysis2Error> {
-        self.request(reqwest::Method::POST, url, headers, Some(body))
-            .await
+        self.request_on_lane(
+            reqwest::Method::POST,
+            url,
+            headers,
+            Some(body),
+            &self.other,
+        )
+        .await
     }
 
-    /// POST that first consumes a Helius rate token (independent bucket, same
-    /// burst/refill strategy as OpenSea).
+    /// POST on the Helius lane (5 req/s + provider-local 429 cool-down).
     pub async fn post_json_helius(
         &self,
         url: &str,
         headers: &[(&str, &str)],
         body: &Value,
     ) -> Result<Value, Analysis2Error> {
-        self.helius_limiter.acquire().await?;
-        self.post_json(url, headers, body).await
+        self.request_on_lane(
+            reqwest::Method::POST,
+            url,
+            headers,
+            Some(body),
+            &self.helius,
+        )
+        .await
     }
 
-    async fn request(
+    pub async fn get_json_etherscan(
+        &self,
+        url: &str,
+        headers: &[(&str, &str)],
+    ) -> Result<Value, Analysis2Error> {
+        self.request_on_lane(
+            reqwest::Method::GET,
+            url,
+            headers,
+            None,
+            &self.etherscan,
+        )
+        .await
+    }
+
+    /// Shared retry loop for one provider lane: rate token → concurrency permit → HTTP.
+    async fn request_on_lane(
         &self,
         method: reqwest::Method,
         url: &str,
         headers: &[(&str, &str)],
         body: Option<&Value>,
+        lane: &ProviderLane,
     ) -> Result<Value, Analysis2Error> {
         let header_map = build_headers(headers)?;
         let endpoint = redact_endpoint(url);
         let mut last_error = None;
         for attempt in 0..=self.retries {
-            let _permit = self
+            // Rate / cool-down is provider-local.
+            lane.limiter.acquire().await?;
+            let _permit = lane
                 .in_flight
                 .acquire()
                 .await
-                .map_err(|_| Analysis2Error::http("HTTP concurrency pool closed"))?;
+                .map_err(|_| {
+                    Analysis2Error::http(format!(
+                        "HTTP concurrency pool closed provider={}",
+                        lane.name
+                    ))
+                })?;
             let mut builder = self
                 .http
                 .request(method.clone(), url)
@@ -203,42 +370,99 @@ impl HttpClient {
             };
             drop(_permit);
             match result {
-                Ok(value) => return Ok(value),
-                Err(error) => {
-                    let retryable = is_retryable(&error);
-                    let will_retry = attempt < self.retries && retryable;
-                    // 429: fixed 1s cool-down before retry (providers ask for space).
-                    // Other retryable errors keep exponential backoff from 100ms.
-                    let backoff_ms = will_retry.then(|| {
-                        if is_http_status(&error, 429) {
-                            1_000
-                        } else {
-                            100u64.saturating_mul(1u64 << attempt.min(8))
+                Ok(value) => {
+                    // Helius (and similar) may return HTTP 200 + JSON-RPC rate-limit.
+                    if let Some(err) = jsonrpc_rate_limit_error(&value) {
+                        let error = Analysis2Error::http(format!(
+                            "HTTP 429 endpoint={endpoint} content_type=application/json body={err}"
+                        ));
+                        if !self
+                            .handle_request_error(
+                                &method,
+                                &endpoint,
+                                attempt,
+                                error,
+                                lane,
+                                &mut last_error,
+                            )
+                            .await?
+                        {
+                            break;
                         }
-                    });
-                    print_request_error(
-                        &method,
-                        &endpoint,
-                        attempt + 1,
-                        self.retries + 1,
-                        backoff_ms,
-                        &error,
-                    );
-                    last_error = Some(error);
-                    if !will_retry {
+                        continue;
+                    }
+                    return Ok(value);
+                }
+                Err(error) => {
+                    if !self
+                        .handle_request_error(
+                            &method,
+                            &endpoint,
+                            attempt,
+                            error,
+                            lane,
+                            &mut last_error,
+                        )
+                        .await?
+                    {
                         break;
                     }
-                    tokio::time::sleep(Duration::from_millis(backoff_ms.unwrap_or(0))).await;
                 }
             }
         }
         let final_error =
             last_error.unwrap_or_else(|| Analysis2Error::http("HTTP request failed"));
         eprintln!(
-            "[api/error] endpoint={endpoint} method={method} action=give_up error={}",
+            "[api/error] endpoint={endpoint} method={method} provider={} action=give_up error={}",
+            lane.name,
             one_line_error(&final_error.to_string(), ERROR_LOG_CHARS)
         );
         Err(final_error)
+    }
+
+    /// Log, cool-down, and sleep for one failed attempt.
+    /// Returns `Ok(true)` when the caller should retry, `Ok(false)` to stop.
+    async fn handle_request_error(
+        &self,
+        method: &reqwest::Method,
+        endpoint: &str,
+        attempt: usize,
+        error: Analysis2Error,
+        lane: &ProviderLane,
+        last_error: &mut Option<Analysis2Error>,
+    ) -> Result<bool, Analysis2Error> {
+        let rate_limited = is_rate_limited(&error);
+        let retryable = rate_limited || is_retryable(&error);
+        let will_retry = attempt < self.retries && retryable;
+        // 429: cool down only this provider's limiter (not other providers).
+        let backoff = if will_retry {
+            if rate_limited {
+                lane.limiter.note_rate_limited(RATE_LIMIT_COOLDOWN);
+                Some(RATE_LIMIT_COOLDOWN)
+            } else {
+                Some(Duration::from_millis(
+                    100u64.saturating_mul(1u64 << attempt.min(8)),
+                ))
+            }
+        } else {
+            None
+        };
+        print_request_error(
+            method,
+            endpoint,
+            attempt + 1,
+            self.retries + 1,
+            backoff.map(|d| d.as_millis() as u64),
+            &error,
+        );
+        *last_error = Some(error);
+        if !will_retry {
+            return Ok(false);
+        }
+        if let Some(delay) = backoff {
+            tokio::time::sleep(delay).await;
+        }
+        Ok(true)
     }
 }
 
@@ -341,6 +565,9 @@ fn format_transport_error(
 }
 
 fn is_retryable(error: &Analysis2Error) -> bool {
+    if is_rate_limited(error) {
+        return true;
+    }
     match error {
         Analysis2Error::Http(message) => {
             let lower = message.to_ascii_lowercase();
@@ -355,7 +582,6 @@ fn is_retryable(error: &Analysis2Error) -> bool {
                 || lower.contains("read body failed")
                 || lower.contains("error decoding response body")
                 || lower.contains("error sending request")
-                || lower.contains("http 429")
                 || lower.contains("http 500")
                 || lower.contains("http 502")
                 || lower.contains("http 503")
@@ -369,10 +595,53 @@ fn is_retryable(error: &Analysis2Error) -> bool {
 fn is_http_status(error: &Analysis2Error, status: u16) -> bool {
     match error {
         Analysis2Error::Http(message) => {
-            let needle = format!("http {status}");
-            message.to_ascii_lowercase().contains(&needle)
+            let lower = message.to_ascii_lowercase();
+            let code = status.to_string();
+            // "HTTP 429 …", "HTTP 429 Too Many Requests …", "status=429 …"
+            lower.contains(&format!("http {code}"))
+                || lower.contains(&format!("status={code}"))
         }
         _ => false,
+    }
+}
+
+/// Provider rate-limit signal: HTTP 429, transport status=429, or rate-limit text.
+fn is_rate_limited(error: &Analysis2Error) -> bool {
+    match error {
+        Analysis2Error::Http(message) => {
+            if is_http_status(error, 429) {
+                return true;
+            }
+            let lower = message.to_ascii_lowercase();
+            lower.contains("too many requests")
+                || lower.contains("rate limit")
+                || lower.contains("rate-limit")
+                || lower.contains("ratelimited")
+                || lower.contains("\"code\":-32429")
+                || lower.contains("\"code\": 429")
+                || lower.contains("\"code\":429")
+        }
+        _ => false,
+    }
+}
+
+/// If a successful JSON-RPC payload is a rate-limit error, return a short body snippet.
+fn jsonrpc_rate_limit_error(value: &Value) -> Option<String> {
+    let err = value.get("error")?;
+    let code = err.get("code").and_then(|c| c.as_i64());
+    let message = err
+        .get("message")
+        .and_then(|m| m.as_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let rate_limited = matches!(code, Some(429) | Some(-32429) | Some(-32005))
+        || message.contains("rate limit")
+        || message.contains("too many requests")
+        || message.contains("rate limited");
+    if rate_limited {
+        Some(one_line_error(&err.to_string(), ERROR_BODY_CHARS))
+    } else {
+        None
     }
 }
 
@@ -613,22 +882,93 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn provider_lanes_have_independent_concurrency_and_cooldown() {
+        let client = HttpClient::with_retries(1, 0).unwrap();
+        // Saturate Alchemy concurrency (1 slot) by holding the permit without
+        // going through HTTP — acquire the semaphore directly via a long cool-down
+        // is not enough; use rate cool-down on alchemy and ensure opensea still moves.
+        client
+            .alchemy
+            .limiter
+            .note_rate_limited(Duration::from_millis(400));
+        // OpenSea must not wait for Alchemy's cool-down.
+        let start = Instant::now();
+        client.opensea.limiter.acquire().await.unwrap();
+        assert!(
+            start.elapsed() < Duration::from_millis(80),
+            "opensea cool-down/rate must be independent of alchemy pause"
+        );
+
+        // Concurrency: hold Alchemy's only in-flight permit and ensure OpenSea
+        // can still acquire its own permit immediately.
+        let alchemy_permit = client.alchemy.in_flight.clone().try_acquire_owned().unwrap();
+        let os_start = Instant::now();
+        let _os_permit = client.opensea.in_flight.clone().try_acquire_owned().unwrap();
+        assert!(
+            os_start.elapsed() < Duration::from_millis(20),
+            "opensea concurrency must not be blocked by a full alchemy pool"
+        );
+        drop(alchemy_permit);
+    }
+
     #[test]
-    fn helius_defaults_target_about_seven_rps() {
-        assert_eq!(HELIUS_RATE_LIMIT_BURST, 7);
-        assert_eq!(HELIUS_RATE_LIMIT_REFILL_MS, 150);
+    fn helius_defaults_target_five_rps() {
+        assert_eq!(HELIUS_RATE_LIMIT_BURST, 5);
+        assert_eq!(HELIUS_RATE_LIMIT_REFILL_MS, 200);
         let rps = 1000.0 / HELIUS_RATE_LIMIT_REFILL_MS as f64;
-        assert!((rps - 1000.0 / 150.0).abs() < 1e-9);
-        assert!(rps > 6.9 && rps < 7.1);
+        assert!((rps - 5.0).abs() < 1e-9);
+        assert_eq!(RATE_LIMIT_COOLDOWN, Duration::from_secs(1));
     }
 
     #[test]
     fn http_429_is_detected_for_fixed_backoff() {
         let err = Analysis2Error::http(
-            "HTTP 429 endpoint=example.com/ path content_type=application/json body=rate limited",
+            "HTTP 429 Too Many Requests endpoint=example.com/ content_type=application/json body=rate limited",
         );
         assert!(is_http_status(&err, 429));
+        assert!(is_rate_limited(&err));
         assert!(is_retryable(&err));
         assert!(!is_http_status(&err, 500));
+
+        let transport = Analysis2Error::http(
+            "transport error method=POST endpoint=mainnet.helius-rpc.com/ status=429 detail=…",
+        );
+        assert!(is_rate_limited(&transport));
+    }
+
+    #[test]
+    fn jsonrpc_rate_limit_payload_is_detected() {
+        let payload = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": "1",
+            "error": { "code": -32429, "message": "rate limited" }
+        });
+        assert!(jsonrpc_rate_limit_error(&payload).is_some());
+        let ok = serde_json::json!({"jsonrpc":"2.0","id":"1","result":{}});
+        assert!(jsonrpc_rate_limit_error(&ok).is_none());
+    }
+
+    #[tokio::test]
+    async fn rate_limit_cooldown_blocks_other_acquires_for_one_second() {
+        let limiter = TokenBucketRateLimiter::new(5, Duration::from_millis(200));
+        // Consume the initial token so the next acquire must wait.
+        limiter.acquire().await.unwrap();
+        limiter.note_rate_limited(Duration::from_millis(250));
+        let start = Instant::now();
+        limiter.acquire().await.unwrap();
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(240),
+            "expected ~250ms cool-down, got {elapsed:?}"
+        );
+        // After cool-down, a single resume token was granted and consumed;
+        // next acquire should wait for refill (~200ms), not block another full second.
+        let start2 = Instant::now();
+        limiter.acquire().await.unwrap();
+        assert!(
+            start2.elapsed() < Duration::from_millis(350),
+            "post cool-down acquire should only wait for refill"
+        );
     }
 }

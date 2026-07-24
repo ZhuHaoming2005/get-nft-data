@@ -332,8 +332,9 @@ pub struct HttpLimits {
 impl Default for HttpLimits {
     fn default() -> Self {
         Self {
-            // Prefer modest concurrency: Alchemy timeouts explode under 32×N
-            // nested candidate tasks on large holder/sales pages.
+            // Prefer modest per-provider concurrency: Alchemy timeouts explode
+            // under 32×N nested candidate tasks on large holder/sales pages.
+            // OpenSea/Helius/Etherscan use independent pools of the same size.
             concurrency: 8,
             retries: 3,
             max_transfer_pages: 5,

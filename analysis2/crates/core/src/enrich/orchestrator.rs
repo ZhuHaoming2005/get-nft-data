@@ -70,8 +70,9 @@ pub async fn enrich_candidates_with_hook(
     progress.set_stage("enrich");
     progress.begin_phase("enrich_candidates", Some(candidates.len() as u64));
 
-    // Single HTTP gate lives in HttpClient. Candidate tasks are scheduled with a
-    // higher slot count so they do not hold an outer permit across nested RPCs.
+    // Per-provider HTTP gates live in HttpClient (Alchemy/OpenSea/Helius/…).
+    // Candidate tasks use a higher outer slot count so they do not hold a task
+    // permit across nested RPCs.
     let task_slots = limits
         .concurrency
         .max(1)

@@ -73,8 +73,10 @@ struct RunArgs {
     #[arg(long)]
     rayon_threads: Option<usize>,
 
-    /// Max concurrent HTTP requests (Alchemy/Helius/etc.). Keep modest: each
-    /// candidate fans out to many nested RPCs. Default 12 avoids mass timeouts.
+    /// Per-provider HTTP concurrency (Alchemy / OpenSea / Helius / Etherscan each
+    /// get an independent pool of this size). Saturating Alchemy does not block
+    /// other providers. Keep modest: each candidate fans out to many nested RPCs.
+    /// Default 12 avoids mass Alchemy timeouts.
     #[arg(long, default_value_t = 12)]
     http_concurrency: usize,
 
@@ -127,7 +129,7 @@ struct SelectSeedsArgs {
     #[arg(long)]
     helius_api_key: Option<String>,
 
-    /// Max concurrent HTTP requests.
+    /// Per-provider HTTP concurrency (independent pools for each API provider).
     #[arg(long, default_value_t = 32)]
     http_concurrency: usize,
 

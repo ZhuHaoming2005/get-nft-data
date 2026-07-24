@@ -47,7 +47,7 @@ pub async fn fetch_transfers(
             contract,
             api_key
         );
-        let payload = match client.get_json(&url, &[]).await {
+        let payload = match client.get_json_etherscan(&url, &[]).await {
             Ok(v) => v,
             Err(e) => {
                 if transfers.is_empty() {

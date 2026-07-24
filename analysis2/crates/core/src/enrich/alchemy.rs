@@ -180,7 +180,7 @@ pub async fn fetch_transfers(
             "method": "alchemy_getAssetTransfers",
             "params": [params]
         });
-        let payload = match client.post_json(&rpc, &[], &body).await {
+        let payload = match client.post_json_alchemy(&rpc, &[], &body).await {
             Ok(v) => v,
             Err(e) => {
                 if transfers.is_empty() {
@@ -327,7 +327,7 @@ async fn fetch_holders_pages(
             page_url.push_str("&pageKey=");
             page_url.push_str(&urlencoding_minimal(key));
         }
-        let payload = match client.get_json(&page_url, &[]).await {
+        let payload = match client.get_json_alchemy(&page_url, &[]).await {
             Ok(v) => v,
             Err(e) => {
                 if holders.is_empty() {
@@ -405,7 +405,7 @@ pub async fn fetch_sales(
             url.push_str("&pageKey=");
             url.push_str(&urlencoding_minimal(key));
         }
-        let payload = match client.get_json(&url, &[]).await {
+        let payload = match client.get_json_alchemy(&url, &[]).await {
             Ok(v) => v,
             Err(e) => {
                 if sales.is_empty() {
@@ -472,7 +472,7 @@ pub async fn fetch_prices(
         api_key,
         symbol
     );
-    let payload = match client.get_json(&url, &[]).await {
+    let payload = match client.get_json_alchemy(&url, &[]).await {
         Ok(v) => v,
         Err(e) => return FetchOutcome::failed("alchemy", "alchemy_prices", e),
     };
@@ -828,7 +828,7 @@ const RECEIPT_RPC_BATCH_SIZE: usize = 80;
 
 /// Fetch `eth_getTransactionReceipt` for unique tx hashes; parse gas fee in native units.
 ///
-/// Uses JSON-RPC batches gated only by [`HttpClient`] concurrency (no nested
+/// Uses JSON-RPC batches gated by the Alchemy lane concurrency (no nested
 /// per-phase semaphore). Batch HTTP failures fall back to per-hash requests.
 ///
 /// Status: NotRequested (no key) / Empty (no txs) / Complete (all ok) /
@@ -935,7 +935,7 @@ async fn fetch_receipt_gas_batch(
             .collect(),
     );
 
-    match client.post_json(rpc, &[], &body).await {
+    match client.post_json_alchemy(rpc, &[], &body).await {
         Ok(payload) => match parse_receipt_batch_payload(&payload, batch_idx, hashes) {
             Ok(rows) => rows,
             Err(_) => fetch_receipt_gas_singles(client, rpc, batch_idx, hashes).await,
@@ -1014,7 +1014,7 @@ async fn fetch_receipt_gas_singles(
                 "method": "eth_getTransactionReceipt",
                 "params": [hash]
             });
-            let payload = match client.post_json(&rpc, &[], &body).await {
+            let payload = match client.post_json_alchemy(&rpc, &[], &body).await {
                 Ok(v) => v,
                 Err(e) => return (hash, Err(e.to_string())),
             };
@@ -1160,7 +1160,7 @@ pub async fn fetch_external_transfers(
         "method": "alchemy_getAssetTransfers",
         "params": [params]
     });
-    let payload = match client.post_json(&rpc, &[], &body).await {
+    let payload = match client.post_json_alchemy(&rpc, &[], &body).await {
         Ok(v) => v,
         Err(e) => return FetchOutcome::failed("alchemy", "alchemy_external", e),
     };
@@ -1442,7 +1442,7 @@ pub async fn fetch_collection_slug(
     let api_key = api_key?;
     let base = endpoints.alchemy_nft(chain, api_key, "getNFTsForContract")?;
     let url = format!("{base}?contractAddress={contract}&withMetadata=true&limit=1");
-    let payload = client.get_json(&url, &[]).await.ok()?;
+    let payload = client.get_json_alchemy(&url, &[]).await.ok()?;
     payload
         .get("nfts")
         .and_then(Value::as_array)
@@ -1475,7 +1475,7 @@ pub async fn is_holder_of_contract(
     };
     let url = format!("{base}?wallet={wallet}&contractAddress={contract}");
     let payload = client
-        .get_json(&url, &[])
+        .get_json_alchemy(&url, &[])
         .await
         .map_err(|e| e.to_string())?;
     Ok(Some(

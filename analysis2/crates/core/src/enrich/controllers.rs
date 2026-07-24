@@ -40,7 +40,7 @@ pub async fn fetch_evm_controllers(
     let mut supplemental_failed = false;
     let mut deployer: Option<String> = None;
 
-    match client.get_json(&meta_url, &[]).await {
+    match client.get_json_alchemy(&meta_url, &[]).await {
         Ok(payload) => {
             if payload.get("error").is_some() {
                 supplemental_failed = true;
@@ -149,7 +149,7 @@ async fn onchain_controllers(
         }
     ]);
     let payload = client
-        .post_json(rpc_url, &[], &batch)
+        .post_json_alchemy(rpc_url, &[], &batch)
         .await
         .map_err(|e| e.to_string())?;
     let rows = payload
