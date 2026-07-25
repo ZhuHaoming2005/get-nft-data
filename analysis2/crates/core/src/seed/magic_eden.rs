@@ -46,10 +46,7 @@ pub fn parse_popular_collections(payload: &Value) -> Vec<MagicEdenCollection> {
         .iter()
         .enumerate()
         .filter_map(|(index, collection)| {
-            let symbol = collection
-                .get("symbol")
-                .and_then(Value::as_str)?
-                .trim();
+            let symbol = collection.get("symbol").and_then(Value::as_str)?.trim();
             if symbol.is_empty() || !seen_symbols.insert(symbol.to_owned()) {
                 return None;
             }

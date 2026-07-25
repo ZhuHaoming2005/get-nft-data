@@ -6,11 +6,7 @@ pub struct CandidateBounds;
 impl CandidateBounds {
     const ROUNDING_EPSILON: f64 = 1e-12;
 
-    pub fn minimum_multiset_overlap(
-        left_len: usize,
-        right_len: usize,
-        threshold: f64,
-    ) -> usize {
+    pub fn minimum_multiset_overlap(left_len: usize, right_len: usize, threshold: f64) -> usize {
         if left_len == 0 && right_len == 0 {
             return 0;
         }

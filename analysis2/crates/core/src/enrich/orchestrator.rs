@@ -193,9 +193,13 @@ async fn enrich_evm(
             keys.opensea(),
             chain,
             address,
+            limits.max_sale_pages,
         )
         .await;
-        if matches!(os.status, EvidenceStatus::Complete) {
+        if matches!(
+            os.status,
+            EvidenceStatus::Empty | EvidenceStatus::Complete | EvidenceStatus::Truncated
+        ) {
             if matches!(sales.status, EvidenceStatus::Failed)
                 && let Some(failure) = sales.failure.take()
             {
@@ -204,7 +208,9 @@ async fn enrich_evm(
             if sales.value.is_empty() {
                 sales = os;
             } else {
-                fill_missing_sale_amounts(&mut sales.value, &os.value);
+                fill_missing_sale_amounts(&mut sales.value, &os.value, chain);
+                sales.status = combine_required_status(Some(sales.status), Some(os.status));
+                sales.truncated |= os.truncated;
                 if let Some(obs) = os.observation {
                     bundle.provenance.push(obs);
                 }
@@ -217,20 +223,43 @@ async fn enrich_evm(
         }
     }
 
-    // Spot price (run-time) + receipt gas are independent of each other.
+    let deployed_block = controllers_out.value.deployed_block;
+
+    // Spot price, activity receipt gas, and deployment receipt gas are independent.
     let tx_hashes = alchemy::collect_unique_tx_hashes(&transfers.value, &sales.value);
-    let (prices, gas) = tokio::join!(
-        alchemy::fetch_prices(client, &limits.endpoints, keys.alchemy(), chain, &[]),
-        alchemy::fetch_receipt_gas(
+    let payment_symbols = price_symbols_for_sales(&sales.value);
+    let payment_addresses = price_addresses_for_sales(&sales.value, chain);
+    let (prices, gas, deployment, royalty_recipients) = tokio::join!(
+        alchemy::fetch_prices(
             client,
             &limits.endpoints,
             keys.alchemy(),
             chain,
-            &tx_hashes,
+            &payment_symbols,
+            &payment_addresses,
+        ),
+        alchemy::fetch_receipt_gas(client, &limits.endpoints, keys.alchemy(), chain, &tx_hashes,),
+        alchemy::fetch_deployment(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            chain,
+            address,
+            deployed_block,
+        ),
+        alchemy::fetch_royalty_recipients(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            chain,
+            address,
+            &sales.value,
         ),
     );
     apply_prices_to_sales(&mut sales.value, &prices.value, chain);
+    alchemy::attach_royalty_recipients(&mut sales.value, &royalty_recipients.value);
     alchemy::attach_receipt_gas(&mut transfers.value, &gas.value);
+    alchemy::attach_sale_receipt_gas(&mut sales.value, &gas.value);
 
     apply_outcome(
         &mut bundle.quality.transfers,
@@ -270,6 +299,21 @@ async fn enrich_evm(
         &mut bundle.quality.failures,
         &gas,
     );
+    bundle.quality.gas = combine_required_status(Some(bundle.quality.gas), Some(deployment.status));
+    if let Some(observation) = deployment.observation {
+        bundle.provenance.push(observation);
+    }
+    if let Some(failure) = deployment.failure {
+        bundle.quality.failures.push(failure);
+    }
+    bundle.deployment_timestamp = deployment.value.as_ref().and_then(|event| event.timestamp);
+    bundle.deployment = deployment.value;
+    if let Some(observation) = royalty_recipients.observation {
+        bundle.provenance.push(observation);
+    }
+    if let Some(failure) = royalty_recipients.failure {
+        bundle.quality.failures.push(failure);
+    }
 
     // Controllers before value-flow so operator seeds include on-chain owners.
     if let Some(obs) = controllers_out.observation {
@@ -278,22 +322,94 @@ async fn enrich_evm(
     if let Some(failure) = controllers_out.failure {
         bundle.quality.failures.push(failure);
     }
-    bundle.controllers = controllers_out.value;
+    bundle.controllers = controllers_out.value.addresses;
 
-    // Value-flow needs gas-attached fee_payers; mint extras only probe mint
-    // recipients and can run concurrently.
-    let (value_flows, mint_extras) = tokio::join!(
+    let mut preliminary_operator_seeds = bundle.controllers.clone();
+    preliminary_operator_seeds.push(address.to_owned());
+    if let Some(payer) = bundle
+        .deployment
+        .as_ref()
+        .and_then(|deployment| deployment.fee_payer.clone())
+    {
+        preliminary_operator_seeds.push(payer);
+    }
+
+    // A controlled-recipient pass supplies mint-payment evidence. After payments are
+    // attached, derive the final binary operator set and query that exact set.
+    let (mut preliminary_flows, mint_extras) = tokio::join!(
         value_flow::fetch_evm_value_flows(
             client,
             &limits.endpoints,
             keys.alchemy(),
             chain,
-            &bundle.controllers,
+            &preliminary_operator_seeds,
             &bundle.transfers,
             &bundle.sales,
         ),
         collect_evm_mint_payment_extras(client, keys, limits, chain, &bundle.transfers),
     );
+    apply_runtime_price_to_value_flows(&mut preliminary_flows.value, &bundle.prices, chain);
+    mint_payment::attach_mint_payments(
+        &mut bundle.transfers,
+        &preliminary_flows.value,
+        &bundle.prices,
+        chain,
+        &mint_extras.payments,
+    );
+    mint_payment::retain_controlled_mint_payments(
+        &mut bundle.transfers,
+        chain,
+        address,
+        &bundle.controllers,
+    );
+    if bundle.transfers.iter().any(|transfer| transfer.is_mint)
+        && !matches!(
+            preliminary_flows.status,
+            EvidenceStatus::Complete | EvidenceStatus::Empty
+        )
+        && matches!(
+            bundle.quality.transfers,
+            EvidenceStatus::Complete | EvidenceStatus::Empty
+        )
+    {
+        bundle.quality.transfers = EvidenceStatus::Truncated;
+        bundle.quality.failures.push(
+            "mint payment attribution incomplete because the preliminary controller value-flow pass was incomplete"
+                .into(),
+        );
+    }
+
+    let operator_seeds = value_flow::derive_operator_seeds(
+        chain,
+        address,
+        &bundle.controllers,
+        bundle.deployment.as_ref(),
+        &bundle.transfers,
+        &bundle.sales,
+        bundle.quality.transfers,
+    );
+    let (initial_seeds, _) = value_flow::collect_operator_seeds(&preliminary_operator_seeds);
+    let (final_seeds, _) = value_flow::collect_operator_seeds(&operator_seeds);
+    let value_flows = if initial_seeds == final_seeds {
+        preliminary_flows
+    } else {
+        if let Some(observation) = preliminary_flows.observation.take() {
+            bundle.provenance.push(observation);
+        }
+        if let Some(failure) = preliminary_flows.failure.take() {
+            bundle.quality.failures.push(failure);
+        }
+        value_flow::fetch_evm_value_flows(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            chain,
+            &operator_seeds,
+            &bundle.transfers,
+            &bundle.sales,
+        )
+        .await
+    };
     apply_outcome(
         &mut bundle.quality.value_flows,
         &mut bundle.provenance,
@@ -301,14 +417,44 @@ async fn enrich_evm(
         &value_flows,
     );
     bundle.value_flows = value_flows.value;
-
-    mint_payment::attach_mint_payments(
-        &mut bundle.transfers,
-        &bundle.value_flows,
-        &bundle.prices,
-        chain,
-        &mint_extras,
-    );
+    // Receipt gas fetched above only covered NFT transfer/sale transactions.
+    // Funding and cashout commonly occur in separate transactions, so attach
+    // their own receipt fees before classifying Setup/Exit costs.
+    alchemy::attach_value_flow_receipt_gas(&mut bundle.value_flows, &gas.value);
+    let mut flow_tx_hashes = alchemy::value_flow_tx_hashes(&bundle.value_flows);
+    flow_tx_hashes.retain(|hash| !gas.value.contains_key(hash));
+    if !flow_tx_hashes.is_empty() {
+        let flow_gas = alchemy::fetch_receipt_gas(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            chain,
+            &flow_tx_hashes,
+        )
+        .await;
+        let combined = combine_required_status(Some(bundle.quality.gas), Some(flow_gas.status));
+        bundle.quality.gas = combined;
+        if let Some(obs) = flow_gas.observation.clone() {
+            bundle.provenance.push(obs);
+        }
+        if let Some(failure) = flow_gas.failure.clone() {
+            bundle.quality.failures.push(failure);
+        }
+        alchemy::attach_value_flow_receipt_gas(&mut bundle.value_flows, &flow_gas.value);
+    }
+    apply_runtime_price_to_value_flows(&mut bundle.value_flows, &bundle.prices, chain);
+    if !mint_extras.ambiguous.is_empty()
+        && matches!(
+            bundle.quality.transfers,
+            EvidenceStatus::Complete | EvidenceStatus::Empty
+        )
+    {
+        bundle.quality.transfers = EvidenceStatus::Truncated;
+        bundle.quality.failures.push(format!(
+            "mint payment attribution ambiguous for {} payer transaction(s); excluded from formal totals",
+            mint_extras.ambiguous.len()
+        ));
+    }
 
     bundle.quality.assets = EvidenceStatus::NotRequested;
     bundle.quality.histories = EvidenceStatus::NotRequested;
@@ -374,20 +520,39 @@ async fn enrich_solana(
     )
     .await;
 
+    let transfer_discovery_complete = matches!(
+        history.status,
+        EvidenceStatus::Complete | EvidenceStatus::Empty
+    ) && !history.truncated
+        && !snapshot.truncated
+        && snapshot.value.assets.len() <= limits.max_history_assets;
     let (mut transfers, mut sales) = history.value;
 
     let (gas, value_flows, decode_stats) = helius::decode_and_attach_transactions(
         client,
         &limits.endpoints.helius,
         keys.helius(),
+        helius::DecodeContext {
+            candidate: address,
+            controllers: &bundle.controllers,
+            transfer_discovery_complete,
+        },
         &mut transfers,
         &mut sales,
-        &bundle.controllers,
     )
     .await;
 
-    let prices =
-        alchemy::fetch_prices(client, &limits.endpoints, keys.alchemy(), chain, &[]).await;
+    let payment_symbols = price_symbols_for_sales(&sales);
+    let payment_addresses = price_addresses_for_sales(&sales, chain);
+    let prices = alchemy::fetch_prices(
+        client,
+        &limits.endpoints,
+        keys.alchemy(),
+        chain,
+        &payment_symbols,
+        &payment_addresses,
+    )
+    .await;
     apply_prices_to_sales(&mut sales, &prices.value, chain);
 
     apply_outcome(
@@ -480,6 +645,7 @@ async fn enrich_solana(
         &prices,
     );
     bundle.prices = prices.value;
+    apply_runtime_price_to_value_flows(&mut bundle.value_flows, &bundle.prices, chain);
 
     mint_payment::attach_mint_payments(
         &mut bundle.transfers,
@@ -488,6 +654,10 @@ async fn enrich_solana(
         chain,
         &ahash::AHashMap::new(),
     );
+    // Solana mint programs commonly route payment to a Candy Machine or
+    // treasury account distinct from collection authorities. The transaction
+    // decoder has already required a unique same-transaction buyer outflow, so
+    // do not apply the EVM controller-recipient restriction here.
 
     finalize_legit_signals(&mut bundle);
     bundle
@@ -508,8 +678,35 @@ fn apply_outcome<T>(
     }
 }
 
-/// Cap mint-recipient EXTERNAL probes for paid-mint attachment.
-const MAX_MINT_PAYER_PROBES: usize = 8;
+fn combine_required_status(
+    first: Option<EvidenceStatus>,
+    second: Option<EvidenceStatus>,
+) -> EvidenceStatus {
+    let statuses = [first, second].into_iter().flatten().collect::<Vec<_>>();
+    if statuses.is_empty() {
+        return EvidenceStatus::Empty;
+    }
+    if statuses.contains(&EvidenceStatus::Failed) {
+        EvidenceStatus::Failed
+    } else if statuses.contains(&EvidenceStatus::NotRequested) {
+        EvidenceStatus::NotRequested
+    } else if statuses.contains(&EvidenceStatus::Truncated) {
+        EvidenceStatus::Truncated
+    } else if statuses
+        .iter()
+        .all(|status| *status == EvidenceStatus::Empty)
+    {
+        EvidenceStatus::Empty
+    } else {
+        EvidenceStatus::Complete
+    }
+}
+
+#[derive(Default)]
+struct MintPaymentExtras {
+    payments: ahash::AHashMap<(String, String), (f64, String)>,
+    ambiguous: ahash::AHashSet<(String, String)>,
+}
 
 async fn collect_evm_mint_payment_extras(
     client: &HttpClient,
@@ -517,11 +714,11 @@ async fn collect_evm_mint_payment_extras(
     limits: &HttpLimits,
     chain: &str,
     transfers: &[TransferEvent],
-) -> ahash::AHashMap<String, f64> {
+) -> MintPaymentExtras {
     use super::value_flow::activity_block_window;
     use ahash::{AHashMap, AHashSet};
 
-    let mut out = AHashMap::new();
+    let mut grouped = AHashMap::<(String, String), (f64, AHashSet<String>)>::new();
     let mint_txs: AHashSet<String> = transfers
         .iter()
         .filter(|t| t.is_mint)
@@ -529,7 +726,7 @@ async fn collect_evm_mint_payment_extras(
         .filter(|t| !t.is_empty())
         .collect();
     if mint_txs.is_empty() || keys.alchemy().is_none() {
-        return out;
+        return MintPaymentExtras::default();
     }
     let window = activity_block_window(transfers, &[]);
     let (from_block, to_block) = window.unwrap_or((0, u64::MAX));
@@ -543,7 +740,6 @@ async fn collect_evm_mint_payment_extras(
     }
     let mut payers: Vec<String> = payers.into_iter().collect();
     payers.sort();
-    payers.truncate(MAX_MINT_PAYER_PROBES);
 
     let mut handles = Vec::with_capacity(payers.len());
     for (idx, payer) in payers.into_iter().enumerate() {
@@ -579,11 +775,29 @@ async fn collect_evm_mint_payment_extras(
             if amt <= 0.0 {
                 continue;
             }
-            let entry = out.entry(tx).or_insert(0.0);
-            *entry += amt;
+            let payer = row.from.trim().to_ascii_lowercase();
+            let receiver = row.to.trim().to_ascii_lowercase();
+            if payer.is_empty() || receiver.is_empty() || receiver == payer {
+                continue;
+            }
+            let entry = grouped
+                .entry((tx, payer))
+                .or_insert_with(|| (0.0, AHashSet::new()));
+            entry.0 += amt;
+            entry.1.insert(receiver);
         }
     }
-    out
+    let mut extras = MintPaymentExtras::default();
+    for (key, (amount, receivers)) in grouped {
+        if receivers.len() == 1 {
+            if let Some(receiver) = receivers.into_iter().next() {
+                extras.payments.insert(key, (amount, receiver));
+            }
+        } else if receivers.len() > 1 {
+            extras.ambiguous.insert(key);
+        }
+    }
+    extras
 }
 
 fn apply_prices_to_sales(
@@ -591,38 +805,255 @@ fn apply_prices_to_sales(
     prices: &[super::types::PriceBucket],
     chain: &str,
 ) {
-    // Single run-time spot rate for the chain (not historical day buckets).
-    let Some(rate) = prices
-        .iter()
-        .find(|p| p.chain == chain && p.usd_per_native > 0.0)
-        .map(|p| p.usd_per_native)
-        .or_else(|| {
-            prices
-                .iter()
-                .find(|p| p.usd_per_native > 0.0)
-                .map(|p| p.usd_per_native)
-        })
-    else {
-        return;
-    };
     for sale in sales {
-        if sale.usd_amount.is_some() {
-            continue;
-        }
-        let Some(native) = sale.native_amount else {
-            continue;
+        let rate = runtime_currency_rate(
+            prices,
+            chain,
+            sale.currency_symbol.as_deref(),
+            sale.currency_address.as_deref(),
+        );
+        let marketplace_rate = runtime_currency_rate(
+            prices,
+            chain,
+            sale.marketplace_fee_currency_symbol
+                .as_deref()
+                .or(sale.currency_symbol.as_deref()),
+            sale.marketplace_fee_currency_address
+                .as_deref()
+                .or(sale.currency_address.as_deref()),
+        );
+        let royalty_rate = runtime_currency_rate(
+            prices,
+            chain,
+            sale.royalty_fee_currency_symbol
+                .as_deref()
+                .or(sale.currency_symbol.as_deref()),
+            sale.royalty_fee_currency_address
+                .as_deref()
+                .or(sale.currency_address.as_deref()),
+        );
+        // Never retain a provider's event-day USD estimate. A report amount is
+        // defined only when the payment units and a run-time rate are both known.
+        sale.seller_proceeds_usd = sale
+            .seller_proceeds_native
+            .zip(rate)
+            .map(|(amount, rate)| amount * rate);
+        sale.marketplace_fee_usd = sale
+            .marketplace_fee_native
+            .zip(marketplace_rate)
+            .map(|(amount, rate)| amount * rate);
+        sale.royalty_fee_usd = sale
+            .royalty_fee_native
+            .zip(royalty_rate)
+            .map(|(amount, rate)| amount * rate);
+        sale.usd_amount = if sale.seller_proceeds_native.is_some()
+            && sale.marketplace_fee_native.is_some()
+            && sale.royalty_fee_native.is_some()
+        {
+            sale.seller_proceeds_usd
+                .zip(sale.marketplace_fee_usd)
+                .zip(sale.royalty_fee_usd)
+                .map(|((seller, marketplace), royalty)| seller + marketplace + royalty)
+        } else {
+            sale.native_amount
+                .zip(rate)
+                .map(|(amount, rate)| amount * rate)
         };
-        sale.usd_amount = Some(native * rate);
     }
 }
 
-fn fill_missing_sale_amounts(preferred: &mut [SaleEvent], fallback: &[SaleEvent]) {
-    for sale in preferred.iter_mut() {
-        if sale.native_amount.is_some() || sale.usd_amount.is_some() {
-            continue;
+fn runtime_currency_rate(
+    prices: &[super::types::PriceBucket],
+    chain: &str,
+    symbol: Option<&str>,
+    address: Option<&str>,
+) -> Option<f64> {
+    let symbol = symbol.map(str::trim).filter(|symbol| !symbol.is_empty());
+    let symbol_quote_is_safe = address.is_none()
+        || symbol
+            .is_some_and(|symbol| is_native_or_wrapped(chain, symbol) || is_usd_stablecoin(symbol));
+    let address_rate = address.and_then(|address| {
+        let expected = super::types::normalize_chain_address(chain, address);
+        prices
+            .iter()
+            .find(|price| {
+                price.token_address.as_deref().is_some_and(|actual| {
+                    super::types::normalize_chain_address(chain, actual) == expected
+                }) && price.usd_per_native.is_finite()
+                    && price.usd_per_native > 0.0
+            })
+            .map(|price| price.usd_per_native)
+    });
+    address_rate.or_else(|| {
+        symbol
+            .filter(|_| symbol_quote_is_safe)
+            .and_then(|symbol| {
+                prices
+                    .iter()
+                    .find(|price| {
+                        price.symbol.eq_ignore_ascii_case(symbol)
+                            && price.usd_per_native.is_finite()
+                            && price.usd_per_native > 0.0
+                    })
+                    .map(|price| price.usd_per_native)
+            })
+            .or_else(|| {
+                symbol
+                    .filter(|symbol| is_usd_stablecoin(symbol))
+                    .map(|_| 1.0)
+            })
+            .or_else(|| {
+                if symbol.is_none_or(|symbol| is_native_or_wrapped(chain, symbol)) {
+                    prices
+                        .iter()
+                        .find(|price| {
+                            price.chain.eq_ignore_ascii_case(chain)
+                                && is_native_or_wrapped(chain, &price.symbol)
+                                && price.usd_per_native.is_finite()
+                                && price.usd_per_native > 0.0
+                        })
+                        .map(|price| price.usd_per_native)
+                } else {
+                    None
+                }
+            })
+    })
+}
+
+fn apply_runtime_price_to_value_flows(
+    edges: &mut [super::types::ValueFlowEdge],
+    prices: &[super::types::PriceBucket],
+    chain: &str,
+) {
+    let rate = prices
+        .iter()
+        .find(|price| {
+            price.chain.eq_ignore_ascii_case(chain)
+                && is_native_or_wrapped(chain, &price.symbol)
+                && price.usd_per_native.is_finite()
+                && price.usd_per_native > 0.0
+        })
+        .map(|price| price.usd_per_native);
+    for edge in edges {
+        edge.usd_amount = edge
+            .native_amount
+            .filter(|amount| amount.is_finite() && *amount >= 0.0)
+            .zip(rate)
+            .map(|(amount, rate)| amount * rate);
+    }
+}
+
+fn is_usd_stablecoin(symbol: &str) -> bool {
+    matches!(
+        symbol.trim().to_ascii_uppercase().as_str(),
+        "USDC"
+            | "USDC.E"
+            | "USDT"
+            | "USDT.E"
+            | "DAI"
+            | "USDS"
+            | "PYUSD"
+            | "FDUSD"
+            | "TUSD"
+            | "USDG"
+            | "USDE"
+            | "GUSD"
+            | "LUSD"
+            | "FRAX"
+            | "CRVUSD"
+    )
+}
+
+fn is_native_or_wrapped(chain: &str, symbol: &str) -> bool {
+    let symbol = symbol.trim().to_ascii_uppercase();
+    match chain.trim().to_ascii_lowercase().as_str() {
+        "ethereum" | "base" => matches!(symbol.as_str(), "ETH" | "WETH"),
+        "polygon" | "matic" => {
+            matches!(symbol.as_str(), "MATIC" | "POL" | "WMATIC" | "WPOL")
         }
+        "solana" => matches!(symbol.as_str(), "SOL" | "WSOL"),
+        _ => false,
+    }
+}
+
+fn price_symbols_for_sales(sales: &[SaleEvent]) -> Vec<String> {
+    const MAX_PAYMENT_PRICE_SYMBOLS: usize = 64;
+    let mut symbols: Vec<String> = sales
+        .iter()
+        .flat_map(|sale| {
+            [
+                sale.currency_symbol.as_deref(),
+                sale.marketplace_fee_currency_symbol.as_deref(),
+                sale.royalty_fee_currency_symbol.as_deref(),
+            ]
+        })
+        .flatten()
+        .map(|symbol| symbol.trim().to_ascii_uppercase())
+        .filter(|symbol| {
+            !symbol.is_empty()
+                && symbol.len() <= 20
+                && symbol
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'_'))
+        })
+        .collect();
+    symbols.sort();
+    symbols.dedup();
+    symbols.truncate(MAX_PAYMENT_PRICE_SYMBOLS);
+    symbols
+}
+
+fn price_addresses_for_sales(sales: &[SaleEvent], chain: &str) -> Vec<String> {
+    const MAX_PAYMENT_PRICE_ADDRESSES: usize = 64;
+    let mut addresses = sales
+        .iter()
+        .flat_map(|sale| {
+            [
+                (
+                    sale.currency_address.as_deref(),
+                    sale.currency_symbol.as_deref(),
+                ),
+                (
+                    sale.marketplace_fee_currency_address.as_deref(),
+                    sale.marketplace_fee_currency_symbol.as_deref(),
+                ),
+                (
+                    sale.royalty_fee_currency_address.as_deref(),
+                    sale.royalty_fee_currency_symbol.as_deref(),
+                ),
+            ]
+        })
+        .filter_map(|(address, symbol)| {
+            let address = address?;
+            let symbol_is_native = symbol.is_some_and(|symbol| is_native_or_wrapped(chain, symbol));
+            (!symbol_is_native || !is_evm_native_sentinel(chain, address)).then_some(address)
+        })
+        .map(str::trim)
+        .filter(|address| !address.is_empty())
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    addresses.sort();
+    addresses.dedup();
+    addresses.truncate(MAX_PAYMENT_PRICE_ADDRESSES);
+    addresses
+}
+
+fn is_evm_native_sentinel(chain: &str, address: &str) -> bool {
+    if chain.eq_ignore_ascii_case("solana") {
+        return false;
+    }
+    matches!(
+        address.trim().to_ascii_lowercase().as_str(),
+        "0x0000000000000000000000000000000000000000" | "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
+    )
+}
+
+fn fill_missing_sale_amounts(preferred: &mut [SaleEvent], fallback: &[SaleEvent], chain: &str) {
+    for sale in preferred.iter_mut() {
         if let Some(src) = fallback.iter().find(|f| {
-            (!sale.tx_hash.is_empty() && f.tx_hash == sale.tx_hash)
+            (!sale.tx_hash.is_empty()
+                && super::types::normalize_chain_transaction(chain, &f.tx_hash)
+                    == super::types::normalize_chain_transaction(chain, &sale.tx_hash))
                 || (f.token_id == sale.token_id
                     && !sale.token_id.is_empty()
                     && f.timestamp == sale.timestamp)
@@ -635,6 +1066,15 @@ fn fill_missing_sale_amounts(preferred: &mut [SaleEvent], fallback: &[SaleEvent]
             }
             if sale.currency_symbol.is_none() {
                 sale.currency_symbol = src.currency_symbol.clone();
+            }
+            if sale.currency_address.is_none() {
+                sale.currency_address = src.currency_address.clone();
+            }
+            if sale.seller_proceeds_native.is_none() {
+                sale.seller_proceeds_native = src.seller_proceeds_native;
+            }
+            if sale.seller_proceeds_usd.is_none() {
+                sale.seller_proceeds_usd = src.seller_proceeds_usd;
             }
         }
     }
@@ -650,8 +1090,8 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::dedup::hits::{Dimension, HitEdge, HitGraph};
-    use crate::enrich::types::ProviderEndpoints;
     use crate::enrich::ValueFlowKind;
+    use crate::enrich::types::ProviderEndpoints;
     use crate::entity::{IdentityRow, SourceOrder};
     use crate::progress::NoopProgress;
 
@@ -679,6 +1119,117 @@ mod tests {
         fn finish(&self) {
             self.finishes.fetch_add(1, Ordering::Relaxed);
         }
+    }
+
+    fn priced_sale(symbol: &str, amount: f64) -> SaleEvent {
+        SaleEvent {
+            tx_hash: format!("tx-{symbol}"),
+            token_id: "1".into(),
+            seller: "0xseller".into(),
+            buyer: "0xbuyer".into(),
+            timestamp: Some(1),
+            block_number: Some(1),
+            marketplace: None,
+            native_amount: Some(amount),
+            usd_amount: None,
+            currency_symbol: Some(symbol.into()),
+            currency_address: None,
+            seller_proceeds_native: Some(amount),
+            seller_proceeds_usd: None,
+            ..SaleEvent::default()
+        }
+    }
+
+    #[test]
+    fn runtime_pricing_handles_stable_native_common_and_unknown_tokens() {
+        let prices = vec![
+            super::super::types::PriceBucket {
+                chain: "ethereum".into(),
+                day_utc: 0,
+                symbol: "ETH".into(),
+                token_address: None,
+                usd_per_native: 2_000.0,
+            },
+            super::super::types::PriceBucket {
+                chain: "ethereum".into(),
+                day_utc: 0,
+                symbol: "WBTC".into(),
+                token_address: None,
+                usd_per_native: 60_000.0,
+            },
+        ];
+        let mut sales = vec![
+            priced_sale("USDC", 5.0),
+            priced_sale("WETH", 2.0),
+            priced_sale("WBTC", 0.1),
+            priced_sale("UNKNOWN", 7.0),
+        ];
+        sales[3].usd_amount = Some(999.0);
+        sales[3].seller_proceeds_usd = Some(999.0);
+        apply_prices_to_sales(&mut sales, &prices, "ethereum");
+        assert_eq!(sales[0].usd_amount, Some(5.0));
+        assert_eq!(sales[1].usd_amount, Some(4_000.0));
+        assert_eq!(sales[2].usd_amount, Some(6_000.0));
+        assert_eq!(sales[3].usd_amount, None);
+        assert_eq!(sales[3].seller_proceeds_usd, None);
+        assert_eq!(sales[1].seller_proceeds_usd, Some(4_000.0));
+    }
+
+    #[test]
+    fn runtime_pricing_values_fee_splits_in_their_own_currencies() {
+        let mut sale = priced_sale("ETH", 0.8);
+        sale.marketplace_fee_native = Some(10.0);
+        sale.marketplace_fee_currency_symbol = Some("USDC".into());
+        sale.royalty_fee_native = Some(5.0);
+        sale.royalty_fee_currency_symbol = Some("ART".into());
+        sale.royalty_fee_currency_address = Some("0xart".into());
+        let prices = vec![
+            super::super::types::PriceBucket {
+                chain: "ethereum".into(),
+                day_utc: 0,
+                symbol: "ETH".into(),
+                token_address: None,
+                usd_per_native: 2_000.0,
+            },
+            super::super::types::PriceBucket {
+                chain: "ethereum".into(),
+                day_utc: 0,
+                symbol: "ART".into(),
+                token_address: Some("0xart".into()),
+                usd_per_native: 2.0,
+            },
+        ];
+        apply_prices_to_sales(std::slice::from_mut(&mut sale), &prices, "ethereum");
+        assert_eq!(sale.seller_proceeds_usd, Some(1_600.0));
+        assert_eq!(sale.marketplace_fee_usd, Some(10.0));
+        assert_eq!(sale.royalty_fee_usd, Some(10.0));
+        assert_eq!(sale.usd_amount, Some(1_620.0));
+    }
+
+    #[test]
+    fn runtime_price_requests_cover_observed_safe_payment_symbols() {
+        let sales = vec![
+            priced_sale("BONK", 1.0),
+            priced_sale("PEPE", 1.0),
+            priced_sale("USDC", 1.0),
+            priced_sale("bad&symbol", 1.0),
+        ];
+        assert_eq!(
+            price_symbols_for_sales(&sales),
+            vec!["BONK".to_owned(), "PEPE".to_owned(), "USDC".to_owned()]
+        );
+    }
+
+    #[test]
+    fn native_sentinel_is_not_sent_to_token_address_pricing() {
+        let mut native = priced_sale("ETH", 1.0);
+        native.currency_address = Some("0x0000000000000000000000000000000000000000".into());
+        let mut token = priced_sale("ABC", 1.0);
+        token.currency_address = Some("0x1111111111111111111111111111111111111111".into());
+        assert_eq!(
+            price_addresses_for_sales(&[native, token], "ethereum"),
+            vec!["0x1111111111111111111111111111111111111111".to_owned()]
+        );
     }
 
     fn identity(chain: &str, address: &str, token: &str, row: u64) -> IdentityRow {
@@ -799,7 +1350,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alchemy_empty_transfers_are_empty_not_failed() {
+    async fn alchemy_empty_activity_keeps_missing_deployment_gas_truncated() {
         let server = MockServer::start_async().await;
         let _rpc = server
             .mock_async(|when, then| {
@@ -839,19 +1390,11 @@ mod tests {
         };
         let client = HttpClient::with_retries(limits.concurrency, limits.retries).unwrap();
         let contract = &store.contracts[cand as usize];
-        let bundle = enrich_evm(
-            cand,
-            "ethereum",
-            &contract.address,
-            &client,
-            &keys,
-            &limits,
-        )
-        .await;
+        let bundle = enrich_evm(cand, "ethereum", &contract.address, &client, &keys, &limits).await;
         assert_eq!(bundle.quality.transfers, EvidenceStatus::Empty);
         assert_eq!(bundle.quality.holders, EvidenceStatus::Empty);
         assert_eq!(bundle.quality.sales, EvidenceStatus::Empty);
-        assert_eq!(bundle.quality.gas, EvidenceStatus::Empty);
+        assert_eq!(bundle.quality.gas, EvidenceStatus::Truncated);
         // No operator seeds without mint fee_payers / controllers.
         assert_eq!(bundle.quality.value_flows, EvidenceStatus::Empty);
         assert_ne!(bundle.quality.transfers, EvidenceStatus::Failed);
@@ -927,15 +1470,7 @@ mod tests {
         };
         let client = HttpClient::with_retries(limits.concurrency, limits.retries).unwrap();
         let contract = &store.contracts[cand as usize];
-        let bundle = enrich_evm(
-            cand,
-            "ethereum",
-            &contract.address,
-            &client,
-            &keys,
-            &limits,
-        )
-        .await;
+        let bundle = enrich_evm(cand, "ethereum", &contract.address, &client, &keys, &limits).await;
         assert!(
             bundle
                 .controllers
@@ -944,18 +1479,24 @@ mod tests {
             "controllers={:?}",
             bundle.controllers
         );
-        assert!(bundle
-            .controllers
-            .iter()
-            .any(|c| c == "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"));
-        assert!(bundle
-            .controllers
-            .iter()
-            .any(|c| c == "0xcccccccccccccccccccccccccccccccccccccccc"));
-        assert!(bundle
-            .provenance
-            .iter()
-            .any(|o| o.request_key == "contract_controllers"));
+        assert!(
+            bundle
+                .controllers
+                .iter()
+                .any(|c| c == "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert!(
+            bundle
+                .controllers
+                .iter()
+                .any(|c| c == "0xcccccccccccccccccccccccccccccccccccccccc")
+        );
+        assert!(
+            bundle
+                .provenance
+                .iter()
+                .any(|o| o.request_key == "contract_controllers")
+        );
 
         let gated = enrich_candidates(&registry, &store, &keys, &limits, &NoopProgress)
             .await
@@ -1030,16 +1571,12 @@ mod tests {
         };
         let client = HttpClient::with_retries(limits.concurrency, limits.retries).unwrap();
         let contract = &store.contracts[cand as usize];
-        let bundle = enrich_evm(
-            cand,
-            "ethereum",
-            &contract.address,
-            &client,
-            &keys,
-            &limits,
-        )
-        .await;
-        assert_eq!(bundle.quality.transfers, EvidenceStatus::Complete);
+        let bundle = enrich_evm(cand, "ethereum", &contract.address, &client, &keys, &limits).await;
+        assert_eq!(
+            bundle.quality.transfers,
+            EvidenceStatus::Truncated,
+            "fallback history is usable, but mint-payment attribution is incomplete when value-flow RPC fails"
+        );
         assert_eq!(bundle.transfers.len(), 1);
         assert_eq!(bundle.transfers[0].token_id, "7");
         assert!(bundle.transfers[0].is_mint);
@@ -1180,6 +1717,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn price_symbols_are_batched_at_the_provider_limit() {
+        let server = MockServer::start_async().await;
+        let requested = (0..25)
+            .map(|index| format!("TOKEN{index}"))
+            .collect::<Vec<_>>();
+        let response_symbols = std::iter::once("ETH".to_owned())
+            .chain(requested.iter().cloned())
+            .map(|symbol| {
+                json!({
+                    "symbol": symbol,
+                    "prices": [{"currency": "usd", "value": "1.0"}]
+                })
+            })
+            .collect::<Vec<_>>();
+        let price_mock = server
+            .mock_async(|when, then| {
+                when.method(GET).path_contains("/tokens/by-symbol");
+                then.status(200)
+                    .json_body(json!({ "data": response_symbols }));
+            })
+            .await;
+        let client = HttpClient::with_retries(2, 0).unwrap();
+        let outcome = alchemy::fetch_prices(
+            &client,
+            &mock_endpoints(&server),
+            Some("key"),
+            "ethereum",
+            &requested,
+            &[],
+        )
+        .await;
+        assert_eq!(outcome.status, EvidenceStatus::Complete);
+        assert_eq!(outcome.value.len(), 26);
+        assert_eq!(price_mock.hits_async().await, 2);
+    }
+
+    #[tokio::test]
     async fn solana_missing_helius_is_not_requested() {
         let evm = ["ethereum"].into_iter().map(str::to_owned).collect();
         let mut store = ResidentStore::with_options(2, &evm);
@@ -1274,10 +1848,12 @@ mod tests {
         let bundle = map.get(&cand).unwrap();
         assert_eq!(bundle.quality.sales, EvidenceStatus::Empty);
         assert_eq!(opensea.hits(), 0);
-        assert!(!bundle
-            .provenance
-            .iter()
-            .any(|o| o.source == "opensea" || o.request_key == "opensea_sales"));
+        assert!(
+            !bundle
+                .provenance
+                .iter()
+                .any(|o| o.source == "opensea" || o.request_key == "opensea_sales")
+        );
     }
 
     #[tokio::test]
@@ -1532,11 +2108,11 @@ mod tests {
         assert_eq!(bundle.quality.histories, EvidenceStatus::Complete);
         assert_eq!(bundle.quality.gas, EvidenceStatus::Complete);
         assert!(
-            bundle
+            !bundle
                 .value_flows
                 .iter()
-                .any(|e| e.from == funder && e.to == fee_payer && e.kind == ValueFlowKind::Funding),
-            "expected Funding edge into fee payer, got {:?}",
+                .any(|e| e.from == funder && e.to == fee_payer),
+            "transaction fee payer is not an operator and must not create a funding edge: {:?}",
             bundle.value_flows
         );
         assert_ne!(bundle.quality.value_flows, EvidenceStatus::Failed);
@@ -1808,7 +2384,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alchemy_receipt_gas_complete_fills_transfer() {
+    async fn alchemy_receipt_gas_fills_transfer_but_deployment_remains_required() {
         let server = MockServer::start_async().await;
         let _transfers = server
             .mock_async(|when, then| {
@@ -1892,7 +2468,7 @@ mod tests {
             .await
             .unwrap();
         let bundle = map.get(&cand).unwrap();
-        assert_eq!(bundle.quality.gas, EvidenceStatus::Complete);
+        assert_eq!(bundle.quality.gas, EvidenceStatus::Truncated);
         assert_eq!(bundle.transfers.len(), 1);
         // 21000 * 1e9 wei = 2.1e13 → 0.000021 ETH
         let gas = bundle.transfers[0].gas_native.unwrap();
@@ -1902,6 +2478,65 @@ mod tests {
             Some("0xfeepayer1111111111111111111111111111111111")
         );
         assert_eq!(bundle.quality.value_flows, EvidenceStatus::Empty);
+    }
+
+    #[tokio::test]
+    async fn alchemy_deployment_fetches_creation_receipt_gas_and_block_time() {
+        let server = MockServer::start_async().await;
+        let contract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let payer = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let _receipts = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path_contains("/rpc/")
+                    .body_contains("alchemy_getTransactionReceipts")
+                    .body_contains("0x10");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": "deployment-receipts",
+                    "result": {
+                        "receipts": [{
+                            "transactionHash": "0xdeploy",
+                            "contractAddress": contract,
+                            "from": payer,
+                            "gasUsed": "0x5208",
+                            "effectiveGasPrice": "0x3b9aca00"
+                        }]
+                    }
+                }));
+            })
+            .await;
+        let _block = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path_contains("/rpc/")
+                    .body_contains("eth_getBlockByNumber")
+                    .body_contains("0x10");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": "deployment-block",
+                    "result": {"timestamp": "0x65"}
+                }));
+            })
+            .await;
+        let endpoints = mock_endpoints(&server);
+        let client = HttpClient::with_retries(2, 0).unwrap();
+        let outcome = alchemy::fetch_deployment(
+            &client,
+            &endpoints,
+            Some("key"),
+            "ethereum",
+            contract,
+            Some(16),
+        )
+        .await;
+
+        assert_eq!(outcome.status, EvidenceStatus::Complete);
+        let deployment = outcome.value.unwrap();
+        assert_eq!(deployment.tx_hash, "0xdeploy");
+        assert_eq!(deployment.timestamp, Some(101));
+        assert_eq!(deployment.fee_payer.as_deref(), Some(payer));
+        assert!((deployment.gas_native.unwrap() - 0.000021).abs() < 1e-12);
     }
 
     #[tokio::test]
@@ -2009,15 +2644,7 @@ mod tests {
         };
         let client = HttpClient::with_retries(limits.concurrency, limits.retries).unwrap();
         let contract = &store.contracts[cand as usize];
-        let bundle = enrich_evm(
-            cand,
-            "ethereum",
-            &contract.address,
-            &client,
-            &keys,
-            &limits,
-        )
-        .await;
+        let bundle = enrich_evm(cand, "ethereum", &contract.address, &client, &keys, &limits).await;
         assert_eq!(bundle.quality.gas, EvidenceStatus::Truncated);
         let good = bundle
             .transfers
@@ -2037,6 +2664,19 @@ mod tests {
     async fn alchemy_value_flows_complete_funding_and_withdrawal() {
         let server = MockServer::start_async().await;
         let operator = "0xcccccccccccccccccccccccccccccccccccccccc";
+        let _controllers = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path_contains("/getContractMetadata")
+                    .query_param(
+                        "contractAddress",
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    );
+                then.status(200).json_body(json!({
+                    "contractMetadata": {"contractDeployer": operator}
+                }));
+            })
+            .await;
         let _transfers = server
             .mock_async(|when, then| {
                 when.method(POST)
@@ -2170,9 +2810,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn alchemy_value_flows_unbounded_window_truncated_without_failure() {
+    async fn alchemy_value_flows_full_history_is_complete_without_page_key() {
         let server = MockServer::start_async().await;
         let operator = "0xcccccccccccccccccccccccccccccccccccccccc";
+        let _controllers = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path_contains("/getContractMetadata")
+                    .query_param(
+                        "contractAddress",
+                        "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    );
+                then.status(200).json_body(json!({
+                    "contractMetadata": {"contractDeployer": operator}
+                }));
+            })
+            .await;
         let _transfers = server
             .mock_async(|when, then| {
                 when.method(POST)
@@ -2188,7 +2841,8 @@ mod tests {
                             "from": "0x0000000000000000000000000000000000000000",
                             "to": "0xdddddddddddddddddddddddddddddddddddddddd",
                             "erc721TokenId": "0x1",
-                            "metadata": { "blockTimestamp": "2024-01-01T00:00:00Z" }
+                            "metadata": { "blockTimestamp": "2024-01-01T00:00:00Z" },
+                            "blockNum": "0x10"
                         }]
                     }
                 }));
@@ -2226,7 +2880,8 @@ mod tests {
                             "to": operator,
                             "category": "external",
                             "value": 1.0,
-                            "metadata": { "blockTimestamp": "2024-01-01T00:00:00Z" }
+                            "metadata": { "blockTimestamp": "2024-01-01T00:00:00Z" },
+                            "blockNum": "0xf"
                         }]
                     }
                 }));
@@ -2262,7 +2917,7 @@ mod tests {
             .await
             .unwrap();
         let bundle = map.get(&cand).unwrap();
-        assert_eq!(bundle.quality.value_flows, EvidenceStatus::Truncated);
+        assert_eq!(bundle.quality.value_flows, EvidenceStatus::Complete);
         assert!(!bundle.value_flows.is_empty());
         assert!(
             !bundle
@@ -2270,21 +2925,21 @@ mod tests {
                 .failures
                 .iter()
                 .any(|f| f.contains("activity block window")),
-            "unbounded window note must not enter quality.failures: {:?}",
+            "block-associated full-history query must remain complete: {:?}",
             bundle.quality.failures
         );
         assert!(
-            bundle
+            !bundle
                 .provenance
                 .iter()
                 .any(|o| o.request_key.contains("activity block window unknown")),
-            "expected provenance note, got {:?}",
+            "known activity blocks must not create an association truncation: {:?}",
             bundle.provenance
         );
     }
 
     #[tokio::test]
-    async fn alchemy_value_flows_ignores_non_mint_fee_payer_seed() {
+    async fn alchemy_value_flows_ignore_all_transaction_fee_payers_as_operator_seeds() {
         let server = MockServer::start_async().await;
         let mint_op = "0xcccccccccccccccccccccccccccccccccccccccc";
         let secondary_fee = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
@@ -2354,7 +3009,8 @@ mod tests {
                 }));
             })
             .await;
-        // Only mint operator should be queried; secondary fee_payer must not appear.
+        // Neither receipt sender is a verified controller, so neither may be queried
+        // as an operator merely because it paid transaction gas.
         let external_mint = server
             .mock_async(|when, then| {
                 when.method(POST)
@@ -2379,6 +3035,48 @@ mod tests {
                 then.status(200).json_body(json!({
                     "jsonrpc": "2.0",
                     "id": "external-secondary",
+                    "result": { "transfers": [] }
+                }));
+            })
+            .await;
+        let _external_candidate = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path_contains("/rpc/")
+                    .body_contains("alchemy_getAssetTransfers")
+                    .body_contains("external")
+                    .body_contains("0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": "external-candidate",
+                    "result": { "transfers": [] }
+                }));
+            })
+            .await;
+        let _external_first_holder = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path_contains("/rpc/")
+                    .body_contains("alchemy_getAssetTransfers")
+                    .body_contains("external")
+                    .body_contains("0xdddddddddddddddddddddddddddddddddddddddd");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": "external-first-holder",
+                    "result": { "transfers": [] }
+                }));
+            })
+            .await;
+        let _external_final_holder = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path_contains("/rpc/")
+                    .body_contains("alchemy_getAssetTransfers")
+                    .body_contains("external")
+                    .body_contains("0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": "external-final-holder",
                     "result": { "transfers": [] }
                 }));
             })
@@ -2414,11 +3112,15 @@ mod tests {
             .unwrap();
         let bundle = map.get(&cand).unwrap();
         assert_eq!(bundle.quality.value_flows, EvidenceStatus::Empty);
-        assert!(external_mint.hits() > 0);
+        assert_eq!(
+            external_mint.hits(),
+            0,
+            "mint fee_payer must not be queried as operator seed"
+        );
         assert_eq!(
             external_secondary.hits(),
             0,
-            "non-mint fee_payer must not be queried as operator seed"
+            "secondary fee_payer must not be queried as operator seed"
         );
     }
 }

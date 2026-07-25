@@ -1,13 +1,13 @@
 //! Golden field shapes for offline duplicate-scale reports.
 
-use analysis2_core::parquet::{write_report_golden_fixture, LoadOptions};
+use analysis2_core::parquet::{LoadOptions, write_report_golden_fixture};
 use analysis2_core::reporting::{
-    build_contract_nft_map, build_seed_dedup_report, load_seeds_json, write_dedup_outputs,
-    DedupRunParams, SeedRecord,
+    DedupRunParams, SeedRecord, build_contract_nft_map, build_seed_dedup_report, load_seeds_json,
+    write_dedup_outputs,
 };
 use analysis2_core::{
+    CandidateRegistry, DEFAULT_METADATA_THRESHOLD, DEFAULT_NAME_THRESHOLD, HitGraph, NoopProgress,
     load_resident_store, query_metadata_for_seed, query_name_for_seed, query_uri_for_seed,
-    CandidateRegistry, HitGraph, NoopProgress, DEFAULT_METADATA_THRESHOLD, DEFAULT_NAME_THRESHOLD,
 };
 use serde_json::Value;
 use std::path::PathBuf;
@@ -108,7 +108,9 @@ fn report_golden_duplicate_scale_fields_and_ratios() {
         .find(|r| r.category == "token_uri")
         .unwrap();
     assert_eq!(m_token.duplicate_nft_count, 1);
-    assert_eq!(m_token.duplicate_nft_ratio_denominator, 4);
+    // Numerator identifies a Base candidate NFT, so the denominator is the
+    // Base snapshot universe rather than the Ethereum seed universe.
+    assert_eq!(m_token.duplicate_nft_ratio_denominator, 1);
 
     let cross = report
         .duplicate_scale
@@ -148,15 +150,36 @@ fn report_golden_duplicate_scale_fields_and_ratios() {
     assert_eq!(token_row["duplicate_nft_count"], 1);
     assert_eq!(token_row["duplicate_nft_ratio_denominator"], 4);
     assert!(token_row.get("duplicate_nft_ratio").is_some());
-    assert!(token_row.get("duplicate_contract_ratio_numerator").is_some());
-    assert!(find_row(intra_rows, "total").get("duplicate_nft_count").is_some());
-    assert!(find_row(intra_rows, "name").get("duplicate_nft_count").is_some());
-    assert!(find_row(intra_rows, "image_uri").get("duplicate_nft_count").is_some());
-    assert!(find_row(intra_rows, "metadata").get("duplicate_nft_count").is_some());
+    assert!(
+        token_row
+            .get("duplicate_contract_ratio_numerator")
+            .is_some()
+    );
+    assert!(
+        find_row(intra_rows, "total")
+            .get("duplicate_nft_count")
+            .is_some()
+    );
+    assert!(
+        find_row(intra_rows, "name")
+            .get("duplicate_nft_count")
+            .is_some()
+    );
+    assert!(
+        find_row(intra_rows, "image_uri")
+            .get("duplicate_nft_count")
+            .is_some()
+    );
+    assert!(
+        find_row(intra_rows, "metadata")
+            .get("duplicate_nft_count")
+            .is_some()
+    );
 
-    assert!(out
-        .join("detail/seeds/ethereum__0xseed/report.md")
-        .is_file());
+    assert!(
+        out.join("detail/seeds/ethereum__0xseed/report.md")
+            .is_file()
+    );
     assert!(out.join("summary/intra_chain.json").is_file());
     assert!(out.join("summary/chain_matrix.json").is_file());
     assert!(out.join("summary/cross_chain.json").is_file());

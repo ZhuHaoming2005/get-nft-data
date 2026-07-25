@@ -22,6 +22,8 @@ use super::types::{
 /// Seed-side cache reused across all candidates for that seed.
 #[derive(Clone, Debug, Default)]
 struct SeedCache {
+    /// Seed-level CC0 / public-domain license.
+    open_license: bool,
     controllers: Vec<String>,
     collection_slug: Option<String>,
     /// Normalized addresses that appear as from/to on seed NFT transfers.
@@ -139,9 +141,15 @@ async fn build_seed_cache(
             )
             .await;
             let probed = !matches!(outcome.status, EvidenceStatus::NotRequested);
-            (outcome.value, probed)
+            (outcome.value.addresses, probed)
         };
-        let slug_probe = resolve_collection_slug(client, limits, keys, &chain, &address);
+        let profile_probe = alchemy::fetch_collection_profile(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            &chain,
+            &address,
+        );
         let transfer_probe = alchemy::fetch_transfers(
             client,
             &limits.endpoints,
@@ -158,12 +166,28 @@ async fn build_seed_cache(
             &address,
             limits.max_holder_pages,
         );
-        let ((controllers, controllers_probed), slug, transfers, holders) =
-            tokio::join!(controller_probe, slug_probe, transfer_probe, holder_probe);
+        let ((controllers, controllers_probed), profile, transfers, holders) = tokio::join!(
+            controller_probe,
+            profile_probe,
+            transfer_probe,
+            holder_probe
+        );
 
         cache.controllers = controllers;
         cache.controllers_probed = controllers_probed;
-        cache.collection_slug = slug;
+        cache.collection_slug = profile.slug.map(|slug| slug.to_ascii_lowercase());
+        cache.open_license = profile.open_license;
+        if cache.collection_slug.is_none() {
+            cache.collection_slug = opensea::fetch_contract_collection_slug(
+                client,
+                &limits.endpoints.opensea,
+                keys.opensea(),
+                &chain,
+                &address,
+            )
+            .await
+            .map(|slug| slug.to_ascii_lowercase());
+        }
         cache.current_owners_complete = matches!(
             holders.status,
             EvidenceStatus::Complete | EvidenceStatus::Empty
@@ -197,6 +221,7 @@ async fn build_seed_cache(
         let (slug, snapshot) = tokio::join!(slug_probe, asset_probe);
 
         cache.collection_slug = slug;
+        cache.open_license = snapshot.value.open_license;
         // Controllers: reuse candidate enrich if seed was also a candidate.
         if let Some(bundle) = evidence.get(&seed_id) {
             cache.controllers = bundle.controllers.clone();
@@ -268,7 +293,7 @@ async fn build_candidate_probe(
         CandidateProbe {
             chain,
             address,
-            controllers: controllers.value,
+            controllers: controllers.value.addresses,
             collection_slug,
         }
     } else {
@@ -344,6 +369,10 @@ async fn probe_relation(
         chain,
         seed.controllers_probed && !cand_controllers.is_empty(),
     );
+    if seed.open_license {
+        signals.seed_open_license = true;
+        signals.evidence_keys.push("seed_open_license".into());
+    }
     // Controllers probed on candidate side even if empty when enrich ran with key.
     if seed.controllers_probed {
         signals.verification_complete = true;
@@ -692,6 +721,29 @@ mod tests {
         assert!(
             !all_relations_legit(&bundle, 2),
             "one unresolved/suspicious seed relation must retain the candidate"
+        );
+    }
+
+    #[test]
+    fn open_license_excludes_only_the_licensed_seed_relation() {
+        let mut bundle = EvidenceBundle::empty(1, "ethereum", "0xcandidate");
+        bundle.relation_legit.insert(
+            "ethereum:0xopen-seed".into(),
+            LegitSignals {
+                seed_open_license: true,
+                evidence_keys: vec!["seed_open_license".into()],
+                verification_complete: true,
+                ..LegitSignals::default()
+            },
+        );
+        assert!(all_relations_legit(&bundle, 1));
+
+        bundle
+            .relation_legit
+            .insert("ethereum:0xclosed-seed".into(), LegitSignals::default());
+        assert!(
+            !all_relations_legit(&bundle, 2),
+            "a suspicious relation must still send a mixed candidate to deep enrichment"
         );
     }
 

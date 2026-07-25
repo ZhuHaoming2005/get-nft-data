@@ -3,8 +3,8 @@
 use ahash::AHashMap;
 use analysis2_core::dedup::uri::query_uri_for_seed;
 use analysis2_core::{
-    count_scope_nfts, Dimension, HitGraph, IdentityRow, NoopProgress, ResidentStore, ScopeKind,
-    SourceOrder,
+    Dimension, HitGraph, IdentityRow, NoopProgress, ResidentStore, ScopeKind, SourceOrder,
+    count_scope_nfts,
 };
 
 fn row(
@@ -66,10 +66,12 @@ fn oracle_intra_and_cross_token_uri_duplicates() {
     query_uri_for_seed(&store, seed, &mut graph, &NoopProgress).unwrap();
 
     // Seed self excluded.
-    assert!(graph
-        .edges()
-        .iter()
-        .all(|e| e.seed_contract != e.candidate_contract));
+    assert!(
+        graph
+            .edges()
+            .iter()
+            .all(|e| e.seed_contract != e.candidate_contract)
+    );
 
     let eth = store.chain_ids["ethereum"];
     let base = store.chain_ids["base"];
@@ -79,32 +81,15 @@ fn oracle_intra_and_cross_token_uri_duplicates() {
     assert_eq!(intra.token_uri, 1, "one candidate NFT on ethereum 0xb");
     assert_eq!(intra.image_uri, 0);
 
-    let matrix = count_scope_nfts(
-        &graph,
-        seed,
-        ScopeKind::ChainMatrix,
-        eth,
-        Some(base),
-        &map,
-    );
+    let matrix = count_scope_nfts(&graph, seed, ScopeKind::ChainMatrix, eth, Some(base), &map);
     assert_eq!(matrix.token_uri, 1, "one candidate NFT on base 0xc");
 
-    let cross = count_scope_nfts(
-        &graph,
-        seed,
-        ScopeKind::CrossChainSummary,
-        eth,
-        None,
-        &map,
-    );
+    let cross = count_scope_nfts(&graph, seed, ScopeKind::CrossChainSummary, eth, None, &map);
     assert_eq!(cross.token_uri, 1);
 
     // Unique-only contract is not a candidate of the seed.
     let unique = contract_id(&store, "ethereum", "0xd");
-    assert!(graph
-        .edges()
-        .iter()
-        .all(|e| e.candidate_contract != unique));
+    assert!(graph.edges().iter().all(|e| e.candidate_contract != unique));
 }
 
 #[test]
@@ -130,21 +115,12 @@ fn oracle_image_uri_fallback_when_token_misses_scope() {
         "image supplemental skipped when token already hit intra"
     );
 
-    let matrix = count_scope_nfts(
-        &graph,
-        seed,
-        ScopeKind::ChainMatrix,
-        eth,
-        Some(base),
-        &map,
-    );
+    let matrix = count_scope_nfts(&graph, seed, ScopeKind::ChainMatrix, eth, Some(base), &map);
     assert_eq!(matrix.token_uri, 0);
     assert_eq!(matrix.image_uri, 1, "image fills token miss on matrix");
 
     assert!(graph.edges().iter().any(|e| {
-        e.dimension == Dimension::ImageUri
-            && e.primary_chain == eth
-            && e.secondary_chain == base
+        e.dimension == Dimension::ImageUri && e.primary_chain == eth && e.secondary_chain == base
     }));
 }
 

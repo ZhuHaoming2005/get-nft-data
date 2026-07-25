@@ -1,8 +1,8 @@
-use analysis2_cli::pipeline::{run as run_pipeline, run_dedup, RunConfig, RunDedupConfig};
+use analysis2_cli::pipeline::{RunConfig, RunDedupConfig, run as run_pipeline, run_dedup};
 use analysis2_cli::progress::{ProgressMode, ProgressReporter};
 use analysis2_core::{
-    select_seeds, write_seed_outputs, Analysis2Error, ApiKeys, PaperConfig, ProgressObserver,
-    SelectSeedsOptions,
+    Analysis2Error, ApiKeys, PaperConfig, ProgressObserver, SelectSeedsOptions, select_seeds,
+    write_seed_outputs,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;

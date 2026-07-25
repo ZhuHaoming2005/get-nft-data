@@ -3,12 +3,14 @@
 use std::sync::{Mutex, OnceLock};
 
 use ahash::{AHashMap, AHashSet};
-use serde_json::{json, Value};
+use num_bigint::BigUint;
+use serde_json::{Value, json};
 
 use super::http::HttpClient;
 use super::types::{
-    day_bucket, now_unix, status_from_count, EvidenceObservation, EvidenceStatus, HolderRecord,
-    PriceBucket, ProviderEndpoints, SaleEvent, TransferEvent,
+    DeploymentEvent, EvidenceObservation, EvidenceStatus, HolderRecord, PriceBucket,
+    ProviderEndpoints, SaleEvent, TransferEvent, ValueFlowEdge, day_bucket, now_unix,
+    status_from_count,
 };
 
 /// Chains where Alchemy NFT `getNFTSales` returned "not enabled for that chain"
@@ -56,6 +58,7 @@ pub(crate) fn is_nft_sales_chain_disabled_error(message: &str) -> bool {
 #[derive(Clone, Debug, Default)]
 pub struct NativeTransfer {
     pub tx_hash: String,
+    pub event_id: Option<String>,
     pub from: String,
     pub to: String,
     pub value_native: Option<f64>,
@@ -111,13 +114,7 @@ impl<T: Default> FetchOutcome<T> {
         }
     }
 
-    pub fn ok(
-        value: T,
-        count: usize,
-        truncated: bool,
-        source: &str,
-        request_key: &str,
-    ) -> Self {
+    pub fn ok(value: T, count: usize, truncated: bool, source: &str, request_key: &str) -> Self {
         let status = status_from_count(count, truncated);
         Self {
             value,
@@ -158,6 +155,7 @@ pub async fn fetch_transfers(
     let mut page_key: Option<String> = None;
     let mut seen = std::collections::BTreeSet::new();
     let mut truncated = false;
+    let mut partial_failure = None;
     let pages = max_pages.max(1);
 
     for page in 0..pages {
@@ -187,18 +185,18 @@ pub async fn fetch_transfers(
                     return FetchOutcome::failed("alchemy", "alchemy_transfers", e);
                 }
                 truncated = true;
+                partial_failure = Some(format!("alchemy_transfers: partial page failure: {e}"));
                 break;
             }
         };
         if let Some(error) = payload.get("error") {
             if transfers.is_empty() {
-                return FetchOutcome::failed(
-                    "alchemy",
-                    "alchemy_transfers",
-                    error.to_string(),
-                );
+                return FetchOutcome::failed("alchemy", "alchemy_transfers", error.to_string());
             }
             truncated = true;
+            partial_failure = Some(format!(
+                "alchemy_transfers: partial provider error: {error}"
+            ));
             break;
         }
         let result = payload.get("result").cloned().unwrap_or(Value::Null);
@@ -219,6 +217,7 @@ pub async fn fetch_transfers(
             Some(next) => {
                 if !seen.insert(next.clone()) {
                     truncated = true;
+                    partial_failure = Some("alchemy_transfers: repeated pagination cursor".into());
                     break;
                 }
                 page_key = Some(next);
@@ -231,7 +230,9 @@ pub async fn fetch_transfers(
     }
 
     let count = transfers.len();
-    FetchOutcome::ok(transfers, count, truncated, "alchemy", "alchemy_transfers")
+    let mut outcome = FetchOutcome::ok(transfers, count, truncated, "alchemy", "alchemy_transfers");
+    outcome.failure = partial_failure;
+    outcome
 }
 
 /// Fetch owners via Alchemy NFT API `getOwnersForContract`.
@@ -258,8 +259,10 @@ pub async fn fetch_holders(
          action=fallback_without_token_balances contract={contract} chain={chain} \
          reason=response_body_too_large"
     );
-    let mut owners_only =
-        fetch_holders_pages(client, endpoints, api_key, chain, contract, max_pages, false).await;
+    let mut owners_only = fetch_holders_pages(
+        client, endpoints, api_key, chain, contract, max_pages, false,
+    )
+    .await;
     // Lost per-token balances → always Truncated when any owners returned.
     if !owners_only.value.is_empty()
         && !matches!(
@@ -319,6 +322,7 @@ async fn fetch_holders_pages(
     let mut page_key: Option<String> = None;
     let mut seen = std::collections::BTreeSet::new();
     let mut truncated = false;
+    let mut partial_failure = None;
     let pages = max_pages.max(1);
 
     for page in 0..pages {
@@ -334,6 +338,7 @@ async fn fetch_holders_pages(
                     return FetchOutcome::failed("alchemy", "alchemy_holders", e);
                 }
                 truncated = true;
+                partial_failure = Some(format!("alchemy_holders: partial page failure: {e}"));
                 break;
             }
         };
@@ -347,6 +352,7 @@ async fn fetch_holders_pages(
             Some(next) => {
                 if !seen.insert(next.clone()) {
                     truncated = true;
+                    partial_failure = Some("alchemy_holders: repeated pagination cursor".into());
                     break;
                 }
                 page_key = Some(next);
@@ -359,7 +365,9 @@ async fn fetch_holders_pages(
     }
 
     let count = holders.len();
-    FetchOutcome::ok(holders, count, truncated, "alchemy", "alchemy_holders")
+    let mut outcome = FetchOutcome::ok(holders, count, truncated, "alchemy", "alchemy_holders");
+    outcome.failure = partial_failure;
+    outcome
 }
 
 /// Fetch NFT sales via Alchemy `getNFTSales`.
@@ -394,6 +402,7 @@ pub async fn fetch_sales(
     let mut page_key: Option<String> = None;
     let mut seen = std::collections::BTreeSet::new();
     let mut truncated = false;
+    let mut partial_failure = None;
     let pages = max_pages.max(1);
 
     for page in 0..pages {
@@ -419,6 +428,7 @@ pub async fn fetch_sales(
                     return FetchOutcome::failed("alchemy", "alchemy_sales", e);
                 }
                 truncated = true;
+                partial_failure = Some(format!("alchemy_sales: partial page failure: {e}"));
                 break;
             }
         };
@@ -432,6 +442,7 @@ pub async fn fetch_sales(
             Some(next) => {
                 if !seen.insert(next.clone()) {
                     truncated = true;
+                    partial_failure = Some("alchemy_sales: repeated pagination cursor".into());
                     break;
                 }
                 page_key = Some(next);
@@ -444,67 +455,159 @@ pub async fn fetch_sales(
     }
 
     let count = sales.len();
-    FetchOutcome::ok(sales, count, truncated, "alchemy", "alchemy_sales")
+    let mut outcome = FetchOutcome::ok(sales, count, truncated, "alchemy", "alchemy_sales");
+    outcome.failure = partial_failure;
+    outcome
 }
 
-/// Fetch **current** (run-time) USD price for the chain native token.
+/// Fetch **current** (run-time) USD prices for the chain native token and
+/// requested common payment symbols.
 ///
 /// Historical day-bucket pricing is intentionally not used: Alchemy limits
 /// `1d` historical ranges to 365 points, and cross-event valuation is simpler
 /// and more stable with a single spot rate taken when enrich runs.
 ///
-/// `day_buckets` is ignored for the API call (kept on the signature so call
-/// sites stay stable). The returned bucket uses `day_utc = day_bucket(now)`.
 pub async fn fetch_prices(
     client: &HttpClient,
     endpoints: &ProviderEndpoints,
     api_key: Option<&str>,
     chain: &str,
-    _day_buckets: &[i64],
+    requested_symbols: &[String],
+    requested_addresses: &[String],
 ) -> FetchOutcome<Vec<PriceBucket>> {
     let Some(api_key) = api_key else {
         return FetchOutcome::skipped("alchemy_prices");
     };
-    let symbol = native_symbol(chain);
-    let url = format!(
-        "{}/{}/tokens/by-symbol?symbols={}",
-        endpoints.alchemy_prices.trim_end_matches('/'),
-        api_key,
-        symbol
-    );
-    let payload = match client.get_json_alchemy(&url, &[]).await {
-        Ok(v) => v,
-        Err(e) => return FetchOutcome::failed("alchemy", "alchemy_prices", e),
-    };
-    if let Some(error) = payload.get("error") {
-        return FetchOutcome::failed("alchemy", "alchemy_prices", error.to_string());
+    let native = native_symbol(chain);
+    let mut symbols = vec![native.to_owned()];
+    for symbol in requested_symbols {
+        let symbol = symbol.trim().to_ascii_uppercase();
+        if !symbol.is_empty() && !symbols.iter().any(|known| known == &symbol) {
+            symbols.push(symbol);
+        }
     }
-    let Some(usd) = parse_by_symbol_usd(&payload, symbol) else {
+    // Alchemy accepts at most 25 symbols per request. Keep broad payment-token
+    // coverage by batching instead of letting one oversized request fail every
+    // quote for the candidate.
+    const SYMBOLS_PER_REQUEST: usize = 25;
+    let mut prices = Vec::new();
+    let mut symbol_fetch_succeeded = false;
+    let mut symbol_fetch_failed = false;
+    for chunk in symbols.chunks(SYMBOLS_PER_REQUEST) {
+        let query = chunk.join("&symbols=");
+        let url = format!(
+            "{}/{}/tokens/by-symbol?symbols={}",
+            endpoints.alchemy_prices.trim_end_matches('/'),
+            api_key,
+            query
+        );
+        let payload = match client.get_json_alchemy(&url, &[]).await {
+            Ok(payload) => payload,
+            Err(_) => {
+                symbol_fetch_failed = true;
+                continue;
+            }
+        };
+        if payload.get("error").is_some() {
+            symbol_fetch_failed = true;
+            continue;
+        }
+        symbol_fetch_succeeded = true;
+        prices.extend(chunk.iter().filter_map(|symbol| {
+            parse_by_symbol_usd(&payload, symbol).map(|usd| PriceBucket {
+                chain: chain.to_owned(),
+                day_utc: day_bucket(now_unix()),
+                symbol: symbol.clone(),
+                token_address: None,
+                usd_per_native: usd,
+            })
+        }));
+    }
+    if !symbol_fetch_succeeded {
         return FetchOutcome::failed(
             "alchemy",
             "alchemy_prices",
-            format!("no current USD price for symbol {symbol}"),
+            "all current symbol-price batches failed",
         );
-    };
-    let prices = vec![PriceBucket {
-        chain: chain.to_owned(),
-        day_utc: day_bucket(now_unix()),
-        symbol: symbol.to_owned(),
-        usd_per_native: usd,
-    }];
-    FetchOutcome::ok(prices, 1, false, "alchemy", "alchemy_prices")
+    }
+    let mut address_fetch_failed = false;
+    if !requested_addresses.is_empty() {
+        if let Some(network) = alchemy_price_network(chain) {
+            let address_url = format!(
+                "{}/{}/tokens/by-address",
+                endpoints.alchemy_prices.trim_end_matches('/'),
+                api_key
+            );
+            let body = json!({
+                "addresses": requested_addresses
+                    .iter()
+                    .map(|address| json!({"network": network, "address": address}))
+                    .collect::<Vec<_>>()
+            });
+            match client.post_json_alchemy(&address_url, &[], &body).await {
+                Ok(payload) if payload.get("error").is_none() => {
+                    for address in requested_addresses {
+                        if let Some(usd) = parse_by_address_usd(&payload, chain, address) {
+                            prices.push(PriceBucket {
+                                chain: chain.to_owned(),
+                                day_utc: day_bucket(now_unix()),
+                                symbol: String::new(),
+                                token_address: Some(super::types::normalize_chain_address(
+                                    chain, address,
+                                )),
+                                usd_per_native: usd,
+                            });
+                        }
+                    }
+                }
+                _ => address_fetch_failed = true,
+            }
+        } else {
+            address_fetch_failed = true;
+        }
+    }
+    let native_missing = prices
+        .iter()
+        .all(|price| !price.symbol.eq_ignore_ascii_case(native));
+    if prices.is_empty() {
+        return FetchOutcome::failed(
+            "alchemy",
+            "alchemy_prices",
+            "no current USD price for any requested symbol",
+        );
+    }
+    let count = prices.len();
+    FetchOutcome::ok(
+        prices,
+        count,
+        native_missing || address_fetch_failed || symbol_fetch_failed,
+        "alchemy",
+        "alchemy_prices",
+    )
 }
 
-/// Parse Alchemy `tokens/by-symbol` current-price response.
-pub(crate) fn parse_by_symbol_usd(payload: &Value, symbol: &str) -> Option<f64> {
+fn alchemy_price_network(chain: &str) -> Option<&'static str> {
+    match chain.trim().to_ascii_lowercase().as_str() {
+        "ethereum" => Some("eth-mainnet"),
+        "base" => Some("base-mainnet"),
+        "polygon" | "matic" => Some("polygon-mainnet"),
+        "solana" => Some("solana-mainnet"),
+        _ => None,
+    }
+}
+
+pub(crate) fn parse_by_address_usd(payload: &Value, chain: &str, address: &str) -> Option<f64> {
+    let expected = super::types::normalize_chain_address(chain, address);
     payload
         .get("data")
         .and_then(Value::as_array)?
         .iter()
         .find(|item| {
-            item.get("symbol")
+            item.get("address")
                 .and_then(Value::as_str)
-                .is_some_and(|s| s.eq_ignore_ascii_case(symbol))
+                .is_some_and(|actual| {
+                    super::types::normalize_chain_address(chain, actual) == expected
+                })
         })?
         .get("prices")
         .and_then(Value::as_array)?
@@ -513,11 +616,40 @@ pub(crate) fn parse_by_symbol_usd(payload: &Value, symbol: &str) -> Option<f64> 
             price
                 .get("currency")
                 .and_then(Value::as_str)
-                .is_some_and(|c| c.eq_ignore_ascii_case("usd"))
+                .is_some_and(|currency| currency.eq_ignore_ascii_case("usd"))
         })?
         .get("value")
-        .and_then(|v| json_f64(Some(v)))
+        .and_then(|value| json_f64(Some(value)))
         .filter(|rate| rate.is_finite() && *rate > 0.0)
+}
+
+/// Parse Alchemy `tokens/by-symbol` current-price response.
+pub(crate) fn parse_by_symbol_usd(payload: &Value, symbol: &str) -> Option<f64> {
+    let mut matches = payload
+        .get("data")
+        .and_then(Value::as_array)?
+        .iter()
+        .filter(|item| {
+            item.get("symbol")
+                .and_then(Value::as_str)
+                .is_some_and(|s| s.eq_ignore_ascii_case(symbol))
+        })
+        .filter_map(|item| {
+            item.get("prices")
+                .and_then(Value::as_array)?
+                .iter()
+                .find(|price| {
+                    price
+                        .get("currency")
+                        .and_then(Value::as_str)
+                        .is_some_and(|c| c.eq_ignore_ascii_case("usd"))
+                })?
+                .get("value")
+                .and_then(|v| json_f64(Some(v)))
+                .filter(|rate| rate.is_finite() && *rate > 0.0)
+        });
+    let first = matches.next()?;
+    matches.next().is_none().then_some(first)
 }
 
 pub fn parse_alchemy_transfer(item: &Value, fallback_contract: &str) -> Vec<TransferEvent> {
@@ -563,6 +695,7 @@ pub fn parse_alchemy_transfer(item: &Value, fallback_contract: &str) -> Vec<Tran
             fee_payer: None,
             mint_payment_native: None,
             mint_payment_usd: None,
+            mint_payment_receiver: None,
         })
         .collect()
 }
@@ -617,22 +750,82 @@ pub fn parse_nft_sales(payload: &Value, chain: &str) -> Vec<SaleEvent> {
         .into_iter()
         .flatten()
     {
-        let seller_fee = fee_amount(item.get("sellerFee"));
-        let protocol_fee = fee_amount(item.get("protocolFee"));
-        let royalty_fee = fee_amount(item.get("royaltyFee"));
-        let native = match (seller_fee, protocol_fee, royalty_fee) {
-            (Some(a), Some(b), Some(c)) => Some(a + b + c),
-            (Some(a), Some(b), None) => Some(a + b),
-            (Some(a), None, Some(c)) => Some(a + c),
-            (None, Some(b), Some(c)) => Some(b + c),
-            (Some(a), None, None) => Some(a),
-            _ => None,
-        };
-        let symbol = item
-            .get("sellerFee")
-            .and_then(|f| f.get("symbol"))
+        let seller_fee = fee_amount_and_symbol(item.get("sellerFee"));
+        let protocol_fee = fee_amount_and_symbol(item.get("protocolFee"));
+        let royalty_fee = fee_amount_and_symbol(item.get("royaltyFee"));
+        let seller_fee_address = fee_token_address(item.get("sellerFee"));
+        let protocol_fee_address = fee_token_address(item.get("protocolFee"));
+        let royalty_fee_address = fee_token_address(item.get("royaltyFee"));
+        let royalty_recipient = item
+            .get("royaltyFee")
+            .and_then(|fee| {
+                fee.get("recipientAddress")
+                    .or_else(|| fee.get("receiverAddress"))
+                    .or_else(|| fee.get("recipient"))
+                    .or_else(|| fee.get("feeRecipient"))
+                    .or_else(|| fee.get("receiver"))
+                    .or_else(|| fee.get("to"))
+            })
             .and_then(Value::as_str)
-            .map(str::to_owned);
+            .or_else(|| {
+                [
+                    "royaltyRecipient",
+                    "royalty_recipient",
+                    "royaltyRecipientAddress",
+                    "royalty_recipient_address",
+                    "creatorFeeRecipient",
+                    "creator_fee_recipient",
+                ]
+                .into_iter()
+                .find_map(|field| item.get(field).and_then(Value::as_str))
+            })
+            .map(|address| address.trim().to_ascii_lowercase())
+            .filter(|address| !address.is_empty());
+        let symbol = seller_fee
+            .as_ref()
+            .and_then(|(_, symbol)| symbol.clone())
+            .or_else(|| protocol_fee.as_ref().and_then(|(_, symbol)| symbol.clone()))
+            .or_else(|| royalty_fee.as_ref().and_then(|(_, symbol)| symbol.clone()))
+            .or_else(|| Some(native_symbol(chain).to_owned()));
+        let split_symbols = [
+            seller_fee.as_ref(),
+            protocol_fee.as_ref(),
+            royalty_fee.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .filter_map(|(_, fee_symbol)| fee_symbol.as_deref())
+        .map(|fee_symbol| fee_symbol.trim().to_ascii_uppercase())
+        .filter(|fee_symbol| !fee_symbol.is_empty())
+        .collect::<std::collections::BTreeSet<_>>();
+        let native = (seller_fee.is_some() && split_symbols.len() <= 1)
+            .then(|| {
+                [
+                    seller_fee.as_ref(),
+                    protocol_fee.as_ref(),
+                    royalty_fee.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                .map(|(amount, _)| *amount)
+                .sum::<f64>()
+            })
+            .filter(|amount| *amount >= 0.0);
+        let sale_price_raw = (seller_fee.is_some() && split_symbols.len() <= 1)
+            .then(|| {
+                [
+                    item.get("sellerFee"),
+                    item.get("protocolFee"),
+                    item.get("royaltyFee"),
+                ]
+                .into_iter()
+                .flatten()
+                .map(fee_raw_amount)
+                .collect::<Option<Vec<_>>>()
+                .map(|amounts| amounts.into_iter().sum::<BigUint>().to_str_radix(10))
+            })
+            .flatten();
+        let seller_proceeds_native = seller_fee.as_ref().map(|(amount, _)| *amount);
         out.push(SaleEvent {
             tx_hash: item
                 .get("transactionHash")
@@ -662,6 +855,28 @@ pub fn parse_nft_sales(payload: &Value, chain: &str) -> Vec<SaleEvent> {
             native_amount: native,
             usd_amount: None,
             currency_symbol: symbol.or_else(|| Some(native_symbol(chain).to_owned())),
+            currency_address: seller_fee_address
+                .clone()
+                .or_else(|| protocol_fee_address.clone())
+                .or_else(|| royalty_fee_address.clone()),
+            sale_price_raw,
+            seller_proceeds_native,
+            seller_proceeds_usd: None,
+            marketplace_fee_native: protocol_fee.as_ref().map(|(amount, _)| *amount),
+            marketplace_fee_usd: None,
+            marketplace_fee_currency_symbol: protocol_fee
+                .as_ref()
+                .and_then(|(_, symbol)| symbol.clone()),
+            marketplace_fee_currency_address: protocol_fee_address,
+            royalty_fee_native: royalty_fee.as_ref().map(|(amount, _)| *amount),
+            royalty_fee_usd: None,
+            royalty_fee_currency_symbol: royalty_fee
+                .as_ref()
+                .and_then(|(_, symbol)| symbol.clone()),
+            royalty_fee_currency_address: royalty_fee_address,
+            royalty_recipient,
+            gas_native: None,
+            fee_payer: None,
         });
     }
     out
@@ -694,28 +909,102 @@ pub fn normalize_token_id(raw: Option<&Value>) -> String {
         .map(str::to_owned)
         .unwrap_or_else(|| raw.to_string());
     let trimmed = text.trim();
-    if trimmed.starts_with("0x") || trimmed.starts_with("0X") {
-        i128::from_str_radix(
-            trimmed.trim_start_matches(['0', 'x', 'X']),
-            16,
-        )
-        .map(|v| v.to_string())
-        .unwrap_or_else(|_| trimmed.to_owned())
+    if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        hex_to_decimal(hex).unwrap_or_else(|| trimmed.to_owned())
+    } else if trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        let normalized = trimmed.trim_start_matches('0');
+        if normalized.is_empty() {
+            "0".into()
+        } else {
+            normalized.into()
+        }
     } else {
         trimmed.to_owned()
     }
 }
 
+fn hex_to_decimal(value: &str) -> Option<String> {
+    if value.is_empty() || value.len() > 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut decimal_digits = vec![0_u8];
+    for digit in value.bytes() {
+        let nibble = match digit {
+            b'0'..=b'9' => digit - b'0',
+            b'a'..=b'f' => digit - b'a' + 10,
+            b'A'..=b'F' => digit - b'A' + 10,
+            _ => return None,
+        };
+        let mut carry = u16::from(nibble);
+        for decimal in decimal_digits.iter_mut().rev() {
+            let current = u16::from(*decimal) * 16 + carry;
+            *decimal = (current % 10) as u8;
+            carry = current / 10;
+        }
+        while carry > 0 {
+            decimal_digits.insert(0, (carry % 10) as u8);
+            carry /= 10;
+        }
+    }
+    let first_nonzero = decimal_digits
+        .iter()
+        .position(|digit| *digit != 0)
+        .unwrap_or(decimal_digits.len().saturating_sub(1));
+    Some(
+        decimal_digits[first_nonzero..]
+            .iter()
+            .map(|digit| char::from(b'0' + *digit))
+            .collect(),
+    )
+}
+
 fn fee_amount(fee: Option<&Value>) -> Option<f64> {
     let fee = fee?;
     if let Some(amount) = json_f64(fee.get("amount")) {
-        let decimals = fee
-            .get("decimals")
-            .and_then(Value::as_u64)
-            .unwrap_or(18) as i32;
+        let decimals = fee.get("decimals").and_then(Value::as_u64).unwrap_or(18) as i32;
         return Some(amount / 10f64.powi(decimals));
     }
     json_f64(fee.get("value")).or_else(|| json_f64(fee.get("rawAmount").or(fee.get("amount"))))
+}
+
+fn fee_raw_amount(fee: &Value) -> Option<BigUint> {
+    let raw = fee
+        .get("amount")
+        .or_else(|| fee.get("rawAmount"))
+        .or_else(|| fee.get("raw_amount"))?;
+    if let Some(value) = raw.as_u64() {
+        return Some(BigUint::from(value));
+    }
+    let text = raw.as_str()?.trim();
+    let (digits, radix) = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .map_or((text, 10), |hex| (hex, 16));
+    (!digits.is_empty())
+        .then(|| BigUint::parse_bytes(digits.as_bytes(), radix))
+        .flatten()
+}
+
+fn fee_amount_and_symbol(fee: Option<&Value>) -> Option<(f64, Option<String>)> {
+    let fee = fee?;
+    let amount = fee_amount(Some(fee))?;
+    let symbol = fee.get("symbol").and_then(Value::as_str).map(str::to_owned);
+    Some((amount, symbol))
+}
+
+fn fee_token_address(fee: Option<&Value>) -> Option<String> {
+    fee.and_then(|fee| {
+        fee.get("tokenAddress")
+            .or_else(|| fee.get("contractAddress"))
+            .or_else(|| fee.get("address"))
+    })
+    .and_then(Value::as_str)
+    .map(str::trim)
+    .filter(|address| !address.is_empty())
+    .map(str::to_ascii_lowercase)
 }
 
 fn parse_timestamp(value: &Value) -> Option<i64> {
@@ -805,6 +1094,330 @@ pub struct ReceiptGas {
     pub fee_payer: Option<String>,
 }
 
+/// Resolve missing positive-royalty recipients through ERC-2981 `royaltyInfo`.
+pub async fn fetch_royalty_recipients(
+    client: &HttpClient,
+    endpoints: &ProviderEndpoints,
+    api_key: Option<&str>,
+    chain: &str,
+    contract: &str,
+    sales: &[SaleEvent],
+) -> FetchOutcome<AHashMap<(String, u64, String), String>> {
+    let Some(api_key) = api_key else {
+        return FetchOutcome::skipped("alchemy_royalty_recipients");
+    };
+    let token_blocks = sales
+        .iter()
+        .filter(|sale| {
+            sale.royalty_recipient
+                .as_deref()
+                .is_none_or(|recipient| recipient.trim().is_empty())
+                && (sale.royalty_fee_native.unwrap_or(0.0) > 0.0
+                    || sale.royalty_fee_usd.unwrap_or(0.0) > 0.0)
+        })
+        .filter_map(|sale| {
+            let block_number = sale.block_number?;
+            let sale_price_raw = sale.sale_price_raw.as_deref()?;
+            let token_word = token_id_to_abi_word(&sale.token_id)?;
+            let sale_price_word = uint256_word_decimal(sale_price_raw)?;
+            Some((
+                (
+                    sale.token_id.clone(),
+                    block_number,
+                    sale_price_raw.to_owned(),
+                ),
+                (token_word, sale_price_word),
+            ))
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if token_blocks.is_empty() {
+        return FetchOutcome::ok(
+            AHashMap::new(),
+            0,
+            false,
+            "alchemy",
+            "alchemy_royalty_recipients",
+        );
+    }
+    let Some(rpc) = endpoints.alchemy_rpc(chain, api_key) else {
+        return FetchOutcome::failed(
+            "alchemy",
+            "alchemy_royalty_recipients",
+            format!("unsupported alchemy network for {chain}"),
+        );
+    };
+    let requests = token_blocks.into_iter().collect::<Vec<_>>();
+    let mut recipients = AHashMap::new();
+    let mut completed = 0usize;
+    for (batch_index, chunk) in requests.chunks(RECEIPT_RPC_BATCH_SIZE).enumerate() {
+        let body = Value::Array(
+            chunk
+                .iter()
+                .enumerate()
+                .map(
+                    |(index, ((_, block_number, _), (token_word, sale_price_word)))| {
+                        json!({
+                            "jsonrpc": "2.0",
+                            "id": format!("royalty-{batch_index}-{index}"),
+                            "method": "eth_call",
+                            "params": [{
+                                "to": contract,
+                                "data": format!("0x2a55205a{token_word}{sale_price_word}")
+                            }, format!("0x{block_number:x}")]
+                        })
+                    },
+                )
+                .collect(),
+        );
+        let payload = match client.post_json_alchemy(&rpc, &[], &body).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                if completed == 0 {
+                    return FetchOutcome::failed("alchemy", "alchemy_royalty_recipients", error);
+                }
+                break;
+            }
+        };
+        let Some(rows) = payload.as_array() else {
+            if completed == 0 {
+                return FetchOutcome::failed(
+                    "alchemy",
+                    "alchemy_royalty_recipients",
+                    "batch response was not an array",
+                );
+            }
+            break;
+        };
+        let by_id = rows
+            .iter()
+            .filter_map(|row| {
+                let id = row.get("id")?.as_str()?.to_owned();
+                Some((id, row))
+            })
+            .collect::<AHashMap<_, _>>();
+        for (index, ((token_id, block_number, sale_price_raw), _)) in chunk.iter().enumerate() {
+            let id = format!("royalty-{batch_index}-{index}");
+            let Some(row) = by_id.get(&id) else {
+                continue;
+            };
+            completed += 1;
+            if let Some(recipient) = row
+                .get("result")
+                .and_then(Value::as_str)
+                .and_then(abi_first_word_address)
+            {
+                recipients.insert(
+                    (token_id.clone(), *block_number, sale_price_raw.clone()),
+                    recipient,
+                );
+            }
+        }
+    }
+    let truncated = completed < requests.len();
+    FetchOutcome::ok(
+        recipients,
+        completed,
+        truncated,
+        "alchemy",
+        "alchemy_royalty_recipients",
+    )
+}
+
+pub fn attach_royalty_recipients(
+    sales: &mut [SaleEvent],
+    recipients: &AHashMap<(String, u64, String), String>,
+) {
+    for sale in sales {
+        if sale
+            .royalty_recipient
+            .as_deref()
+            .is_none_or(|recipient| recipient.trim().is_empty())
+            && let Some(recipient) = sale.block_number.and_then(|block| {
+                sale.sale_price_raw.as_ref().and_then(|sale_price_raw| {
+                    recipients.get(&(sale.token_id.clone(), block, sale_price_raw.clone()))
+                })
+            })
+        {
+            sale.royalty_recipient = Some(recipient.clone());
+        }
+    }
+}
+
+fn abi_first_word_address(value: &str) -> Option<String> {
+    let hex = value
+        .trim()
+        .strip_prefix("0x")
+        .or_else(|| value.trim().strip_prefix("0X"))
+        .unwrap_or(value.trim());
+    if hex.len() < 64 {
+        return None;
+    }
+    let word = &hex[..64];
+    if !word.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return None;
+    }
+    let address = format!("0x{}", &word[24..]).to_ascii_lowercase();
+    (address != ZERO).then_some(address)
+}
+
+fn token_id_to_abi_word(token_id: &str) -> Option<String> {
+    let trimmed = token_id.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let hex = if let Some(hex) = trimmed
+        .strip_prefix("0x")
+        .or_else(|| trimmed.strip_prefix("0X"))
+    {
+        hex.to_owned()
+    } else {
+        decimal_to_hex(trimmed)?
+    };
+    (hex.len() <= 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .then(|| format!("{hex:0>64}").to_ascii_lowercase())
+}
+
+fn uint256_word_decimal(value: &str) -> Option<String> {
+    let hex = decimal_to_hex(value.trim())?;
+    (hex.len() <= 64).then(|| format!("{hex:0>64}"))
+}
+
+fn decimal_to_hex(value: &str) -> Option<String> {
+    if value.is_empty() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let mut digits = value.bytes().map(|byte| byte - b'0').collect::<Vec<_>>();
+    let mut hex_digits = Vec::new();
+    while digits.iter().any(|digit| *digit != 0) {
+        let mut carry = 0u16;
+        for digit in &mut digits {
+            let current = carry * 10 + u16::from(*digit);
+            *digit = (current / 16) as u8;
+            carry = current % 16;
+        }
+        hex_digits.push(char::from_digit(u32::from(carry), 16)?);
+        while digits.len() > 1 && digits.first() == Some(&0) {
+            digits.remove(0);
+        }
+    }
+    if hex_digits.is_empty() {
+        Some("0".into())
+    } else {
+        Some(hex_digits.into_iter().rev().collect())
+    }
+}
+
+/// Resolve the contract-creation receipt and block time from Alchemy.
+///
+/// A missing deployment block is treated as truncated evidence: deployment gas
+/// is a required Setup cost and must not silently become zero.
+pub async fn fetch_deployment(
+    client: &HttpClient,
+    endpoints: &ProviderEndpoints,
+    api_key: Option<&str>,
+    chain: &str,
+    contract: &str,
+    deployed_block: Option<u64>,
+) -> FetchOutcome<Option<DeploymentEvent>> {
+    let Some(api_key) = api_key else {
+        return FetchOutcome::skipped("alchemy_deployment");
+    };
+    let Some(block_number) = deployed_block else {
+        let mut outcome = FetchOutcome::ok(None, 0, true, "alchemy", "alchemy_deployment");
+        outcome.failure =
+            Some("alchemy_deployment: contract metadata omitted deployedBlockNumber".into());
+        return outcome;
+    };
+    let Some(rpc) = endpoints.alchemy_rpc(chain, api_key) else {
+        return FetchOutcome::failed(
+            "alchemy",
+            "alchemy_deployment",
+            format!("unsupported alchemy network for {chain}"),
+        );
+    };
+    let block_hex = format!("0x{block_number:x}");
+    let receipt_body = json!({
+        "jsonrpc": "2.0",
+        "id": "deployment-receipts",
+        "method": "alchemy_getTransactionReceipts",
+        "params": [{"blockNumber": block_hex}]
+    });
+    let receipt_payload = match client.post_json_alchemy(&rpc, &[], &receipt_body).await {
+        Ok(payload) => payload,
+        Err(error) => {
+            return FetchOutcome::failed("alchemy", "alchemy_deployment", error);
+        }
+    };
+    if let Some(error) = receipt_payload.get("error") {
+        return FetchOutcome::failed("alchemy", "alchemy_deployment", error);
+    }
+    let normalized_contract = contract.trim().to_ascii_lowercase();
+    let receipt = receipt_payload
+        .pointer("/result/receipts")
+        .and_then(Value::as_array)
+        .and_then(|receipts| {
+            receipts.iter().find(|receipt| {
+                receipt
+                    .get("contractAddress")
+                    .and_then(Value::as_str)
+                    .is_some_and(|address| {
+                        address.trim().eq_ignore_ascii_case(&normalized_contract)
+                    })
+            })
+        });
+    let Some(receipt) = receipt else {
+        let mut outcome = FetchOutcome::ok(None, 0, true, "alchemy", "alchemy_deployment");
+        outcome.failure = Some(format!(
+            "alchemy_deployment: no creation receipt for {contract} in block {block_number}"
+        ));
+        return outcome;
+    };
+    let Some(receipt_gas) = parse_receipt_gas(receipt) else {
+        let mut outcome = FetchOutcome::ok(None, 0, true, "alchemy", "alchemy_deployment");
+        outcome.failure =
+            Some("alchemy_deployment: creation receipt omitted usable gas fields".into());
+        return outcome;
+    };
+
+    let block_body = json!({
+        "jsonrpc": "2.0",
+        "id": "deployment-block",
+        "method": "eth_getBlockByNumber",
+        "params": [block_hex, false]
+    });
+    let timestamp = client
+        .post_json_alchemy(&rpc, &[], &block_body)
+        .await
+        .ok()
+        .and_then(|payload| {
+            parse_u128(
+                payload
+                    .get("result")
+                    .and_then(|result| result.get("timestamp")),
+            )
+        })
+        .and_then(|timestamp| i64::try_from(timestamp).ok());
+    let tx_hash = receipt
+        .get("transactionHash")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    if tx_hash.is_empty() {
+        let mut outcome = FetchOutcome::ok(None, 0, true, "alchemy", "alchemy_deployment");
+        outcome.failure =
+            Some("alchemy_deployment: creation receipt omitted transactionHash".into());
+        return outcome;
+    }
+    let deployment = DeploymentEvent {
+        tx_hash,
+        timestamp,
+        gas_native: receipt_gas.gas_native,
+        fee_payer: receipt_gas.fee_payer,
+    };
+    FetchOutcome::ok(Some(deployment), 1, false, "alchemy", "alchemy_deployment")
+}
+
 /// Collect unique non-empty tx hashes from transfers and sales (lowercase).
 pub fn collect_unique_tx_hashes(transfers: &[TransferEvent], sales: &[SaleEvent]) -> Vec<String> {
     let mut set = std::collections::BTreeSet::new();
@@ -844,13 +1457,7 @@ pub async fn fetch_receipt_gas(
         return FetchOutcome::skipped("alchemy_receipts");
     };
     if tx_hashes.is_empty() {
-        return FetchOutcome::ok(
-            AHashMap::new(),
-            0,
-            false,
-            "alchemy",
-            "alchemy_receipts",
-        );
+        return FetchOutcome::ok(AHashMap::new(), 0, false, "alchemy", "alchemy_receipts");
     }
     let Some(rpc) = endpoints.alchemy_rpc(chain, api_key) else {
         return FetchOutcome::failed(
@@ -1058,6 +1665,42 @@ pub fn attach_receipt_gas(
     }
 }
 
+/// Attach receipt gas / fee payer onto matching sales.
+pub fn attach_sale_receipt_gas(sales: &mut [SaleEvent], receipts: &AHashMap<String, ReceiptGas>) {
+    for sale in sales {
+        let key = sale.tx_hash.trim().to_ascii_lowercase();
+        if let Some(receipt) = receipts.get(&key) {
+            sale.gas_native = receipt.gas_native;
+            sale.fee_payer = receipt.fee_payer.clone();
+        }
+    }
+}
+
+/// Collect and attach receipt fees for candidate-wide money-flow transactions.
+pub fn value_flow_tx_hashes(edges: &[ValueFlowEdge]) -> Vec<String> {
+    let mut hashes = AHashSet::new();
+    for edge in edges {
+        let hash = edge.tx_hash.trim();
+        if !hash.is_empty() {
+            hashes.insert(hash.to_ascii_lowercase());
+        }
+    }
+    hashes.into_iter().collect()
+}
+
+pub fn attach_value_flow_receipt_gas(
+    edges: &mut [ValueFlowEdge],
+    receipts: &AHashMap<String, ReceiptGas>,
+) {
+    for edge in edges {
+        let key = edge.tx_hash.trim().to_ascii_lowercase();
+        if let Some(receipt) = receipts.get(&key) {
+            edge.gas_native = receipt.gas_native;
+            edge.fee_payer = receipt.fee_payer.clone();
+        }
+    }
+}
+
 pub fn parse_receipt_gas(result: &Value) -> Option<ReceiptGas> {
     let gas_used = parse_u128(result.get("gasUsed"))?;
     let gas_price = parse_u128(
@@ -1091,10 +1734,7 @@ fn parse_u128(value: Option<&Value>) -> Option<u128> {
     if text.is_empty() {
         return None;
     }
-    if let Some(hex) = text
-        .strip_prefix("0x")
-        .or_else(|| text.strip_prefix("0X"))
-    {
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
         if hex.is_empty() {
             return Some(0);
         }
@@ -1230,6 +1870,13 @@ pub fn parse_native_transfer(item: &Value) -> Option<NativeTransfer> {
     });
     Some(NativeTransfer {
         tx_hash,
+        event_id: item
+            .get("uniqueId")
+            .or_else(|| item.get("unique_id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
         from,
         to,
         value_native,
@@ -1267,6 +1914,7 @@ pub fn sales_need_opensea_fallback(sales: &[SaleEvent], sales_status: EvidenceSt
 #[cfg(test)]
 mod receipt_gas_tests {
     use super::*;
+    use httpmock::{Method::POST, MockServer};
 
     #[test]
     fn parse_u128_zero_hex() {
@@ -1298,6 +1946,146 @@ mod receipt_gas_tests {
     }
 
     #[test]
+    fn eip2981_helpers_support_decimal_tokens_and_first_word_recipient() {
+        assert_eq!(
+            token_id_to_abi_word("255").unwrap(),
+            format!("{:0>64}", "ff")
+        );
+        let encoded = format!(
+            "0x{:0>64}{:0>64}",
+            "1234567890abcdef1234567890abcdef12345678", "64"
+        );
+        assert_eq!(
+            abi_first_word_address(&encoded).as_deref(),
+            Some("0x1234567890abcdef1234567890abcdef12345678")
+        );
+    }
+
+    #[test]
+    fn sale_parser_preserves_fee_splits_and_royalty_recipient() {
+        let payload = json!({
+            "nftSales": [{
+                "transactionHash": "0xsale",
+                "tokenId": "1",
+                "sellerAddress": "0xSeller",
+                "buyerAddress": "0xBuyer",
+                "sellerFee": {"amount": "800000000000000000", "decimals": 18, "symbol": "ETH"},
+                "protocolFee": {"amount": "100000000000000000", "decimals": 18, "symbol": "ETH"},
+                "royaltyFee": {
+                    "amount": "100000000000000000",
+                    "decimals": 18,
+                    "symbol": "ETH",
+                    "feeRecipient": "0xCreator"
+                }
+            }]
+        });
+        let sales = parse_nft_sales(&payload, "ethereum");
+        assert_eq!(sales.len(), 1);
+        assert_eq!(sales[0].native_amount, Some(1.0));
+        assert_eq!(sales[0].seller_proceeds_native, Some(0.8));
+        assert_eq!(sales[0].marketplace_fee_native, Some(0.1));
+        assert_eq!(sales[0].royalty_fee_native, Some(0.1));
+        assert_eq!(
+            sales[0].sale_price_raw.as_deref(),
+            Some("1000000000000000000")
+        );
+        assert_eq!(sales[0].royalty_recipient.as_deref(), Some("0xcreator"));
+    }
+
+    #[test]
+    fn sale_without_seller_fee_keeps_gross_amount_unknown() {
+        let payload = json!({
+            "nftSales": [{
+                "transactionHash": "0xsale",
+                "tokenId": "1",
+                "sellerAddress": "0xSeller",
+                "buyerAddress": "0xBuyer",
+                "protocolFee": {
+                    "amount": "100000000000000000",
+                    "decimals": 18,
+                    "symbol": "ETH"
+                }
+            }]
+        });
+        let sales = parse_nft_sales(&payload, "ethereum");
+        assert_eq!(sales.len(), 1);
+        assert_eq!(sales[0].native_amount, None);
+        assert!(sales_need_opensea_fallback(
+            &sales,
+            EvidenceStatus::Complete
+        ));
+    }
+
+    #[test]
+    fn token_id_normalization_supports_full_uint256_and_decimal_leading_zeros() {
+        assert_eq!(
+            normalize_token_id(Some(&Value::String(
+                "0xffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff".into()
+            ))),
+            "115792089237316195423570985008687907853269984665640564039457584007913129639935"
+        );
+        assert_eq!(
+            normalize_token_id(Some(&Value::String("00000042".into()))),
+            "42"
+        );
+        assert_eq!(normalize_token_id(Some(&Value::String("0x0".into()))), "0");
+    }
+
+    #[tokio::test]
+    async fn royalty_lookup_uses_each_sale_historical_block_and_actual_price() {
+        let server = MockServer::start_async().await;
+        let rpc = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/rpc/eth-mainnet/key")
+                    .body_contains("\"eth_call\"")
+                    .body_contains("0x2a55205a")
+                    .body_contains(
+                        "0000000000000000000000000000000000000000000000001bc16d674ec80000",
+                    );
+                then.status(200).json_body(json!([{
+                    "jsonrpc": "2.0",
+                    "id": "royalty-0-0",
+                    "result": format!(
+                        "0x{:0>64}{:0>64}",
+                        "1234567890abcdef1234567890abcdef12345678", "64"
+                    )
+                }]));
+            })
+            .await;
+        let endpoints = ProviderEndpoints {
+            alchemy_rpc_template: format!("{}/rpc/{{network}}/{{key}}", server.base_url()),
+            ..ProviderEndpoints::default()
+        };
+        let client = HttpClient::with_retries(1, 0).unwrap();
+        let sales = vec![SaleEvent {
+            token_id: "1".into(),
+            block_number: Some(42),
+            royalty_fee_native: Some(0.1),
+            sale_price_raw: Some("2000000000000000000".into()),
+            ..SaleEvent::default()
+        }];
+        let outcome = fetch_royalty_recipients(
+            &client,
+            &endpoints,
+            Some("key"),
+            "ethereum",
+            "0xcontract",
+            &sales,
+        )
+        .await;
+        assert_eq!(outcome.status, EvidenceStatus::Complete);
+        assert_eq!(
+            outcome
+                .value
+                .get(&("1".into(), 42, "2000000000000000000".into()))
+                .map(String::as_str),
+            Some("0x1234567890abcdef1234567890abcdef12345678")
+        );
+        assert_eq!(rpc.hits(), 1);
+    }
+
+    #[test]
     fn collect_unique_hashes_from_transfers_and_sales() {
         let transfers = vec![TransferEvent {
             tx_hash: "0xAAA".into(),
@@ -1311,6 +2099,7 @@ mod receipt_gas_tests {
             fee_payer: None,
             mint_payment_native: None,
             mint_payment_usd: None,
+            mint_payment_receiver: None,
         }];
         let sales = vec![SaleEvent {
             tx_hash: "0xaaa".into(),
@@ -1323,6 +2112,10 @@ mod receipt_gas_tests {
             native_amount: None,
             usd_amount: None,
             currency_symbol: None,
+            currency_address: None,
+            seller_proceeds_native: None,
+            seller_proceeds_usd: None,
+            ..SaleEvent::default()
         }];
         let hashes = collect_unique_tx_hashes(&transfers, &sales);
         assert_eq!(hashes, vec!["0xaaa".to_owned()]);
@@ -1341,6 +2134,30 @@ mod receipt_gas_tests {
         });
         assert_eq!(parse_by_symbol_usd(&payload, "ETH"), Some(2500.5));
         assert_eq!(parse_by_symbol_usd(&payload, "SOL"), None);
+    }
+
+    #[test]
+    fn symbol_price_is_rejected_when_multiple_tokens_share_the_symbol() {
+        let payload = json!({
+            "data": [
+                {"symbol": "ABC", "prices": [{"currency": "usd", "value": "1"}]},
+                {"symbol": "ABC", "prices": [{"currency": "usd", "value": "9"}]}
+            ]
+        });
+        assert_eq!(parse_by_symbol_usd(&payload, "ABC"), None);
+    }
+
+    #[test]
+    fn address_price_matches_chain_aware_token_identity() {
+        let payload = json!({
+            "data": [{
+                "network": "solana-mainnet",
+                "address": "AbC",
+                "prices": [{"currency": "USD", "value": "2.5"}]
+            }]
+        });
+        assert_eq!(parse_by_address_usd(&payload, "solana", "AbC"), Some(2.5));
+        assert_eq!(parse_by_address_usd(&payload, "solana", "abc"), None);
     }
 
     #[test]
@@ -1390,6 +2207,10 @@ mod sales_fallback_tests {
             native_amount: native,
             usd_amount: None,
             currency_symbol: Some("ETH".into()),
+            currency_address: None,
+            seller_proceeds_native: native,
+            seller_proceeds_usd: None,
+            ..SaleEvent::default()
         }
     }
 
@@ -1397,7 +2218,9 @@ mod sales_fallback_tests {
     fn detects_alchemy_sales_disabled_on_chain_message() {
         let msg = r#"HTTP 400 Bad Request body={"error":{"message":"This endpoint isn't enabled for that chain or network just yet - please contact the Alchemy team for support!"}}"#;
         assert!(super::is_nft_sales_chain_disabled_error(msg));
-        assert!(!super::is_nft_sales_chain_disabled_error("HTTP 500 internal"));
+        assert!(!super::is_nft_sales_chain_disabled_error(
+            "HTTP 500 internal"
+        ));
     }
 
     #[test]
@@ -1408,7 +2231,10 @@ mod sales_fallback_tests {
     #[test]
     fn failed_or_not_requested_need_opensea() {
         assert!(sales_need_opensea_fallback(&[], EvidenceStatus::Failed));
-        assert!(sales_need_opensea_fallback(&[], EvidenceStatus::NotRequested));
+        assert!(sales_need_opensea_fallback(
+            &[],
+            EvidenceStatus::NotRequested
+        ));
     }
 
     #[test]
@@ -1431,19 +2257,55 @@ mod sales_fallback_tests {
     }
 }
 
-/// Alchemy NFT API: collection slug from first NFT metadata (or None).
-pub async fn fetch_collection_slug(
+#[derive(Clone, Debug, Default)]
+pub struct CollectionProfile {
+    pub slug: Option<String>,
+    pub open_license: bool,
+}
+
+pub(crate) fn is_open_license_payload(payload: &Value) -> bool {
+    fn contains_marker(value: &Value) -> bool {
+        match value {
+            Value::Object(map) => map.values().any(contains_marker),
+            Value::Array(items) => items.iter().any(contains_marker),
+            Value::String(text) => {
+                let text = text.to_ascii_lowercase();
+                [
+                    "cc0-1.0",
+                    "license: cc0",
+                    "creative commons zero",
+                    "public domain",
+                    "cc zero",
+                ]
+                .iter()
+                .any(|marker| text.contains(marker))
+            }
+            _ => false,
+        }
+    }
+
+    contains_marker(payload)
+}
+
+/// Alchemy NFT API: collection identity and seed-level license from the first NFT.
+pub async fn fetch_collection_profile(
     client: &HttpClient,
     endpoints: &ProviderEndpoints,
     api_key: Option<&str>,
     chain: &str,
     contract: &str,
-) -> Option<String> {
-    let api_key = api_key?;
-    let base = endpoints.alchemy_nft(chain, api_key, "getNFTsForContract")?;
+) -> CollectionProfile {
+    let Some(api_key) = api_key else {
+        return CollectionProfile::default();
+    };
+    let Some(base) = endpoints.alchemy_nft(chain, api_key, "getNFTsForContract") else {
+        return CollectionProfile::default();
+    };
     let url = format!("{base}?contractAddress={contract}&withMetadata=true&limit=1");
-    let payload = client.get_json_alchemy(&url, &[]).await.ok()?;
-    payload
+    let Ok(payload) = client.get_json_alchemy(&url, &[]).await else {
+        return CollectionProfile::default();
+    };
+    let slug = payload
         .get("nfts")
         .and_then(Value::as_array)
         .into_iter()
@@ -1455,7 +2317,43 @@ pub async fn fetch_collection_slug(
                 .map(str::trim)
                 .filter(|s| !s.is_empty())
                 .map(ToOwned::to_owned)
-        })
+        });
+    CollectionProfile {
+        slug,
+        open_license: is_open_license_payload(&payload),
+    }
+}
+
+/// Alchemy NFT API: collection slug from first NFT metadata (or None).
+pub async fn fetch_collection_slug(
+    client: &HttpClient,
+    endpoints: &ProviderEndpoints,
+    api_key: Option<&str>,
+    chain: &str,
+    contract: &str,
+) -> Option<String> {
+    fetch_collection_profile(client, endpoints, api_key, chain, contract)
+        .await
+        .slug
+}
+
+#[cfg(test)]
+mod open_license_tests {
+    use super::is_open_license_payload;
+    use serde_json::json;
+
+    #[test]
+    fn detects_supported_open_license_markers_recursively() {
+        assert!(is_open_license_payload(&json!({
+            "raw": {"metadata": {"license": "CC0-1.0"}}
+        })));
+        assert!(is_open_license_payload(&json!({
+            "description": "Released into the public domain"
+        })));
+        assert!(!is_open_license_payload(&json!({
+            "description": "All rights reserved"
+        })));
+    }
 }
 
 /// Alchemy NFT API: whether `wallet` currently holds any NFT of `contract`.

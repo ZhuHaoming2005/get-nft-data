@@ -7,8 +7,8 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::path::PathBuf;
 
-use crate::progress::ProgressObserver;
 use crate::Analysis2Error;
+use crate::progress::ProgressObserver;
 
 pub const PASS1_COLUMNS: [&str; 6] = [
     "chain",
@@ -53,12 +53,12 @@ pub fn validate_inputs(
             progress.check_cancelled()?;
             let file_ordinal = u32::try_from(ordinal)
                 .map_err(|_| Analysis2Error::invalid("too many input files for file_ordinal"))?;
-            let file = File::open(path).map_err(|error| {
-                Analysis2Error::parquet(format!("{}: {error}", path.display()))
-            })?;
-            let metadata = ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).map_err(
-                |error| Analysis2Error::parquet(format!("{}: schema load: {error}", path.display())),
-            )?;
+            let file = File::open(path)
+                .map_err(|error| Analysis2Error::parquet(format!("{}: {error}", path.display())))?;
+            let metadata =
+                ArrowReaderMetadata::load(&file, ArrowReaderOptions::new()).map_err(|error| {
+                    Analysis2Error::parquet(format!("{}: schema load: {error}", path.display()))
+                })?;
             let schema = metadata.schema();
             let mut required_indices = Vec::with_capacity(REQUIRED_COLUMNS.len());
             for required in REQUIRED_COLUMNS {

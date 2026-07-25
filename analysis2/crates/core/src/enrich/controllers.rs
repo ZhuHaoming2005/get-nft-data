@@ -1,6 +1,6 @@
 //! Fill `EvidenceBundle.controllers` from Alchemy / on-chain (EVM) and Helius (Solana).
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use super::alchemy::FetchOutcome;
 use super::http::HttpClient;
@@ -9,6 +9,12 @@ use super::types::ProviderEndpoints;
 const EIP1967_ADMIN_SLOT: &str =
     "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103";
 
+#[derive(Clone, Debug, Default)]
+pub struct EvmControllerEvidence {
+    pub addresses: Vec<String>,
+    pub deployed_block: Option<u64>,
+}
+
 /// EVM: Alchemy `getContractMetadata` fields + on-chain owner/admin/EIP-1967.
 pub async fn fetch_evm_controllers(
     client: &HttpClient,
@@ -16,7 +22,7 @@ pub async fn fetch_evm_controllers(
     api_key: Option<&str>,
     chain: &str,
     contract: &str,
-) -> FetchOutcome<Vec<String>> {
+) -> FetchOutcome<EvmControllerEvidence> {
     let Some(api_key) = api_key else {
         return FetchOutcome::skipped("contract_controllers");
     };
@@ -39,6 +45,7 @@ pub async fn fetch_evm_controllers(
     let mut controllers = Vec::new();
     let mut supplemental_failed = false;
     let mut deployer: Option<String> = None;
+    let mut deployed_block = None;
 
     match client.get_json_alchemy(&meta_url, &[]).await {
         Ok(payload) => {
@@ -75,6 +82,10 @@ pub async fn fetch_evm_controllers(
                         .and_then(Value::as_str)
                         .and_then(normalize_evm_address)
                 });
+                deployed_block = metadata
+                    .get("deployedBlockNumber")
+                    .or_else(|| payload.get("deployedBlockNumber"))
+                    .and_then(parse_block_number);
             }
         }
         Err(_) => {
@@ -101,7 +112,10 @@ pub async fn fetch_evm_controllers(
     controllers.dedup();
     let count = controllers.len();
     let mut outcome = FetchOutcome::ok(
-        controllers,
+        EvmControllerEvidence {
+            addresses: controllers,
+            deployed_block,
+        },
         count,
         supplemental_failed,
         "alchemy",
@@ -115,6 +129,18 @@ pub async fn fetch_evm_controllers(
         }
     }
     outcome
+}
+
+fn parse_block_number(value: &Value) -> Option<u64> {
+    if let Some(number) = value.as_u64() {
+        return Some(number);
+    }
+    let text = value.as_str()?.trim();
+    if let Some(hex) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        u64::from_str_radix(hex, 16).ok()
+    } else {
+        text.parse().ok()
+    }
 }
 
 async fn onchain_controllers(
@@ -224,7 +250,11 @@ pub fn normalize_evm_address(value: &str) -> Option<String> {
 }
 
 /// Extract collection `updateAuthority` (+ verified creators) from a DAS asset item / result.
-pub fn solana_authorities_from_asset(item: &Value, result: &Value, collection: &str) -> Vec<String> {
+pub fn solana_authorities_from_asset(
+    item: &Value,
+    result: &Value,
+    collection: &str,
+) -> Vec<String> {
     let mut out = Vec::new();
     let metadata = item
         .get("grouping")
@@ -312,8 +342,7 @@ mod tests {
 
     #[test]
     fn abi_address_takes_trailing_40() {
-        let padded =
-            "0x000000000000000000000000abcdef0123456789abcdef0123456789abcdef01";
+        let padded = "0x000000000000000000000000abcdef0123456789abcdef0123456789abcdef01";
         assert_eq!(
             abi_address(Some(padded)).as_deref(),
             Some("0xabcdef0123456789abcdef0123456789abcdef01")
@@ -340,14 +369,20 @@ mod tests {
             &Value::Null,
             "Coll1111111111111111111111111111111111111",
         );
-        assert!(authorities
-            .iter()
-            .any(|a| a == "Auth1111111111111111111111111111111111111"));
-        assert!(authorities
-            .iter()
-            .any(|a| a == "Cre11111111111111111111111111111111111111"));
-        assert!(!authorities
-            .iter()
-            .any(|a| a == "Fake1111111111111111111111111111111111111"));
+        assert!(
+            authorities
+                .iter()
+                .any(|a| a == "Auth1111111111111111111111111111111111111")
+        );
+        assert!(
+            authorities
+                .iter()
+                .any(|a| a == "Cre11111111111111111111111111111111111111")
+        );
+        assert!(
+            !authorities
+                .iter()
+                .any(|a| a == "Fake1111111111111111111111111111111111111")
+        );
     }
 }

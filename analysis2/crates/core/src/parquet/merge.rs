@@ -1,8 +1,8 @@
 //! Ordered tree-merge of ResidentStore shards.
 
+use crate::Analysis2Error;
 use crate::entity::ResidentStore;
 use crate::parquet::LoadOptions;
-use crate::Analysis2Error;
 
 pub fn merge_shards_ordered(
     mut shards: Vec<Result<ResidentStore, Analysis2Error>>,

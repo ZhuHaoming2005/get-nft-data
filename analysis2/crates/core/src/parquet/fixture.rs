@@ -24,9 +24,7 @@ fn write_rows(path: &Path, rows: &[FixtureRow]) -> Result<(), Analysis2Error> {
             rows.iter().map(|r| r.chain).collect::<Vec<_>>(),
         )),
         Arc::new(StringArray::from(
-            rows.iter()
-                .map(|r| r.contract_address)
-                .collect::<Vec<_>>(),
+            rows.iter().map(|r| r.contract_address).collect::<Vec<_>>(),
         )),
         Arc::new(StringArray::from(
             rows.iter().map(|r| r.token_id).collect::<Vec<_>>(),

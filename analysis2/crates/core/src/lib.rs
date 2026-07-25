@@ -11,8 +11,8 @@ pub mod reporting;
 pub mod seed;
 
 pub use analysis::{
-    AddressRole, BehaviorFacts, BehaviorInstance, BehaviorKind, CandidateAnalysis, PaperConfig,
-    analyze_candidate,
+    AddressRole, BehaviorFacts, BehaviorInstance, BehaviorKind, CandidateAnalysis, LinkedLossEvent,
+    PaperConfig, analyze_candidate,
 };
 pub use dedup::{
     CandidateRegistry, DEFAULT_METADATA_THRESHOLD, DEFAULT_NAME_THRESHOLD, Dimension, HitEdge,
@@ -35,25 +35,25 @@ pub use entity::{
 };
 pub use error::Analysis2Error;
 pub use parquet::{
-    load_resident_store, load_resident_store_uri_ready, LoadOptions, PendingDedupLoad,
+    LoadOptions, PendingDedupLoad, load_resident_store, load_resident_store_uri_ready,
 };
 pub use progress::{EwmaEta, NoopProgress, ProgressObserver};
 pub use reporting::{
-    build_all_chains_duplicate_scale, build_contract_nft_map, build_dedup_cache,
-    build_evidence_cache, build_seed_analysis_rollup, build_seed_dedup_report, count_failed_seeds,
-    count_scope_nfts, default_dedup_cache_path, default_evidence_cache_path, detail_candidates_dir,
-    detail_dir, ensure_output_layout, evidence_cache_artifacts_present, evidence_cache_params,
+    CachedHitEdge, CachedSeedHits, DEDUP_CACHE_VERSION, DEFAULT_DEDUP_CACHE_FILE,
+    DEFAULT_EVIDENCE_CACHE_BATCH, DEFAULT_EVIDENCE_CACHE_FILE, DETAIL_CANDIDATES_REL, DETAIL_DIR,
+    DedupCacheFile, DedupCacheParams, DedupRunParams, EVIDENCE_CACHE_VERSION, EvidenceCacheFile,
+    EvidenceCacheParams, EvidenceCacheSink, FailureRecord, INTERMEDIATE_DIR, SCOPE_ALL_CHAINS,
+    SCOPE_CHAIN_MATRIX, SCOPE_CROSS_CHAIN, SCOPE_INTRA_CHAIN, SUMMARY_DIR, ScopeAnalysisSets,
+    ScopeNftCounts, SeedDedupReport, SeedFullReport, SeedRecord, build_all_chains_duplicate_scale,
+    build_contract_nft_map, build_dedup_cache, build_evidence_cache, build_seed_analysis_rollup,
+    build_seed_dedup_report, candidate_json_rel_path, count_failed_seeds, count_scope_nfts,
+    default_dedup_cache_path, default_evidence_cache_path, detail_candidates_dir, detail_dir,
+    ensure_output_layout, evidence_cache_artifacts_present, evidence_cache_params,
     intermediate_dir, load_dedup_cache, load_evidence_cache, load_evidence_cache_resumable,
     load_seeds_json, rematerialize_dedup_batch, rematerialize_evidence, resolve_seed_contract,
     scopes_complete_for_seed, serialize_candidate_json, summary_dir, validate_dedup_cache,
     validate_evidence_cache, write_candidate_json, write_candidate_json_bytes, write_dedup_cache,
-    write_dedup_outputs, write_evidence_cache, write_run_outputs, CachedHitEdge, CachedSeedHits,
-    DedupCacheFile, DedupCacheParams, DedupRunParams, EvidenceCacheFile, EvidenceCacheParams,
-    EvidenceCacheSink, FailureRecord, ScopeNftCounts, SeedDedupReport, SeedFullReport, SeedRecord,
-    DEFAULT_DEDUP_CACHE_FILE, DEFAULT_EVIDENCE_CACHE_BATCH, DEFAULT_EVIDENCE_CACHE_FILE,
-    DETAIL_CANDIDATES_REL, DETAIL_DIR, DEDUP_CACHE_VERSION, EVIDENCE_CACHE_VERSION, INTERMEDIATE_DIR,
-    SCOPE_ALL_CHAINS, SCOPE_CHAIN_MATRIX, SCOPE_CROSS_CHAIN, SCOPE_INTRA_CHAIN, SUMMARY_DIR,
-    candidate_json_rel_path,
+    write_dedup_outputs, write_evidence_cache, write_run_outputs,
 };
 pub use seed::{
     SeedRecord as SelectedSeed, SelectSeedsOptions, select_seeds, select_seeds_async,

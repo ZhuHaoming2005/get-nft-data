@@ -236,14 +236,12 @@ pub fn rematerialize_dedup_batch(
             let candidate_nft = match &edge.candidate_token_id {
                 None => None,
                 Some(token_id) => {
-                    let nft_id = store
-                        .nft_id(candidate, token_id)
-                        .ok_or_else(|| {
-                            Analysis2Error::invalid(format!(
-                                "dedup cache NFT not in snapshot: {} / {} / {token_id}",
-                                edge.candidate_chain, edge.candidate_address
-                            ))
-                        })?;
+                    let nft_id = store.nft_id(candidate, token_id).ok_or_else(|| {
+                        Analysis2Error::invalid(format!(
+                            "dedup cache NFT not in snapshot: {} / {} / {token_id}",
+                            edge.candidate_chain, edge.candidate_address
+                        ))
+                    })?;
                     Some(nft_id)
                 }
             };
@@ -253,13 +251,12 @@ pub fn rematerialize_dedup_batch(
                     edge.primary_chain
                 ))
             })?;
-            let secondary_chain =
-                *store.chain_ids.get(&edge.secondary_chain).ok_or_else(|| {
-                    Analysis2Error::invalid(format!(
-                        "dedup cache unknown secondary_chain {}",
-                        edge.secondary_chain
-                    ))
-                })?;
+            let secondary_chain = *store.chain_ids.get(&edge.secondary_chain).ok_or_else(|| {
+                Analysis2Error::invalid(format!(
+                    "dedup cache unknown secondary_chain {}",
+                    edge.secondary_chain
+                ))
+            })?;
             graph.push(HitEdge {
                 seed_contract: seed_id,
                 candidate_contract: candidate,
@@ -278,17 +275,14 @@ pub fn rematerialize_dedup_batch(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::entity::{IdentityRow, SourceOrder};
     use crate::dedup::hits::Dimension;
+    use crate::entity::{IdentityRow, SourceOrder};
 
     fn prepared() -> ResidentStore {
         let mut store = ResidentStore::new();
-        for (n, (chain, addr, token)) in [
-            ("ethereum", "0xseed", "1"),
-            ("base", "0xcand", "9"),
-        ]
-        .into_iter()
-        .enumerate()
+        for (n, (chain, addr, token)) in [("ethereum", "0xseed", "1"), ("base", "0xcand", "9")]
+            .into_iter()
+            .enumerate()
         {
             store
                 .ingest_identity_row(IdentityRow {
@@ -341,7 +335,8 @@ mod tests {
             seeds: vec![seed.clone()],
         };
         let cache = build_dedup_cache(&store, params.clone(), &[(seed, seed_id, graph)], &[]);
-        let dir = std::env::temp_dir().join(format!("analysis2_dedup_cache_{}", std::process::id()));
+        let dir =
+            std::env::temp_dir().join(format!("analysis2_dedup_cache_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("dedup_cache.json");

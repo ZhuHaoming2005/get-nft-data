@@ -1,11 +1,11 @@
 //! Integration test for two-pass Parquet load into ResidentStore.
 
-use analysis2_core::parquet::{load_resident_store, write_tiny_multichain_fixture, LoadOptions};
+use analysis2_core::parquet::{LoadOptions, load_resident_store, write_tiny_multichain_fixture};
 use analysis2_core::{NoopProgress, ProgressObserver};
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 struct RecordingProgress {
     stages: Mutex<Vec<String>>,

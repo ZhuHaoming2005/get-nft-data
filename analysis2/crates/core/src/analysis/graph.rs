@@ -37,13 +37,21 @@ impl AddressGraph {
         sales: &'a [SaleEvent],
         include: impl Fn(&SaleEvent) -> bool,
     ) -> Self {
-        Self::build(sales.iter().filter(|event| include(event)).filter_map(|event| {
-            if event.seller.is_empty() || event.buyer.is_empty() || event.seller == event.buyer {
-                None
-            } else {
-                Some((event.seller.as_str(), event.buyer.as_str()))
-            }
-        }))
+        Self::build(
+            sales
+                .iter()
+                .filter(|event| include(event))
+                .filter_map(|event| {
+                    if event.seller.is_empty()
+                        || event.buyer.is_empty()
+                        || event.seller == event.buyer
+                    {
+                        None
+                    } else {
+                        Some((event.seller.as_str(), event.buyer.as_str()))
+                    }
+                }),
+        )
     }
 
     pub fn build<'a>(pairs: impl Iterator<Item = (&'a str, &'a str)>) -> Self {
@@ -207,6 +215,10 @@ mod tests {
                 native_amount: Some(1.0),
                 usd_amount: Some(1.0),
                 currency_symbol: None,
+                currency_address: None,
+                seller_proceeds_native: Some(1.0),
+                seller_proceeds_usd: Some(1.0),
+                ..SaleEvent::default()
             },
             SaleEvent {
                 tx_hash: "t1".into(),
@@ -219,6 +231,10 @@ mod tests {
                 native_amount: Some(1.0),
                 usd_amount: Some(1.0),
                 currency_symbol: None,
+                currency_address: None,
+                seller_proceeds_native: Some(1.0),
+                seller_proceeds_usd: Some(1.0),
+                ..SaleEvent::default()
             },
         ];
         let graph = AddressGraph::from_sales(&sales);

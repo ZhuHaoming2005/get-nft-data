@@ -7,8 +7,8 @@
 //!
 //! After an interrupt, the next run loads meta+jsonl (and/or the JSON snapshot),
 //! rematerializes bundles, and only HTTP-fetches candidates still missing.
-//! Pagination bounds must match. Seed membership and provider-key presence do
-//! not invalidate candidate-scoped HTTP evidence.
+//! Pagination bounds and the run-time pricing day must match. Adding a provider
+//! key invalidates a cache that could not have collected that provider's data.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -17,12 +17,14 @@ use std::path::{Path, PathBuf};
 use ahash::AHashMap;
 use serde::{Deserialize, Serialize};
 
-use crate::enrich::types::{ApiKeys, EvidenceBundle, HttpLimits};
+use crate::enrich::types::{ApiKeys, EvidenceBundle, HttpLimits, normalize_chain_address};
 use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 use crate::reporting::json::SeedRecord;
 
-pub const EVIDENCE_CACHE_VERSION: u32 = 1;
+// v8 adds seed-level open-license relation evidence and derives value-flow
+// operator seeds from complete contract-wide outbound NFT-transfer history.
+pub const EVIDENCE_CACHE_VERSION: u32 = 8;
 pub const DEFAULT_EVIDENCE_CACHE_FILE: &str = "evidence_cache.json";
 /// How many finished candidates to buffer before an append + snapshot flush.
 pub const DEFAULT_EVIDENCE_CACHE_BATCH: usize = 16;
@@ -40,6 +42,9 @@ pub struct EvidenceCacheParams {
     pub max_solana_assets: usize,
     pub max_history_assets: usize,
     pub max_signatures_per_asset: usize,
+    /// UTC day whose run-time spot prices are embedded in cached bundles.
+    #[serde(default)]
+    pub pricing_day_utc: i64,
     /// Whether each provider key was present when the cache was built (not the secret).
     pub had_alchemy: bool,
     pub had_etherscan: bool,
@@ -95,6 +100,7 @@ pub fn evidence_cache_params(
         max_solana_assets: limits.max_solana_assets,
         max_history_assets: limits.max_history_assets,
         max_signatures_per_asset: limits.max_signatures_per_asset,
+        pricing_day_utc: crate::enrich::types::now_unix().div_euclid(86_400) * 86_400,
         had_alchemy: keys.alchemy().is_some(),
         had_etherscan: keys.etherscan().is_some(),
         had_helius: keys.helius().is_some(),
@@ -111,7 +117,7 @@ fn portable_bundle(bundle: &EvidenceBundle) -> EvidenceBundle {
 fn bundle_key(bundle: &EvidenceBundle) -> (String, String) {
     (
         bundle.chain.to_ascii_lowercase(),
-        bundle.address.to_ascii_lowercase(),
+        normalize_chain_address(&bundle.chain, &bundle.address),
     )
 }
 
@@ -278,9 +284,8 @@ pub fn load_evidence_cache_resumable(path: &Path) -> Result<EvidenceCacheFile, A
 
 /// Ensure the cache was produced with equivalent evidence completeness bounds.
 ///
-/// Seed membership and API-key presence are deliberately excluded: cached
-/// provider responses are candidate-scoped and remain useful across those run
-/// configuration changes.
+/// Seed membership is deliberately excluded: cached provider responses are
+/// candidate-scoped and remain useful across seed changes.
 pub fn validate_evidence_cache(
     cache: &EvidenceCacheFile,
     expected: &EvidenceCacheParams,
@@ -297,25 +302,37 @@ pub fn validate_evidence_cache(
             "evidence cache pagination limits do not match current HttpLimits; re-run without --reuse-evidence",
         ));
     }
+    if got.pricing_day_utc != expected.pricing_day_utc {
+        return Err(Analysis2Error::invalid(
+            "evidence cache pricing day is not the current execution day; re-run without --reuse-evidence",
+        ));
+    }
+    if (!got.had_alchemy && expected.had_alchemy)
+        || (!got.had_etherscan && expected.had_etherscan)
+        || (!got.had_helius && expected.had_helius)
+        || (!got.had_opensea && expected.had_opensea)
+    {
+        return Err(Analysis2Error::invalid(
+            "evidence cache was built without a provider key now available; re-run without --reuse-evidence",
+        ));
+    }
     Ok(())
 }
 
 /// Rematerialize evidence keyed by process-local contract ids.
 ///
-/// Address match is **case-insensitive** so checksummed vs lowercased EVM
-/// addresses still hit. Bundles absent from the snapshot are skipped.
+/// Address matching is case-insensitive for EVM and case-sensitive for
+/// Solana. Bundles absent from the snapshot are skipped.
 pub fn rematerialize_evidence(
     store: &ResidentStore,
     cache: &EvidenceCacheFile,
 ) -> Result<AHashMap<ContractId, EvidenceBundle>, Analysis2Error> {
-    // Build a one-shot lowercased index so rematerialize does not depend on
-    // interned address string exact match (common re-run miss → full HTTP).
-    let mut by_lower: AHashMap<(String, String), ContractId> =
+    let mut by_identity: AHashMap<(String, String), ContractId> =
         AHashMap::with_capacity(store.contracts.len());
     for c in &store.contracts {
         let chain = store.chain_name(c.chain_id).to_ascii_lowercase();
-        let addr = c.address.to_ascii_lowercase();
-        by_lower.insert((chain, addr), c.id);
+        let addr = normalize_chain_address(&chain, &c.address);
+        by_identity.insert((chain, addr), c.id);
     }
 
     let mut out = AHashMap::with_capacity(cache.bundles.len());
@@ -323,9 +340,9 @@ pub fn rematerialize_evidence(
     for entry in &cache.bundles {
         let key = (
             entry.chain.to_ascii_lowercase(),
-            entry.address.to_ascii_lowercase(),
+            normalize_chain_address(&entry.chain, &entry.address),
         );
-        let Some(&contract_id) = by_lower.get(&key) else {
+        let Some(&contract_id) = by_identity.get(&key) else {
             skipped += 1;
             continue;
         };
@@ -376,15 +393,24 @@ impl EvidenceCacheSink {
         // Seed in-memory index from any existing cache (resume mid-run).
         let mut all = AHashMap::new();
         if path.is_file() || (meta_path.is_file() && jsonl_path.is_file()) {
-            if let Ok(existing) = load_evidence_cache_resumable(path) {
-                if validate_evidence_cache(&existing, &params).is_ok() {
+            match load_evidence_cache_resumable(path) {
+                Ok(existing) if validate_evidence_cache(&existing, &params).is_ok() => {
                     for b in existing.bundles {
                         all.insert(bundle_key(&b), b);
                     }
-                } else {
+                }
+                Ok(_) => {
                     // Params changed: start a fresh jsonl to avoid mixing.
                     eprintln!(
                         "evidence cache: params changed; truncating incremental jsonl at {}",
+                        jsonl_path.display()
+                    );
+                    let _ = fs::remove_file(&jsonl_path);
+                    all.clear();
+                }
+                Err(error) => {
+                    eprintln!(
+                        "evidence cache: unreadable/incompatible incremental cache; truncating {}: {error}",
                         jsonl_path.display()
                     );
                     let _ = fs::remove_file(&jsonl_path);
@@ -403,9 +429,8 @@ impl EvidenceCacheSink {
         // If we seeded from snapshot only (no jsonl), rewrite jsonl from `all`
         // so incremental append stays consistent.
         if !jsonl_path.is_file() && !all.is_empty() {
-            let mut f = File::create(&jsonl_path).map_err(|e| {
-                Analysis2Error::invalid(format!("create evidence jsonl: {e}"))
-            })?;
+            let mut f = File::create(&jsonl_path)
+                .map_err(|e| Analysis2Error::invalid(format!("create evidence jsonl: {e}")))?;
             let mut rows: Vec<_> = all.values().collect();
             rows.sort_by(|a, b| {
                 a.chain
@@ -416,9 +441,8 @@ impl EvidenceCacheSink {
                 let line = serde_json::to_string(b).map_err(|e| {
                     Analysis2Error::invalid(format!("serialize evidence jsonl: {e}"))
                 })?;
-                writeln!(f, "{line}").map_err(|e| {
-                    Analysis2Error::invalid(format!("write evidence jsonl: {e}"))
-                })?;
+                writeln!(f, "{line}")
+                    .map_err(|e| Analysis2Error::invalid(format!("write evidence jsonl: {e}")))?;
             }
             f.flush()
                 .map_err(|e| Analysis2Error::invalid(format!("flush evidence jsonl: {e}")))?;
@@ -453,7 +477,12 @@ impl EvidenceCacheSink {
         self.all.insert(key, portable.clone());
         // Always re-append when newly enriched so a restarted run that re-fetches
         // a key still records the latest bytes; note_cached avoids dup on seed.
-        if is_new || !self.pending.iter().any(|b| bundle_key(b) == bundle_key(&portable)) {
+        if is_new
+            || !self
+                .pending
+                .iter()
+                .any(|b| bundle_key(b) == bundle_key(&portable))
+        {
             self.pending.push(portable);
         }
         if self.pending.len() >= self.batch_size {
@@ -596,10 +625,8 @@ mod tests {
         let cache = build_evidence_cache(p.clone(), &map);
         assert_eq!(cache.bundles[0].contract_id, 0);
 
-        let dir = std::env::temp_dir().join(format!(
-            "analysis2_evidence_cache_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("analysis2_evidence_cache_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("evidence_cache.json");
@@ -619,10 +646,8 @@ mod tests {
         let store = prepared();
         let a = store.contract_id("ethereum", "0xabc").unwrap();
         let d = store.contract_id("ethereum", "0xdef").unwrap();
-        let dir = std::env::temp_dir().join(format!(
-            "analysis2_evidence_sink_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("analysis2_evidence_sink_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("evidence_cache.json");
@@ -650,7 +675,7 @@ mod tests {
     }
 
     #[test]
-    fn incremental_sink_keeps_bundles_when_seed_and_key_presence_change() {
+    fn incremental_sink_keeps_bundles_when_seed_changes() {
         let store = prepared();
         let a = store.contract_id("ethereum", "0xabc").unwrap();
         let dir = std::env::temp_dir().join(format!(
@@ -675,7 +700,6 @@ mod tests {
             address: "0xnew-seed".into(),
             rank: None,
         }];
-        current_params.had_alchemy = true;
         let sink = EvidenceCacheSink::create(&path, current_params, 1).unwrap();
         assert_eq!(sink.cached_count(), 1);
         sink.finish().unwrap();
@@ -687,9 +711,13 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_seed_and_key_presence_changes() {
-        let cached =
-            evidence_cache_params(&[], "seeds.json", &ApiKeys::default(), &HttpLimits::default());
+    fn validate_accepts_seed_changes_but_rejects_new_provider_coverage() {
+        let cached = evidence_cache_params(
+            &[],
+            "seeds.json",
+            &ApiKeys::default(),
+            &HttpLimits::default(),
+        );
         let mut current = cached.clone();
         current.seeds = vec![SeedRecord {
             chain: "polygon".into(),
@@ -707,14 +735,23 @@ mod tests {
             bundles: Vec::new(),
         };
 
-        validate_evidence_cache(&cache, &current)
-            .expect("candidate evidence must survive seed and key-presence changes");
+        assert!(validate_evidence_cache(&cache, &current).is_err());
+
+        let mut seed_only = cache.params.clone();
+        seed_only.seeds = current.seeds;
+        seed_only.seeds_path = current.seeds_path;
+        validate_evidence_cache(&cache, &seed_only)
+            .expect("candidate evidence must survive seed changes");
     }
 
     #[test]
     fn validate_still_rejects_pagination_changes() {
-        let cached =
-            evidence_cache_params(&[], "seeds.json", &ApiKeys::default(), &HttpLimits::default());
+        let cached = evidence_cache_params(
+            &[],
+            "seeds.json",
+            &ApiKeys::default(),
+            &HttpLimits::default(),
+        );
         let mut current = cached.clone();
         current.max_transfer_pages += 1;
         let cache = EvidenceCacheFile {

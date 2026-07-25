@@ -1,27 +1,29 @@
 //! Offline `run-dedup` and full `run` orchestration.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
 use std::sync::Arc;
+use std::sync::mpsc;
 use std::thread;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use analysis2_core::{
-    analyze_candidate, build_contract_nft_map, build_dedup_cache, build_evidence_cache,
-    build_seed_analysis_rollup, build_seed_dedup_report, candidate_json_rel_path,
-    default_dedup_cache_path, default_evidence_cache_path, enrich_candidates_with_hook,
-    evidence_cache_artifacts_present, evidence_cache_params, load_dedup_cache,
-    load_evidence_cache_resumable, load_resident_store_uri_ready, load_seeds_json,
-    query_metadata_for_seed_with_scratch, query_name_for_seed_with_scratch,
-    query_uri_for_seed_with_scratch, rematerialize_dedup_batch, rematerialize_evidence,
-    resolve_seed_contract, scopes_complete_for_seed, serialize_candidate_json,
-    validate_dedup_cache, validate_evidence_cache, write_candidate_json_bytes, write_dedup_cache,
-    write_dedup_outputs, write_evidence_cache, write_run_outputs, Analysis2Error, ApiKeys,
-    CandidateAnalysis, CandidateRegistry, ContractId, DedupCacheParams, DedupRunParams,
-    EvidenceBundle, EvidenceCacheSink, FailureRecord, HitGraph, HttpLimits, LegitSignals,
+    Analysis2Error, ApiKeys, CandidateAnalysis, CandidateRegistry, ContractId,
+    DEFAULT_EVIDENCE_CACHE_BATCH, DedupCacheParams, DedupRunParams, EvidenceBundle,
+    EvidenceCacheSink, EvidenceStatus, FailureRecord, HitGraph, HttpLimits, LegitSignals,
     LoadOptions, MetadataQueryScratch, NameQueryScratch, PaperConfig, PendingDedupLoad,
-    ProgressObserver, ResidentStore, SeedDedupReport, SeedFullReport, SeedRecord, UriQueryScratch,
-    DEFAULT_EVIDENCE_CACHE_BATCH, finalize_legit_signals,
+    ProgressObserver, ResidentStore, ScopeAnalysisSets, SeedDedupReport, SeedFullReport,
+    SeedRecord, UriQueryScratch, analyze_candidate, build_contract_nft_map, build_dedup_cache,
+    build_evidence_cache, build_seed_analysis_rollup, build_seed_dedup_report,
+    candidate_json_rel_path, default_dedup_cache_path, default_evidence_cache_path,
+    enrich_candidates_with_hook, evidence_cache_artifacts_present, evidence_cache_params,
+    finalize_legit_signals, load_dedup_cache, load_evidence_cache_resumable,
+    load_resident_store_uri_ready, load_seeds_json, query_metadata_for_seed_with_scratch,
+    query_name_for_seed_with_scratch, query_uri_for_seed_with_scratch, rematerialize_dedup_batch,
+    rematerialize_evidence, resolve_seed_contract, scopes_complete_for_seed,
+    serialize_candidate_json, validate_dedup_cache, validate_evidence_cache,
+    write_candidate_json_bytes, write_dedup_cache, write_dedup_outputs, write_evidence_cache,
+    write_run_outputs,
 };
 use rayon::prelude::*;
 
@@ -48,6 +50,171 @@ pub type EnrichOverride = Arc<
         + Send
         + Sync,
 >;
+
+#[derive(Clone, Debug, Default)]
+struct ScopeEvidenceSelector {
+    token_ids: AHashSet<String>,
+    seed_keys: AHashSet<String>,
+    token_ids_by_seed: AHashMap<String, AHashSet<String>>,
+}
+
+impl ScopeEvidenceSelector {
+    /// Keep relation classifications for the whole scope. When at least one
+    /// relation is suspicious, the candidate is a contract-level hit and deep
+    /// analysis receives every NFT event in that contract.
+    fn filtered_bundle(&self, bundle: &EvidenceBundle) -> EvidenceBundle {
+        let mut suspicious_token_ids = AHashSet::new();
+        for (seed_key, token_ids) in &self.token_ids_by_seed {
+            let expected_key = parse_relation_key(seed_key);
+            let is_legit = bundle
+                .relation_legit
+                .iter()
+                .find(|(key, _)| parse_relation_key(key) == expected_key)
+                .is_some_and(|(_, signals)| signals.is_legit_duplicate());
+            if !is_legit {
+                suspicious_token_ids.extend(token_ids.iter().cloned());
+            }
+        }
+        if self.token_ids_by_seed.is_empty() {
+            suspicious_token_ids.extend(self.token_ids.iter().cloned());
+        }
+        bundle.filtered_for_analysis(&suspicious_token_ids, &self.seed_keys)
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CandidateScopeSelectors {
+    all: ScopeEvidenceSelector,
+    intra: ScopeEvidenceSelector,
+    cross: ScopeEvidenceSelector,
+    matrix: BTreeMap<(String, String), ScopeEvidenceSelector>,
+}
+
+struct CandidateAnalysisBatch {
+    per_seed: Vec<(String, CandidateAnalysis)>,
+}
+
+fn build_scope_selectors(
+    registry: &CandidateRegistry,
+    store: &ResidentStore,
+    allowed_seeds: Option<&AHashSet<ContractId>>,
+) -> AHashMap<ContractId, CandidateScopeSelectors> {
+    let mut selectors = AHashMap::new();
+    for relation in registry.relations() {
+        if allowed_seeds.is_some_and(|allowed| !allowed.contains(&relation.seed_contract)) {
+            continue;
+        }
+        let seed = &store.contracts[relation.seed_contract as usize];
+        let candidate = &store.contracts[relation.candidate_contract as usize];
+        let primary = store.chain_name(seed.chain_id).to_ascii_lowercase();
+        let secondary = store.chain_name(candidate.chain_id).to_ascii_lowercase();
+        let seed_key = canonical_relation_key(&primary, &seed.address);
+        let token_ids: Vec<String> = relation
+            .nft_ids
+            .iter()
+            .filter_map(|id| store.nfts.get(*id as usize))
+            .map(|nft| nft.token_id.clone())
+            .collect();
+        let candidate_selectors = selectors
+            .entry(relation.candidate_contract)
+            .or_insert_with(CandidateScopeSelectors::default);
+        candidate_selectors
+            .all
+            .token_ids
+            .extend(token_ids.iter().cloned());
+        candidate_selectors.all.seed_keys.insert(seed_key.clone());
+        candidate_selectors
+            .all
+            .token_ids_by_seed
+            .entry(seed_key.clone())
+            .or_default()
+            .extend(token_ids.iter().cloned());
+        let same_chain = primary.eq_ignore_ascii_case(&secondary);
+        let scope_selector = if same_chain {
+            &mut candidate_selectors.intra
+        } else {
+            &mut candidate_selectors.cross
+        };
+        scope_selector.token_ids.extend(token_ids.iter().cloned());
+        scope_selector.seed_keys.insert(seed_key.clone());
+        scope_selector
+            .token_ids_by_seed
+            .entry(seed_key.clone())
+            .or_default()
+            .extend(token_ids.iter().cloned());
+        if !same_chain {
+            let matrix = candidate_selectors
+                .matrix
+                .entry((primary, secondary))
+                .or_insert_with(ScopeEvidenceSelector::default);
+            matrix.token_ids.extend(token_ids.iter().cloned());
+            matrix.seed_keys.insert(seed_key.clone());
+            matrix
+                .token_ids_by_seed
+                .entry(seed_key)
+                .or_default()
+                .extend(token_ids);
+        }
+    }
+    selectors
+}
+
+fn retain_formal_seed_selectors(
+    selectors: &AHashMap<ContractId, CandidateScopeSelectors>,
+    formal_seed_keys: &AHashSet<String>,
+) -> AHashMap<ContractId, CandidateScopeSelectors> {
+    fn filtered(
+        source: &ScopeEvidenceSelector,
+        formal_seed_keys: &AHashSet<String>,
+    ) -> ScopeEvidenceSelector {
+        let token_ids_by_seed: AHashMap<String, AHashSet<String>> = source
+            .token_ids_by_seed
+            .iter()
+            .filter(|(seed_key, _)| formal_seed_keys.contains(*seed_key))
+            .map(|(seed_key, token_ids)| (seed_key.clone(), token_ids.clone()))
+            .collect();
+        let token_ids = token_ids_by_seed
+            .values()
+            .flat_map(|ids| ids.iter().cloned())
+            .collect();
+        let seed_keys = token_ids_by_seed.keys().cloned().collect();
+        ScopeEvidenceSelector {
+            token_ids,
+            seed_keys,
+            token_ids_by_seed,
+        }
+    }
+
+    selectors
+        .iter()
+        .filter_map(|(&candidate_id, source)| {
+            let all = filtered(&source.all, formal_seed_keys);
+            if all.token_ids_by_seed.is_empty() {
+                return None;
+            }
+            let intra = filtered(&source.intra, formal_seed_keys);
+            let cross = filtered(&source.cross, formal_seed_keys);
+            let matrix = source
+                .matrix
+                .iter()
+                .filter_map(|(direction, selector)| {
+                    let selector = filtered(selector, formal_seed_keys);
+                    (!selector.token_ids_by_seed.is_empty())
+                        .then_some((direction.clone(), selector))
+                })
+                .collect();
+            Some((
+                candidate_id,
+                CandidateScopeSelectors {
+                    all,
+                    intra,
+                    cross,
+                    matrix,
+                },
+            ))
+        })
+        .collect()
+}
 
 /// Configuration for the full end-to-end `run` pipeline.
 pub struct RunConfig {
@@ -393,8 +560,7 @@ fn run_dedup_inner(
     );
     options.build_name_index = config.name_threshold.is_some();
     let seeds = load_seeds_json(&config.seeds)?;
-    let (mut store, pending) =
-        load_resident_store_uri_ready(&config.inputs, &options, progress)?;
+    let (mut store, pending) = load_resident_store_uri_ready(&config.inputs, &options, progress)?;
     // Built before dimension drops so CSR slices stay valid for reporting.
     let contract_nfts = build_contract_nft_map(&store);
 
@@ -511,6 +677,11 @@ fn normalized_relation_key(chain: &str, address: &str) -> (String, String) {
     (chain, address)
 }
 
+fn canonical_relation_key(chain: &str, address: &str) -> String {
+    let (chain, address) = normalized_relation_key(chain, address);
+    format!("{chain}:{address}")
+}
+
 fn parse_relation_key(key: &str) -> Option<(String, String)> {
     let (chain, address) = key.split_once(':')?;
     Some(normalized_relation_key(chain, address))
@@ -522,7 +693,7 @@ fn reconcile_cached_relation_legit(
     evidence: &mut AHashMap<ContractId, EvidenceBundle>,
     registry: &CandidateRegistry,
     store: &ResidentStore,
-) {
+) -> AHashSet<ContractId> {
     let mut expected: AHashMap<ContractId, Vec<(String, (String, String))>> = AHashMap::new();
     for relation in registry.relations() {
         let seed = &store.contracts[relation.seed_contract as usize];
@@ -531,12 +702,10 @@ fn reconcile_cached_relation_legit(
         expected
             .entry(relation.candidate_contract)
             .or_default()
-            .push((
-                display_key,
-                normalized_relation_key(chain, &seed.address),
-            ));
+            .push((display_key, normalized_relation_key(chain, &seed.address)));
     }
 
+    let mut refresh = AHashSet::new();
     for (&candidate_id, bundle) in evidence.iter_mut() {
         let Some(relations) = expected.get(&candidate_id) else {
             bundle.relation_legit.clear();
@@ -549,14 +718,55 @@ fn reconcile_cached_relation_legit(
                 .filter_map(|(key, signals)| parse_relation_key(&key).map(|key| (key, signals)))
                 .collect();
         for (display_key, normalized_key) in relations {
-            bundle.relation_legit.insert(
-                display_key.clone(),
-                cached.remove(normalized_key).unwrap_or_default(),
-            );
+            let signals = cached.remove(normalized_key);
+            if signals.is_none() {
+                refresh.insert(candidate_id);
+            }
+            bundle
+                .relation_legit
+                .insert(display_key.clone(), signals.unwrap_or_default());
         }
         bundle.legit = LegitSignals::default();
         finalize_legit_signals(bundle);
     }
+    refresh
+}
+
+fn cached_evidence_needs_retry(bundle: &EvidenceBundle) -> bool {
+    let mut statuses = vec![
+        bundle.quality.transfers,
+        bundle.quality.sales,
+        bundle.quality.holders,
+        bundle.quality.prices,
+        bundle.quality.gas,
+        bundle.quality.value_flows,
+    ];
+    if bundle.chain.eq_ignore_ascii_case("solana") {
+        statuses.extend([bundle.quality.assets, bundle.quality.histories]);
+    }
+    let failed = statuses.contains(&EvidenceStatus::Failed);
+    // A cap-limited Truncated result is stable for the same pagination
+    // parameters. Retry only when the recorded failure belongs to the same
+    // truncated evidence family, rather than pairing an unrelated warning
+    // (for example royalty lookup) with a stable page cap.
+    let transient_partial = bundle.quality.failures.iter().any(|failure| {
+        let failure = failure.to_ascii_lowercase();
+        (bundle.quality.transfers == EvidenceStatus::Truncated
+            && (failure.contains("alchemy_transfers") || failure.contains("etherscan_transfers")))
+            || (bundle.quality.sales == EvidenceStatus::Truncated
+                && (failure.contains("alchemy_sales") || failure.contains("opensea_sales")))
+            || (bundle.quality.holders == EvidenceStatus::Truncated
+                && failure.contains("alchemy_holders"))
+            || (bundle.quality.gas == EvidenceStatus::Truncated
+                && (failure.contains("receipt") || failure.contains("helius")))
+            || (bundle.quality.value_flows == EvidenceStatus::Truncated
+                && failure.contains("value_flow"))
+            || (bundle.chain.eq_ignore_ascii_case("solana")
+                && (bundle.quality.assets == EvidenceStatus::Truncated
+                    || bundle.quality.histories == EvidenceStatus::Truncated)
+                && failure.contains("helius"))
+    });
+    failed || transient_partial
 }
 
 fn load_seed_batch_from_cache(
@@ -632,11 +842,8 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
 
     // Resolve dedup reuse *before* Parquet load so we can skip index build when
     // a compatible cache is available (auto-resume; --reuse-dedup only hard-fails).
-    let dedup_cache = try_load_validated_dedup_cache(
-        &cache_path,
-        &cache_params,
-        config.reuse_dedup,
-    )?;
+    let dedup_cache =
+        try_load_validated_dedup_cache(&cache_path, &cache_params, config.reuse_dedup)?;
     if dedup_cache.is_some() {
         eprintln!(
             "dedup: will reuse {} (identity-only Parquet load)",
@@ -669,8 +876,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         options.build_name_index = config.name_threshold.is_some();
         options
     };
-    let (mut store, pending) =
-        load_resident_store_uri_ready(&config.inputs, &options, progress)?;
+    let (mut store, pending) = load_resident_store_uri_ready(&config.inputs, &options, progress)?;
     let contract_nfts = build_contract_nft_map(&store);
 
     let seed_batch = if let Some(cache) = dedup_cache {
@@ -697,12 +903,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         };
         // Persist immediately so a later run can auto-reuse / --reuse-dedup.
         progress.begin_phase("write_dedup_cache", Some(1));
-        let cache = build_dedup_cache(
-            &store,
-            cache_params,
-            &batch.completed,
-            &batch.failures,
-        );
+        let cache = build_dedup_cache(&store, cache_params, &batch.completed, &batch.failures);
         write_dedup_cache(&cache_path, &cache)?;
         progress.add_completed(1);
         eprintln!(
@@ -758,6 +959,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
     // Auto-resume from incremental jsonl/snapshot when present and params match.
     // `--reuse-evidence` makes a missing cache fatal; otherwise a bad cache is skipped.
     let mut evidence = AHashMap::new();
+    let mut forced_refresh = AHashSet::new();
     let cache_exists = evidence_cache_artifacts_present(&evidence_path);
     eprintln!(
         "evidence: cache path {} (artifacts_present={})",
@@ -772,12 +974,17 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                     if config.reuse_evidence {
                         return Err(e);
                     }
-                    eprintln!(
-                        "evidence: IGNORING incompatible cache (will re-fetch HTTP): {e}"
-                    );
+                    eprintln!("evidence: IGNORING incompatible cache (will re-fetch HTTP): {e}");
                 } else {
                     evidence = rematerialize_evidence(&store, &cache)?;
-                    reconcile_cached_relation_legit(&mut evidence, &registry, &store);
+                    forced_refresh =
+                        reconcile_cached_relation_legit(&mut evidence, &registry, &store);
+                    forced_refresh.extend(
+                        evidence
+                            .iter()
+                            .filter(|(_, bundle)| cached_evidence_needs_retry(bundle))
+                            .map(|(&candidate_id, _)| candidate_id),
+                    );
                     eprintln!(
                         "evidence: resumed {} in-memory bundles from {}",
                         evidence.len(),
@@ -808,7 +1015,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
             // Test / offline hooks replace evidence entirely (still written to cache).
             let map = hook(&registry, &store, progress)?;
             progress.begin_phase("write_evidence_cache", Some(1));
-            let evidence_file = build_evidence_cache(evidence_params, &map);
+            let evidence_file = build_evidence_cache(evidence_params.clone(), &map);
             write_evidence_cache(&evidence_path, &evidence_file)?;
             progress.add_completed(1);
             map
@@ -819,7 +1026,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 .candidate_contracts()
                 .iter()
                 .copied()
-                .filter(|cid| !evidence.contains_key(cid))
+                .filter(|cid| !evidence.contains_key(cid) || forced_refresh.contains(cid))
                 .collect();
             let cached_hits = total_cands.saturating_sub(missing.len());
             eprintln!(
@@ -832,7 +1039,6 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 );
                 // Do not rewrite evidence_cache.json here: multi‑GB rewrite can
                 // dominate re-run wall time when HTTP is already fully cached.
-                let _ = evidence_params;
                 evidence
             } else {
                 let subset = registry.filter_candidates(&missing);
@@ -856,10 +1062,9 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                     .build()
                     .map_err(|e| Analysis2Error::http(format!("tokio runtime: {e}")))?;
                 let fetch_result = {
-                    let mut on_bundle =
-                        |bundle: &EvidenceBundle| -> Result<(), Analysis2Error> {
-                            sink.push(bundle)
-                        };
+                    let mut on_bundle = |bundle: &EvidenceBundle| -> Result<(), Analysis2Error> {
+                        sink.push(bundle)
+                    };
                     runtime.block_on(enrich_candidates_with_hook(
                         &subset,
                         &store,
@@ -894,7 +1099,11 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         bundle.strip_for_analysis_memory();
     }
 
-    // P1: seed reports + registry are self-contained for NFT numerators; analyze
+    // Resolve direct-hit NFT ids to token strings before dropping resident identity.
+    // Every reporting scope reuses the same cached evidence, filtered by these sets.
+    let all_scope_selectors = build_scope_selectors(&registry, &store, None);
+
+    // P1: seed reports + selectors are self-contained for NFT numerators; analyze
     // only needs contract id → chain/address. Drop full NFT/string universe now.
     store.shrink_identity_for_analysis();
 
@@ -903,8 +1112,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
     let candidates = registry.candidate_contracts().to_vec();
     progress.begin_phase("analyze_candidates", Some(candidates.len() as u64));
 
-    analysis2_core::ensure_output_layout(&config.output_dir)
-        .map_err(Analysis2Error::from)?;
+    analysis2_core::ensure_output_layout(&config.output_dir).map_err(Analysis2Error::from)?;
     let paper = config.paper.clone();
     let out_dir = config.output_dir.clone();
 
@@ -933,7 +1141,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         .map_err(|e| Analysis2Error::invalid(format!("spawn candidate writer: {e}")))?;
 
     // Err arm carries candidate identity so failures.jsonl is never unknown/unknown.
-    let analyze_results: Vec<Result<CandidateAnalysis, (String, String, Analysis2Error)>> =
+    let analyze_results: Vec<Result<CandidateAnalysisBatch, (String, String, Analysis2Error)>> =
         owned_evidence
             .into_par_iter()
             .map(|(cid, bundle_owned)| {
@@ -951,15 +1159,16 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                         &empty
                     }
                 };
-                let mut analysis = match analyze_candidate(&store, cid, bundle, &paper) {
+                let selectors = all_scope_selectors.get(&cid).cloned().unwrap_or_default();
+                let all_bundle = selectors.all.filtered_bundle(bundle);
+                let mut analysis = match analyze_candidate(&store, cid, &all_bundle, &paper) {
                     Ok(a) => a,
                     Err(e) => return Err((chain, address, e)),
                 };
-                // Drop large transfer/sale/holder payloads before the next candidate
-                // is scheduled on this worker.
-                drop(bundle_owned);
+                drop(all_bundle);
 
-                // Serialize full analysis on CPU, hand bytes to IO thread.
+                // Persist the full all-chains detail before shrinking it; scoped
+                // analyses below only need summary fields.
                 let rel = candidate_json_rel_path(&analysis.chain, &analysis.address);
                 let body = serialize_candidate_json(&analysis)
                     .map_err(|e| (chain.clone(), address.clone(), e))?;
@@ -970,11 +1179,41 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                         Analysis2Error::invalid(format!("candidate write queue closed: {e}")),
                     )
                 })?;
-
-                // P0: keep only summary fields in the in-memory map.
                 analysis.shrink_for_summary_memory();
+                let mut per_seed = Vec::with_capacity(selectors.all.token_ids_by_seed.len());
+                if selectors.all.token_ids_by_seed.len() == 1 {
+                    let seed_key = selectors
+                        .all
+                        .token_ids_by_seed
+                        .keys()
+                        .next()
+                        .cloned()
+                        .expect("one per-seed selector");
+                    per_seed.push((seed_key, analysis.clone()));
+                } else {
+                    for (seed_key, token_ids) in &selectors.all.token_ids_by_seed {
+                        let per_seed_selector = ScopeEvidenceSelector {
+                            token_ids: token_ids.clone(),
+                            seed_keys: AHashSet::from([seed_key.clone()]),
+                            token_ids_by_seed: AHashMap::from([(
+                                seed_key.clone(),
+                                token_ids.clone(),
+                            )]),
+                        };
+                        let scoped = per_seed_selector.filtered_bundle(bundle);
+                        let mut scoped_analysis =
+                            analyze_candidate(&store, cid, &scoped, &paper)
+                                .map_err(|e| (chain.clone(), address.clone(), e))?;
+                        scoped_analysis.shrink_for_summary_memory();
+                        per_seed.push((seed_key.clone(), scoped_analysis));
+                    }
+                }
+                // Drop large transfer/sale/holder payloads before the next candidate
+                // is scheduled on this worker.
+                drop(bundle_owned);
+
                 progress.add_completed(1);
-                Ok(analysis)
+                Ok(CandidateAnalysisBatch { per_seed })
             })
             .collect();
 
@@ -984,11 +1223,16 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         .join()
         .map_err(|_| Analysis2Error::invalid("candidate writer thread panicked"))??;
 
-    let mut analyses_map: AHashMap<ContractId, CandidateAnalysis> = AHashMap::new();
+    let mut per_seed_analyses = AHashMap::<String, AHashMap<ContractId, CandidateAnalysis>>::new();
     for result in analyze_results {
         match result {
-            Ok(analysis) => {
-                analyses_map.insert(analysis.contract_id, analysis);
+            Ok(batch) => {
+                for (seed_key, analysis) in batch.per_seed {
+                    per_seed_analyses
+                        .entry(seed_key)
+                        .or_default()
+                        .insert(analysis.contract_id, analysis);
+                }
             }
             Err((_, _, Analysis2Error::Cancelled)) => return Err(Analysis2Error::Cancelled),
             Err((chain, address, e)) => {
@@ -1005,23 +1249,29 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
     // Attach analysis rollups to already-materialized seed dedup reports.
     progress.set_stage("report");
     progress.begin_phase("aggregate_seeds", Some(seed_dedups.len() as u64));
+    let empty_seed_analyses = AHashMap::new();
     let reports = seed_dedups
         .into_par_iter()
         .map(|(seed, seed_id, dedup)| {
             let scopes_complete = scopes_complete_for_seed(&store, &dedup);
+            let seed_key = canonical_relation_key(&seed.chain, &seed.address);
+            let seed_analyses = per_seed_analyses
+                .get(&seed_key)
+                .unwrap_or(&empty_seed_analyses);
             let (rollup, analysis_ok) = build_seed_analysis_rollup(
                 &registry,
                 seed_id,
                 &seed.chain,
                 &seed.address,
-                &analyses_map,
+                seed_analyses,
                 analysis2_core::DETAIL_CANDIDATES_REL,
             );
             let analysis_complete = analysis_ok
-                && registry
-                    .relations_for_seed(seed_id)
-                    .iter()
-                    .all(|rel| analyses_map.contains_key(&rel.candidate_contract));
+                && registry.relations_for_seed(seed_id).iter().all(|rel| {
+                    seed_analyses
+                        .get(&rel.candidate_contract)
+                        .is_some_and(CandidateAnalysis::is_formal_complete)
+                });
             progress.add_completed(1);
             (
                 seed,
@@ -1034,8 +1284,133 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
             )
         })
         .collect::<Vec<_>>();
-    // Registry only needed for relation lookups while building rollups.
+
+    // A seed becomes formal only after every one of its candidate analyses has
+    // passed the evidence-quality gates. Build summary selectors from that exact
+    // final set. This prevents an incomplete seed's token-specific sales from
+    // leaking into another formal seed that happens to share the candidate.
+    let formal_seed_keys: AHashSet<String> = reports
+        .iter()
+        .filter(|(_, report)| report.is_formal())
+        .map(|(seed, _)| canonical_relation_key(&seed.chain, &seed.address))
+        .collect();
+    let formal_scope_selectors =
+        retain_formal_seed_selectors(&all_scope_selectors, &formal_seed_keys);
+
+    // Candidate-wide funding/withdrawal evidence is deliberately present in
+    // every related seed analysis. Re-analyze the union of *formal* relations
+    // once per candidate for run summaries, which de-duplicates those amounts
+    // while retaining the exact formal token scope. Reloading the durable cache
+    // avoids retaining all raw HTTP evidence across the first analysis barrier.
+    progress.set_stage("analyze");
+    progress.begin_phase(
+        "analyze_formal_scopes",
+        Some(formal_scope_selectors.len() as u64),
+    );
+    let cache = load_evidence_cache_resumable(&evidence_path)?;
+    validate_evidence_cache(&cache, &evidence_params)?;
+    let mut summary_evidence = rematerialize_evidence(&store, &cache)?;
+    summary_evidence.retain(|candidate_id, _| formal_scope_selectors.contains_key(candidate_id));
+    for bundle in summary_evidence.values_mut() {
+        bundle.strip_for_analysis_memory();
+    }
+    type FormalScopeBatch = (
+        CandidateAnalysis,
+        Option<CandidateAnalysis>,
+        Option<CandidateAnalysis>,
+        Vec<((String, String), CandidateAnalysis)>,
+    );
+    let formal_work: Vec<_> = formal_scope_selectors
+        .into_iter()
+        .map(|(candidate_id, selectors)| {
+            let bundle = summary_evidence.remove(&candidate_id);
+            (candidate_id, selectors, bundle)
+        })
+        .collect();
+    drop(summary_evidence);
+    let formal_results: Vec<Result<FormalScopeBatch, (String, String, Analysis2Error)>> =
+        formal_work
+            .into_par_iter()
+            .map(|(candidate_id, selectors, bundle)| {
+                let contract = &store.contracts[candidate_id as usize];
+                let chain = store.chain_name(contract.chain_id).to_owned();
+                let address = contract.address.clone();
+                let bundle = bundle.ok_or_else(|| {
+                    (
+                        chain.clone(),
+                        address.clone(),
+                        Analysis2Error::invalid("formal summary evidence missing from cache"),
+                    )
+                })?;
+                let analyze_scope = |selector: &ScopeEvidenceSelector| {
+                    let scoped = selector.filtered_bundle(&bundle);
+                    let mut analysis = analyze_candidate(&store, candidate_id, &scoped, &paper)?;
+                    analysis.shrink_for_summary_memory();
+                    Ok::<_, Analysis2Error>(analysis)
+                };
+                let all = analyze_scope(&selectors.all)
+                    .map_err(|error| (chain.clone(), address.clone(), error))?;
+                if !all.is_formal_complete() {
+                    return Err((
+                        chain,
+                        address,
+                        Analysis2Error::invalid(
+                            "formal seed union failed candidate completeness invariant",
+                        ),
+                    ));
+                }
+                let intra = (!selectors.intra.token_ids_by_seed.is_empty())
+                    .then(|| analyze_scope(&selectors.intra))
+                    .transpose()
+                    .map_err(|error| (chain.clone(), address.clone(), error))?;
+                let cross = (!selectors.cross.token_ids_by_seed.is_empty())
+                    .then(|| analyze_scope(&selectors.cross))
+                    .transpose()
+                    .map_err(|error| (chain.clone(), address.clone(), error))?;
+                let mut matrix = Vec::with_capacity(selectors.matrix.len());
+                for (direction, selector) in &selectors.matrix {
+                    matrix.push((
+                        direction.clone(),
+                        analyze_scope(selector)
+                            .map_err(|error| (chain.clone(), address.clone(), error))?,
+                    ));
+                }
+                progress.add_completed(1);
+                Ok((all, intra, cross, matrix))
+            })
+            .collect();
+
+    let mut analyses_map: AHashMap<ContractId, CandidateAnalysis> = AHashMap::new();
+    let mut scope_analyses = ScopeAnalysisSets::default();
+    for result in formal_results {
+        match result {
+            Ok((all, intra, cross, matrix)) => {
+                if let Some(analysis) = intra {
+                    scope_analyses.intra_chain.push(analysis);
+                }
+                if let Some(analysis) = cross {
+                    scope_analyses.cross_chain.push(analysis);
+                }
+                for (direction, analysis) in matrix {
+                    scope_analyses
+                        .chain_matrix
+                        .entry(direction)
+                        .or_default()
+                        .push(analysis);
+                }
+                analyses_map.insert(all.contract_id, all);
+            }
+            Err((chain, address, error)) => {
+                return Err(Analysis2Error::invalid(format!(
+                    "formal summary analysis failed for {chain}:{address}: {error}"
+                )));
+            }
+        }
+    }
+    // Registry and per-seed analyses are no longer needed after exact formal
+    // summaries have been materialized.
     drop(registry);
+    drop(per_seed_analyses);
 
     let analyzed: Vec<Result<(SeedRecord, SeedFullReport), FailureRecord>> =
         reports.into_iter().map(Ok).collect();
@@ -1064,6 +1439,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         &seeds,
         &analyzed,
         &analyses_list,
+        &scope_analyses,
         &failures,
     )?;
     progress.add_completed(1);
@@ -1076,8 +1452,8 @@ mod tests {
     use analysis2_core::parquet::write_report_golden_fixture;
     use analysis2_core::{DEFAULT_METADATA_THRESHOLD, DEFAULT_NAME_THRESHOLD, SaleEvent};
     use serde_json::Value;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     #[derive(Default)]
     struct PhaseRecordingProgress {
@@ -1101,6 +1477,23 @@ mod tests {
     }
 
     #[test]
+    fn cached_truncation_retries_only_when_a_provider_failure_was_recorded() {
+        let mut cap_limited = EvidenceBundle::empty(1, "ethereum", "0xcandidate");
+        cap_limited.quality.sales = EvidenceStatus::Truncated;
+        assert!(!cached_evidence_needs_retry(&cap_limited));
+
+        cap_limited
+            .quality
+            .failures
+            .push("alchemy_sales: partial page failure".into());
+        assert!(cached_evidence_needs_retry(&cap_limited));
+
+        let mut failed = EvidenceBundle::empty(1, "ethereum", "0xcandidate");
+        failed.quality.sales = EvidenceStatus::Failed;
+        assert!(cached_evidence_needs_retry(&failed));
+    }
+
+    #[test]
     fn explicit_rayon_threads_use_a_run_local_pool() {
         let _ = rayon::current_num_threads();
         let workers = with_rayon_pool(Some(3), || {
@@ -1112,11 +1505,102 @@ mod tests {
     }
 
     #[test]
+    fn scope_filter_keeps_legit_labels_and_contract_wide_nft_events() {
+        let legit_seed = "ethereum:0xlegit".to_owned();
+        let suspicious_seed = "ethereum:0xsuspicious".to_owned();
+        let mut selector = ScopeEvidenceSelector::default();
+        selector
+            .token_ids
+            .extend(["legit-nft".to_owned(), "suspect-nft".to_owned()]);
+        selector
+            .seed_keys
+            .extend([legit_seed.clone(), suspicious_seed.clone()]);
+        selector
+            .token_ids_by_seed
+            .insert(legit_seed.clone(), AHashSet::from(["legit-nft".to_owned()]));
+        selector.token_ids_by_seed.insert(
+            suspicious_seed.clone(),
+            AHashSet::from(["suspect-nft".to_owned()]),
+        );
+
+        let mut bundle = EvidenceBundle::empty(0, "base", "0xcandidate");
+        bundle.relation_legit.insert(
+            legit_seed.clone(),
+            LegitSignals {
+                verified_migration: true,
+                verification_complete: true,
+                ..LegitSignals::default()
+            },
+        );
+        bundle
+            .relation_legit
+            .insert(suspicious_seed.clone(), LegitSignals::default());
+        for token_id in ["legit-nft", "suspect-nft"] {
+            bundle.sales.push(SaleEvent {
+                tx_hash: format!("tx-{token_id}"),
+                token_id: token_id.into(),
+                seller: "seller".into(),
+                buyer: "buyer".into(),
+                timestamp: None,
+                block_number: None,
+                marketplace: None,
+                native_amount: Some(1.0),
+                usd_amount: Some(2_000.0),
+                currency_symbol: Some("ETH".into()),
+                currency_address: None,
+                seller_proceeds_native: Some(1.0),
+                seller_proceeds_usd: Some(2_000.0),
+                ..SaleEvent::default()
+            });
+        }
+
+        let filtered = selector.filtered_bundle(&bundle);
+        assert_eq!(filtered.sales.len(), 2);
+        assert!(
+            filtered
+                .sales
+                .iter()
+                .any(|sale| sale.token_id == "legit-nft")
+        );
+        assert!(
+            filtered
+                .sales
+                .iter()
+                .any(|sale| sale.token_id == "suspect-nft")
+        );
+        assert_eq!(filtered.relation_legit.len(), 2);
+        assert!(filtered.relation_legit[&legit_seed].is_legit_duplicate());
+        assert!(!filtered.relation_legit[&suspicious_seed].is_legit_duplicate());
+    }
+
+    #[test]
+    fn formal_selector_filter_removes_incomplete_seed_tokens() {
+        let mut source = CandidateScopeSelectors::default();
+        source.all.token_ids_by_seed.insert(
+            "ethereum:0xformal".into(),
+            AHashSet::from(["formal-token".into()]),
+        );
+        source.all.token_ids_by_seed.insert(
+            "ethereum:0xincomplete".into(),
+            AHashSet::from(["incomplete-token".into()]),
+        );
+        source.all.token_ids = AHashSet::from(["formal-token".into(), "incomplete-token".into()]);
+        source.all.seed_keys =
+            AHashSet::from(["ethereum:0xformal".into(), "ethereum:0xincomplete".into()]);
+        let filtered = retain_formal_seed_selectors(
+            &AHashMap::from([(7, source)]),
+            &AHashSet::from(["ethereum:0xformal".into()]),
+        );
+        let all = &filtered[&7].all;
+        assert_eq!(all.token_ids, AHashSet::from(["formal-token".into()]));
+        assert_eq!(all.seed_keys, AHashSet::from(["ethereum:0xformal".into()]));
+        assert!(!all.token_ids_by_seed.contains_key("ethereum:0xincomplete"));
+    }
+
+    #[test]
     fn omitted_name_threshold_skips_name_dedup_stage() {
-        let dir = std::env::temp_dir().join(format!(
-            "analysis2_no_name_dedup_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("analysis2_no_name_dedup_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let parquet = dir.join("fixture.parquet");
@@ -1285,8 +1769,23 @@ mod tests {
                     native_amount: Some(1.0),
                     usd_amount: Some(42.0),
                     currency_symbol: Some("ETH".into()),
+                    currency_address: None,
+                    seller_proceeds_native: Some(1.0),
+                    seller_proceeds_usd: Some(42.0),
+                    ..SaleEvent::default()
                 });
                 bundle.controllers.push("0xop".into());
+                bundle.quality = analysis2_core::EvidenceQuality {
+                    transfers: EvidenceStatus::Empty,
+                    sales: EvidenceStatus::Complete,
+                    holders: EvidenceStatus::Empty,
+                    prices: EvidenceStatus::Complete,
+                    assets: EvidenceStatus::Empty,
+                    histories: EvidenceStatus::Empty,
+                    gas: EvidenceStatus::Empty,
+                    value_flows: EvidenceStatus::Empty,
+                    failures: Vec::new(),
+                };
                 map.insert(cid, bundle);
                 progress.add_completed(1);
             }
@@ -1326,9 +1825,10 @@ mod tests {
         assert!(out.join("summary/chain_matrix.json").is_file());
         assert!(out.join("summary/cross_chain.json").is_file());
         assert!(out.join("intermediate/failures.jsonl").is_file());
-        assert!(out
-            .join("detail/seeds/ethereum__0xseed/report.json")
-            .is_file());
+        assert!(
+            out.join("detail/seeds/ethereum__0xseed/report.json")
+                .is_file()
+        );
 
         let summary: Value = serde_json::from_str(
             &std::fs::read_to_string(out.join("summary/all_chains.json")).unwrap(),
@@ -1353,14 +1853,31 @@ mod tests {
             "behaviors",
             "economics",
             "data_quality",
-            "all_chains",
+            "scope_summary",
         ] {
             assert!(summary.get(key).is_some(), "missing summary key {key}");
         }
         assert_eq!(summary["scope"], "all_chains");
         assert!(summary["economics"].get("operator_output_usd").is_some());
-        assert!(summary["economics"].get("honest_loss_usd").is_some());
+        assert!(
+            summary["economics"]
+                .get("honest_paid_exposure_usd")
+                .is_some()
+        );
         assert!(summary["economics"].get("operator_output_native").is_none());
+        assert!(!serde_json::to_string(&summary).unwrap().contains("_native"));
+
+        let matrix: Value = serde_json::from_str(
+            &std::fs::read_to_string(out.join("summary/chain_matrix.json")).unwrap(),
+        )
+        .unwrap();
+        let blocks = matrix["matrix_blocks"].as_array().unwrap();
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks.iter().all(|block| {
+            block["primary_chain"] == "ethereum"
+                && block.get("secondary_chain").is_some()
+                && block["summary"].is_object()
+        }));
 
         let manifest: Value = serde_json::from_str(
             &std::fs::read_to_string(out.join("intermediate/run_manifest.json")).unwrap(),
@@ -1383,6 +1900,16 @@ mod tests {
         assert!(cand_dir.is_dir());
         let cand_count = std::fs::read_dir(&cand_dir).unwrap().count();
         assert!(cand_count >= 1, "expected streamed candidate JSON");
+        let first_candidate = std::fs::read_to_string(
+            std::fs::read_dir(&cand_dir)
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+        )
+        .unwrap();
+        assert!(!first_candidate.contains("_native"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1448,10 +1975,8 @@ mod tests {
 
     #[test]
     fn run_writes_dedup_cache_and_reuse_skips_query() {
-        let dir = std::env::temp_dir().join(format!(
-            "analysis2_run_dedup_cache_{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("analysis2_run_dedup_cache_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let parquet = dir.join("fixture.parquet");

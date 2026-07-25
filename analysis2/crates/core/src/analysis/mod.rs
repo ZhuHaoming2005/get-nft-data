@@ -8,8 +8,11 @@ mod legit;
 mod lifecycle;
 
 pub use attribution::{AddressAttribution, AddressEvidence, AddressEvidenceKind, AddressRole};
-pub use behavior::{BehaviorFacts, BehaviorInstance, BehaviorKind};
-pub use economics::{EconomicFacts, EconomicsQuality};
+pub use behavior::{BehaviorFacts, BehaviorInstance, BehaviorKind, LinkedLossEvent};
+pub use economics::{
+    EconomicContribution, EconomicContributionKind, EconomicFacts, EconomicsQuality,
+    GasContribution, GasStage, ValueFlowContribution,
+};
 pub use graph::AddressGraph;
 pub use legit::LegitClassification;
 pub use lifecycle::{LifecycleFacts, ValueFlowFacts};
@@ -18,7 +21,7 @@ use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 
 use crate::Analysis2Error;
-use crate::enrich::EvidenceBundle;
+use crate::enrich::{EvidenceBundle, EvidenceQuality, EvidenceStatus};
 use crate::entity::{ContractId, ResidentStore};
 
 const PARALLEL_CANDIDATE_EVENT_THRESHOLD: usize = 2_048;
@@ -67,14 +70,56 @@ pub struct CandidateAnalysis {
     pub behavior_instances: Vec<BehaviorInstance>,
     pub economics: EconomicFacts,
     pub economics_quality: EconomicsQuality,
+    /// Provider completeness copied before the evidence bundle is released.
+    #[serde(default)]
+    pub evidence_quality: EvidenceQuality,
     pub analysis_timestamp: i64,
 }
 
 impl CandidateAnalysis {
+    /// Whether this analysis is complete enough for formal USD/behavior
+    /// numerators. Partial provider data remains available in candidate detail
+    /// but must not silently contribute zeroes to formal summaries.
+    pub fn is_formal_complete(&self) -> bool {
+        if !self.legit_by_seed.is_empty()
+            && self
+                .legit_by_seed
+                .values()
+                .all(|relation| relation.is_legit_duplicate)
+        {
+            return self
+                .legit_by_seed
+                .values()
+                .all(|relation| relation.verification_complete);
+        }
+        let complete = |status| matches!(status, EvidenceStatus::Complete | EvidenceStatus::Empty);
+        let base_complete = complete(self.evidence_quality.transfers)
+            && complete(self.evidence_quality.sales)
+            && complete(self.evidence_quality.holders)
+            && complete(self.evidence_quality.prices)
+            && complete(self.evidence_quality.gas)
+            && complete(self.evidence_quality.value_flows);
+        let chain_complete = !self.chain.eq_ignore_ascii_case("solana")
+            || (complete(self.evidence_quality.assets)
+                && complete(self.evidence_quality.histories));
+        base_complete
+            && chain_complete
+            && self.economics.unpriced_sale_count == 0
+            && self.economics.amountless_sale_count == 0
+            && self.economics.assumed_stablecoin_peg_sale_count == 0
+            && self.economics.unpriced_operator_sale_proceeds_count == 0
+            && self.economics.unknown_operator_sale_proceeds_count == 0
+            && self.economics.unknown_royalty_recipient_count == 0
+            && self.economics.unpriced_operator_paid_mint_payment_count == 0
+            && self.economics.unknown_paid_mint_receiver_count == 0
+            && self.economics.unpriced_honest_paid_mint_loss_count == 0
+            && self.economics.unpriced_value_flow_count == 0
+    }
+
     /// Drop detail retained only for per-candidate JSON on disk.
     ///
     /// Keeps fields needed by seed rollups and batch `summary` (roles, behavior
-    /// instance identities / linked loss, economics). Safe to call **after**
+    /// instance identities / linked paid exposure, economics). Safe to call **after**
     /// `write_candidate_json`.
     pub fn shrink_for_summary_memory(&mut self) {
         for (_addr, attr) in &mut self.attribution {
@@ -85,7 +130,7 @@ impl CandidateAnalysis {
         self.lifecycle = LifecycleFacts::default();
         self.value_flow = ValueFlowFacts::default();
         for inst in &mut self.behavior_instances {
-            // Summary needs kind, addresses, nfts, linked_buyers, linked_loss_usd.
+            // Summary needs kind, addresses, nfts, linked buyers, and linked paid exposure.
             inst.transactions.clear();
             inst.transactions.shrink_to_fit();
             inst.gini_nft_count = None;
@@ -153,6 +198,7 @@ pub fn analyze_candidate(
             behavior_instances: Vec::new(),
             economics: EconomicFacts::default(),
             economics_quality: EconomicsQuality::default(),
+            evidence_quality: evidence.quality.clone(),
             analysis_timestamp: cfg.analysis_timestamp,
         });
     }
@@ -165,24 +211,19 @@ pub fn analyze_candidate(
         .saturating_add(evidence.value_flows.len());
     let parallel =
         event_work >= PARALLEL_CANDIDATE_EVENT_THRESHOLD && rayon::current_num_threads() > 1;
-    let (transfer_sccs, attribution, lifecycle) = if parallel {
-        let (transfer_sccs, (attribution, lifecycle)) = rayon::join(
+    let (transfer_sccs, attribution) = if parallel {
+        rayon::join(
             || transfer_graph.strongly_connected_components(),
-            || {
-                rayon::join(
-                    || attribution::attribute_addresses(evidence, &transfer_graph),
-                    || lifecycle::build_lifecycle(evidence, cfg.analysis_timestamp),
-                )
-            },
-        );
-        (transfer_sccs, attribution, lifecycle)
+            || attribution::attribute_addresses(evidence, &transfer_graph),
+        )
     } else {
         (
             transfer_graph.strongly_connected_components(),
             attribution::attribute_addresses(evidence, &transfer_graph),
-            lifecycle::build_lifecycle(evidence, cfg.analysis_timestamp),
         )
     };
+    let lifecycle =
+        lifecycle::build_lifecycle(evidence, &attribution.roles, cfg.analysis_timestamp);
     let (value_flow, detected, economics, economics_quality) = if parallel {
         let (value_flow, (detected, (economics, economics_quality))) = rayon::join(
             || lifecycle::build_value_flow(evidence, &attribution.roles),
@@ -227,10 +268,8 @@ pub fn analyze_candidate(
         (value_flow, detected, economics, economics_quality)
     };
 
-    let mut attribution_rows: Vec<(String, AddressAttribution)> = attribution
-        .records
-        .into_iter()
-        .collect();
+    let mut attribution_rows: Vec<(String, AddressAttribution)> =
+        attribution.records.into_iter().collect();
     if attribution_rows.len() >= PARALLEL_CANDIDATE_EVENT_THRESHOLD {
         attribution_rows.par_sort_by(|left, right| left.0.cmp(&right.0));
     } else {
@@ -250,6 +289,7 @@ pub fn analyze_candidate(
         behavior_instances: detected.instances,
         economics,
         economics_quality,
+        evidence_quality: evidence.quality.clone(),
         analysis_timestamp: cfg.analysis_timestamp,
     })
 }
@@ -295,6 +335,10 @@ mod tests {
             native_amount: Some(usd),
             usd_amount: Some(usd),
             currency_symbol: Some("ETH".into()),
+            currency_address: None,
+            seller_proceeds_native: Some(usd),
+            seller_proceeds_usd: Some(usd),
+            ..SaleEvent::default()
         }
     }
 
@@ -318,6 +362,7 @@ mod tests {
             fee_payer: None,
             mint_payment_native: None,
             mint_payment_usd: None,
+            mint_payment_receiver: None,
         }
     }
 
@@ -360,7 +405,7 @@ mod tests {
                 .iter()
                 .find(|(addr, _)| addr == "0xb")
                 .map(|(_, row)| row.role),
-            Some(AddressRole::SuspectedColluder)
+            Some(AddressRole::SuspectedOperator)
         ));
     }
 
@@ -453,8 +498,27 @@ mod tests {
             sale("s1", "3", "0xop", "0xd", 11, 2.0),
             sale("s2", "4", "0xop", "0xe", 12, 2.0),
         ];
+        evidence.holders = vec![
+            HolderRecord {
+                token_id: "2".into(),
+                owner: "0xc".into(),
+                balance: Some(1),
+            },
+            HolderRecord {
+                token_id: "3".into(),
+                owner: "0xd".into(),
+                balance: Some(1),
+            },
+            HolderRecord {
+                token_id: "4".into(),
+                owner: "0xe".into(),
+                balance: Some(1),
+            },
+        ];
         evidence.quality.transfers = EvidenceStatus::Complete;
         evidence.quality.sales = EvidenceStatus::Complete;
+        evidence.quality.transfers = EvidenceStatus::Empty;
+        evidence.quality.holders = EvidenceStatus::Complete;
 
         let analysis = analyze_candidate(
             &store,
@@ -474,7 +538,7 @@ mod tests {
                 + analysis.behaviors.poisoning
                 >= 1
         );
-        // Star sales to paid victims must carry linked_loss_usd (paper 关联损失).
+        // Star sales to role-attributed paid victims carry linked paid exposure.
         let star_loss: f64 = analysis
             .behavior_instances
             .iter()
@@ -492,16 +556,18 @@ mod tests {
             star_loss > 0.0,
             "expected star linked_loss_usd from sales to victims, got {star_loss}"
         );
-        assert!(analysis
-            .behavior_instances
-            .iter()
-            .any(|i| !i.linked_buyers.is_empty()
-                && matches!(
-                    i.kind,
-                    BehaviorKind::FraudRevenue
-                        | BehaviorKind::SybilDistribution
-                        | BehaviorKind::Poisoning
-                )));
+        assert!(
+            analysis
+                .behavior_instances
+                .iter()
+                .any(|i| !i.linked_buyers.is_empty()
+                    && matches!(
+                        i.kind,
+                        BehaviorKind::FraudRevenue
+                            | BehaviorKind::SybilDistribution
+                            | BehaviorKind::Poisoning
+                    ))
+        );
     }
 
     #[test]
@@ -516,6 +582,7 @@ mod tests {
             balance: Some(1),
         }];
         evidence.quality.sales = EvidenceStatus::Complete;
+        evidence.quality.transfers = EvidenceStatus::Empty;
         evidence.quality.holders = EvidenceStatus::Complete;
 
         let analysis = analyze_candidate(
@@ -548,7 +615,197 @@ mod tests {
     }
 
     #[test]
-    fn output_input_ratio_uses_same_unit_native_when_gas_complete() {
+    fn paid_buyer_without_outbound_transfer_is_a_victim_even_when_not_a_current_holder() {
+        let (store, contract) = store_with_contract("ethereum", "0xattr_same");
+        let mut evidence = EvidenceBundle::empty(contract, "ethereum", "0xattr_same");
+        evidence.sales = vec![sale("tx", "9", "0xop", "0xv", 5, 3.0)];
+        evidence.holders = vec![
+            HolderRecord {
+                token_id: "9".into(),
+                owner: "0xv".into(),
+                balance: Some(0),
+            },
+            HolderRecord {
+                token_id: "10".into(),
+                owner: "0xv".into(),
+                balance: Some(1),
+            },
+        ];
+        evidence.quality.sales = EvidenceStatus::Complete;
+        evidence.quality.transfers = EvidenceStatus::Empty;
+        evidence.quality.holders = EvidenceStatus::Complete;
+
+        let analysis =
+            analyze_candidate(&store, contract, &evidence, &PaperConfig::default()).unwrap();
+        let buyer = analysis
+            .attribution
+            .iter()
+            .find(|(addr, _)| addr == "0xv")
+            .unwrap();
+        assert_eq!(buyer.1.role, AddressRole::LikelyVictim);
+        assert_eq!(analysis.economics.honest_loss_usd, 3.0);
+    }
+
+    #[test]
+    fn repeated_seller_and_withdrawal_recipient_are_operator_evidence() {
+        let (store, contract) = store_with_contract("ethereum", "0xattr_behavior");
+        let mut evidence = EvidenceBundle::empty(contract, "ethereum", "0xattr_behavior");
+        evidence.sales = (1..=3)
+            .map(|index| {
+                sale(
+                    &format!("sale-{index}"),
+                    &index.to_string(),
+                    "0xseller",
+                    &format!("0xbuyer{index}"),
+                    index,
+                    1.0,
+                )
+            })
+            .collect();
+        evidence.value_flows.push(ValueFlowEdge {
+            tx_hash: "withdrawal".into(),
+            event_id: None,
+            from: "0xattr_behavior".into(),
+            to: "0xrecipient".into(),
+            kind: ValueFlowKind::Withdrawal,
+            native_amount: Some(1.0),
+            usd_amount: Some(2_000.0),
+            timestamp: Some(4),
+            gas_native: None,
+            fee_payer: None,
+        });
+
+        let analysis =
+            analyze_candidate(&store, contract, &evidence, &PaperConfig::default()).unwrap();
+        for (address, evidence_kind) in [
+            ("0xseller", AddressEvidenceKind::HighVolumeSeller),
+            ("0xrecipient", AddressEvidenceKind::WithdrawalRecipient),
+        ] {
+            let attribution = analysis
+                .attribution
+                .iter()
+                .find(|(candidate, _)| candidate == address)
+                .map(|(_, attribution)| attribution)
+                .unwrap();
+            assert_eq!(attribution.role, AddressRole::SuspectedOperator);
+            assert!(
+                attribution
+                    .evidence
+                    .iter()
+                    .any(|evidence| evidence.evidence_type == evidence_kind)
+            );
+        }
+    }
+
+    #[test]
+    fn paid_mint_current_holder_is_a_victim() {
+        let (store, contract) = store_with_contract("ethereum", "0xattr_mint");
+        let mut evidence = EvidenceBundle::empty(contract, "ethereum", "0xattr_mint");
+        let mut paid_mint = transfer(
+            "mint-paid",
+            "9",
+            "0x0000000000000000000000000000000000000000",
+            "0xv",
+            5,
+            true,
+        );
+        paid_mint.mint_payment_native = Some(0.1);
+        paid_mint.mint_payment_usd = Some(300.0);
+        paid_mint.mint_payment_receiver = Some("0xoperator".into());
+        evidence.transfers = vec![paid_mint];
+        evidence.holders = vec![HolderRecord {
+            token_id: "9".into(),
+            owner: "0xv".into(),
+            balance: Some(1),
+        }];
+        evidence.quality.transfers = EvidenceStatus::Complete;
+        evidence.quality.holders = EvidenceStatus::Complete;
+
+        let analysis =
+            analyze_candidate(&store, contract, &evidence, &PaperConfig::default()).unwrap();
+        let buyer = analysis
+            .attribution
+            .iter()
+            .find(|(addr, _)| addr == "0xv")
+            .unwrap();
+        assert_eq!(buyer.1.role, AddressRole::LikelyVictim);
+        assert_eq!(analysis.economics.paid_mint_loss_usd, 300.0);
+        assert_eq!(analysis.economics.honest_loss_usd, 300.0);
+    }
+
+    #[test]
+    fn paid_buyer_with_any_later_sale_is_an_operator_not_a_victim() {
+        let (store, contract) = store_with_contract("ethereum", "0xattr_resale");
+        let mut evidence = EvidenceBundle::empty(contract, "ethereum", "0xattr_resale");
+        evidence.sales = vec![
+            sale("buy", "1", "0xfirst_seller", "0xbuyer", 10, 100.0),
+            sale("sell", "1", "0xbuyer", "0xnext_buyer", 20, 120.0),
+        ];
+        evidence.transfers = vec![
+            transfer("buy", "1", "0xfirst_seller", "0xbuyer", 10, false),
+            transfer("sell", "1", "0xbuyer", "0xnext_buyer", 20, false),
+        ];
+        evidence.quality.sales = EvidenceStatus::Complete;
+        evidence.quality.transfers = EvidenceStatus::Complete;
+
+        let analysis =
+            analyze_candidate(&store, contract, &evidence, &PaperConfig::default()).unwrap();
+        let buyer = analysis
+            .attribution
+            .iter()
+            .find(|(address, _)| address == "0xbuyer")
+            .unwrap();
+        assert_eq!(buyer.1.role, AddressRole::SuspectedOperator);
+        assert_eq!(analysis.economics.honest_loss_usd, 120.0);
+        assert_eq!(analysis.economics.secondary_sale_loss_usd, 120.0);
+    }
+
+    #[test]
+    fn paid_buyer_with_free_outbound_transfer_is_an_operator_not_a_victim() {
+        let (store, contract) = store_with_contract("ethereum", "0xattr_transfer");
+        let mut evidence = EvidenceBundle::empty(contract, "ethereum", "0xattr_transfer");
+        evidence.sales = vec![sale("buy", "1", "0xfirst_seller", "0xbuyer", 10, 100.0)];
+        evidence.transfers = vec![transfer(
+            "free-transfer",
+            "2",
+            "0xbuyer",
+            "0xrecipient",
+            20,
+            false,
+        )];
+        evidence.quality.sales = EvidenceStatus::Complete;
+        evidence.quality.transfers = EvidenceStatus::Complete;
+
+        let analysis =
+            analyze_candidate(&store, contract, &evidence, &PaperConfig::default()).unwrap();
+        let buyer = analysis
+            .attribution
+            .iter()
+            .find(|(address, _)| address == "0xbuyer")
+            .unwrap();
+        assert_eq!(buyer.1.role, AddressRole::SuspectedOperator);
+    }
+
+    #[test]
+    fn paid_buyer_with_incomplete_transfer_history_is_an_operator() {
+        let (store, contract) = store_with_contract("ethereum", "0xattr_incomplete");
+        let mut evidence = EvidenceBundle::empty(contract, "ethereum", "0xattr_incomplete");
+        evidence.sales = vec![sale("buy", "1", "0xfirst_seller", "0xbuyer", 10, 100.0)];
+        evidence.quality.sales = EvidenceStatus::Complete;
+        evidence.quality.transfers = EvidenceStatus::Truncated;
+
+        let analysis =
+            analyze_candidate(&store, contract, &evidence, &PaperConfig::default()).unwrap();
+        let buyer = analysis
+            .attribution
+            .iter()
+            .find(|(address, _)| address == "0xbuyer")
+            .unwrap();
+        assert_eq!(buyer.1.role, AddressRole::SuspectedOperator);
+    }
+
+    #[test]
+    fn output_input_ratio_uses_runtime_usd_for_both_units() {
         let (store, contract) = store_with_contract("ethereum", "0xratio");
         let mut evidence = EvidenceBundle::empty(contract, "ethereum", "0xratio");
         evidence.controllers = vec!["0xop".into()];
@@ -564,6 +821,7 @@ mod tests {
             fee_payer: None,
             mint_payment_native: None,
             mint_payment_usd: None,
+            mint_payment_receiver: None,
         }];
         evidence.sales = vec![SaleEvent {
             tx_hash: "sale".into(),
@@ -576,10 +834,21 @@ mod tests {
             native_amount: Some(2.0),
             usd_amount: Some(400.0),
             currency_symbol: Some("ETH".into()),
+            currency_address: None,
+            seller_proceeds_native: Some(2.0),
+            seller_proceeds_usd: Some(400.0),
+            ..SaleEvent::default()
         }];
         evidence.quality.transfers = EvidenceStatus::Complete;
         evidence.quality.sales = EvidenceStatus::Complete;
         evidence.quality.gas = EvidenceStatus::Complete;
+        evidence.prices = vec![crate::enrich::PriceBucket {
+            chain: "ethereum".into(),
+            day_utc: 0,
+            symbol: "ETH".into(),
+            token_address: None,
+            usd_per_native: 2_000.0,
+        }];
 
         let analysis = analyze_candidate(
             &store,
@@ -595,8 +864,9 @@ mod tests {
         assert_eq!(analysis.economics.total_gas_native, 0.1);
         assert_eq!(analysis.economics.operator_output_native, 2.0);
         assert_eq!(analysis.economics.operator_output_usd, 400.0);
-        // Same-unit native/native — not mixed 400 / 0.1.
-        assert_eq!(analysis.economics.output_input_ratio, Some(20.0));
+        assert_eq!(analysis.economics.total_gas_usd, 200.0);
+        // USD/USD only: 400 / 200.
+        assert_eq!(analysis.economics.output_input_ratio, Some(2.0));
     }
 
     #[test]
@@ -615,6 +885,10 @@ mod tests {
             native_amount: Some(1.5),
             usd_amount: None,
             currency_symbol: Some("ETH".into()),
+            currency_address: None,
+            seller_proceeds_native: Some(1.5),
+            seller_proceeds_usd: None,
+            ..SaleEvent::default()
         }];
         evidence.holders = vec![HolderRecord {
             token_id: "7".into(),
@@ -622,6 +896,7 @@ mod tests {
             balance: Some(1),
         }];
         evidence.quality.sales = EvidenceStatus::Complete;
+        evidence.quality.transfers = EvidenceStatus::Empty;
         evidence.quality.holders = EvidenceStatus::Complete;
 
         let analysis = analyze_candidate(
@@ -662,6 +937,7 @@ mod tests {
                 fee_payer: Some("0xop".into()),
                 mint_payment_native: None,
                 mint_payment_usd: None,
+                mint_payment_receiver: None,
             },
             TransferEvent {
                 tx_hash: "lure-tx".into(),
@@ -675,6 +951,7 @@ mod tests {
                 fee_payer: Some("0xop".into()),
                 mint_payment_native: None,
                 mint_payment_usd: None,
+                mint_payment_receiver: None,
             },
             TransferEvent {
                 tx_hash: "cashout-tx".into(),
@@ -688,26 +965,45 @@ mod tests {
                 fee_payer: Some("0xop".into()),
                 mint_payment_native: None,
                 mint_payment_usd: None,
+                mint_payment_receiver: None,
             },
         ];
         evidence.value_flows = vec![
             ValueFlowEdge {
+                tx_hash: "mint-tx".into(),
+                event_id: None,
+                from: "0xfunder".into(),
+                to: "0xop".into(),
+                kind: ValueFlowKind::Funding,
+                native_amount: Some(1.0),
+                usd_amount: Some(200.0),
+                timestamp: Some(1),
+                gas_native: None,
+                fee_payer: None,
+            },
+            ValueFlowEdge {
                 tx_hash: "cashout-tx".into(),
+                event_id: None,
                 from: "0xop".into(),
                 to: "0xex".into(),
                 kind: ValueFlowKind::Cashout,
                 native_amount: Some(0.8),
                 usd_amount: Some(160.0),
                 timestamp: Some(3),
+                gas_native: None,
+                fee_payer: None,
             },
             ValueFlowEdge {
                 tx_hash: "wd-tx".into(),
+                event_id: None,
                 from: "0xop".into(),
                 to: "0xcex".into(),
                 kind: ValueFlowKind::Withdrawal,
                 native_amount: Some(0.2),
                 usd_amount: Some(40.0),
                 timestamp: Some(4),
+                gas_native: None,
+                fee_payer: None,
             },
         ];
         evidence.quality = EvidenceQuality {
@@ -735,7 +1031,7 @@ mod tests {
         );
         assert_eq!(analysis.economics.setup_gas_native, 0.01);
         assert_eq!(analysis.economics.lure_gas_native, 0.02);
-        // cashout-tx gas upgraded Setup/Lure → Exit via Cashout edge.
+        // Funding marks Setup; cashout upgrades the matching tx to Exit.
         assert_eq!(analysis.economics.exit_gas_native, 0.05);
         assert_eq!(analysis.economics.total_gas_native, 0.08);
         assert_eq!(analysis.economics.withdrawal_native, 1.0);
@@ -765,7 +1061,7 @@ mod tests {
                 },
             )],
             lifecycle: LifecycleFacts {
-                early_signal_categories: vec!["x".into()],
+                first_activity_timestamp: Some(1),
                 ..LifecycleFacts::default()
             },
             value_flow: ValueFlowFacts {
@@ -790,6 +1086,7 @@ mod tests {
                 ..EconomicFacts::default()
             },
             economics_quality: EconomicsQuality::default(),
+            evidence_quality: EvidenceQuality::default(),
             analysis_timestamp: 0,
         };
         analysis.shrink_for_summary_memory();
@@ -798,7 +1095,7 @@ mod tests {
             analysis.attribution[0].1.role,
             AddressRole::SuspectedOperator
         );
-        assert!(analysis.lifecycle.early_signal_categories.is_empty());
+        assert_eq!(analysis.lifecycle.first_activity_timestamp, None);
         assert_eq!(analysis.value_flow.mint_edge_count, 0);
         assert_eq!(analysis.behavior_instances[0].addresses, vec!["0xa"]);
         assert!(analysis.behavior_instances[0].transactions.is_empty());

@@ -3,18 +3,18 @@
 use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
 use arrow_cast::cast;
 use arrow_schema::DataType;
-use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use parquet::arrow::ProjectionMask;
+use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
 use std::fs::File;
 use std::path::Path;
 
-use crate::entity::{ResidentStore, SourceOrder};
-use crate::parquet::merge::merge_shards_ordered;
-use crate::parquet::validate::{ValidatedInput, PASS1_COLUMNS};
-use crate::parquet::LoadOptions;
-use crate::progress::ProgressObserver;
 use crate::Analysis2Error;
+use crate::entity::{ResidentStore, SourceOrder};
+use crate::parquet::LoadOptions;
+use crate::parquet::merge::merge_shards_ordered;
+use crate::parquet::validate::{PASS1_COLUMNS, ValidatedInput};
+use crate::progress::ProgressObserver;
 
 pub fn scan_pass1(
     inputs: &[ValidatedInput],
@@ -73,9 +73,7 @@ fn scan_row_group_pass1(
         .with_row_groups(vec![row_group])
         .with_batch_size(8 * 1024)
         .build()
-        .map_err(|error| {
-            Analysis2Error::parquet(format!("{}: {error}", input.path.display()))
-        })?;
+        .map_err(|error| Analysis2Error::parquet(format!("{}: {error}", input.path.display())))?;
     let mut shard = ResidentStore::with_options(options.metadata_anchors, &options.evm_chains);
     let mut row_offset = 0_u64;
     for batch in reader {
@@ -121,9 +119,10 @@ impl ProjectedUtf8Columns {
     ) -> Result<Self, Analysis2Error> {
         let mut columns = Vec::with_capacity(names.len());
         for required in names {
-            let index = batch.schema().index_of(required).map_err(|error| {
-                Analysis2Error::parquet(format!("{}: {error}", path.display()))
-            })?;
+            let index = batch
+                .schema()
+                .index_of(required)
+                .map_err(|error| Analysis2Error::parquet(format!("{}: {error}", path.display())))?;
             let source = batch.column(index);
             let converted = cast(source, &DataType::Utf8).map_err(|error| {
                 Analysis2Error::parquet(format!(

@@ -14,6 +14,9 @@ pub struct LegitClassification {
 
 pub fn classify(signals: &LegitSignals) -> LegitClassification {
     let mut reasons = Vec::new();
+    if signals.seed_open_license {
+        reasons.push("seed_open_license".into());
+    }
     if signals.verified_migration {
         reasons.push("verified_migration".into());
     }
@@ -60,6 +63,18 @@ mod tests {
         assert!(out.is_legit_duplicate);
         assert_eq!(out.reasons, vec!["verified_migration".to_owned()]);
         assert_eq!(out.evidence_keys, vec!["migration:official".to_owned()]);
+    }
+
+    #[test]
+    fn marks_legit_when_seed_has_open_license() {
+        let out = classify(&LegitSignals {
+            seed_open_license: true,
+            evidence_keys: vec!["seed_open_license".into()],
+            verification_complete: true,
+            ..LegitSignals::default()
+        });
+        assert!(out.is_legit_duplicate);
+        assert_eq!(out.reasons, vec!["seed_open_license".to_owned()]);
     }
 
     #[test]

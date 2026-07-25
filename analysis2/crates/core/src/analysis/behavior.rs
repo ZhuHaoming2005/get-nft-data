@@ -5,10 +5,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use ahash::{AHashMap, AHashSet};
 use serde::{Deserialize, Serialize};
 
+use super::PaperConfig;
 use super::attribution::AddressRole;
 use super::graph::AddressGraph;
-use super::PaperConfig;
-use crate::enrich::{EvidenceBundle, SaleEvent, TransferEvent};
+use crate::enrich::{EvidenceBundle, SaleEvent, TransferEvent, normalize_chain_address};
 
 #[derive(Clone, Copy, Debug, Default, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -46,10 +46,17 @@ pub struct BehaviorInstance {
     pub end_timestamp: Option<i64>,
     pub start_block: Option<u64>,
     pub end_block: Option<u64>,
+    #[serde(skip_serializing)]
     pub native_value: f64,
     pub usd_value: f64,
+    #[serde(skip_serializing)]
     pub linked_loss_native: f64,
+    #[serde(rename = "linked_paid_exposure_usd")]
     pub linked_loss_usd: f64,
+    /// Transaction-level paid exposures used for cross-detector de-duplication.
+    #[serde(default)]
+    #[serde(rename = "linked_paid_exposure_events")]
+    pub linked_loss_events: Vec<LinkedLossEvent>,
     pub gini_nft_count: Option<f64>,
     pub gini_token_transaction_count: Option<f64>,
     pub fan_out: Option<u64>,
@@ -63,6 +70,14 @@ pub struct BehaviorInstance {
     pub exit_to_cycle_nft_ratio: Option<f64>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct LinkedLossEvent {
+    pub tx_hash: String,
+    pub buyer: String,
+    pub token_id: String,
+    pub usd_amount: f64,
+}
+
 pub struct BehaviorAnalysis {
     pub facts: BehaviorFacts,
     pub instances: Vec<BehaviorInstance>,
@@ -71,10 +86,12 @@ pub struct BehaviorAnalysis {
 #[derive(Default)]
 struct CycleValues {
     end: Option<i64>,
+    internal_event_count: u64,
     internal_native_sum: f64,
     internal_native_count: u64,
     internal_usd_sum: f64,
     internal_usd_count: u64,
+    exit_event_count: u64,
     exit_native_sum: f64,
     exit_native_count: u64,
     exit_usd_sum: f64,
@@ -90,32 +107,20 @@ pub fn detect_behaviors(
     roles: &BTreeMap<String, AddressRole>,
     cfg: &PaperConfig,
 ) -> BehaviorAnalysis {
-    // Case-fold addresses: controller / sale checksum mismatches zeroed wash before.
+    // Attribution keys are already normalized with chain-aware semantics.
     let malicious = roles
         .iter()
-        .filter(|(_, role)| {
-            matches!(
-                role,
-                AddressRole::SuspectedOperator | AddressRole::SuspectedColluder
-            )
-        })
-        .map(|(address, _)| address.to_ascii_lowercase())
+        .filter(|(_, role)| matches!(role, AddressRole::SuspectedOperator))
+        .map(|(address, _)| address.clone())
         .collect::<AHashSet<_>>();
     let honest = roles
         .iter()
-        .filter(|(_, role)| {
-            matches!(
-                role,
-                AddressRole::LikelyVictim | AddressRole::CorruptedVictim
-            )
-        })
-        .map(|(address, _)| address.to_ascii_lowercase())
+        .filter(|(_, role)| matches!(role, AddressRole::LikelyVictim))
+        .map(|(address, _)| address.clone())
         .collect::<AHashSet<_>>();
-
     // Wash cycles: build SCC on *all* sales (normalized), then keep components that
-    // are large enough and contain at least one malicious address. Using
-    // both-malicious-only edges under-detects when colluder marking or address
-    // casing dropped one side of a wash pair.
+    // are large enough and contain at least one operator. Restricting the graph to
+    // operator-only edges can drop the other side of a wash pair.
     let sale_graph = AddressGraph::from_sales(&evidence.sales);
     let sale_components = sale_graph.strongly_connected_components();
     let wash_components = sale_components
@@ -123,7 +128,10 @@ pub fn detect_behaviors(
         .filter(|component| {
             component.len() >= cfg.min_cycle_size
                 && component.iter().any(|&vertex| {
-                    malicious.contains(&sale_graph.addresses[vertex].to_ascii_lowercase())
+                    malicious.contains(&normalize_chain_address(
+                        &evidence.chain,
+                        &sale_graph.addresses[vertex],
+                    ))
                 })
         })
         .map(Vec::as_slice)
@@ -133,7 +141,7 @@ pub fn detect_behaviors(
     for (wash_id, component) in wash_components.iter().enumerate() {
         for &vertex in *component {
             wash_by_address.insert(
-                sale_graph.addresses[vertex].to_ascii_lowercase(),
+                normalize_chain_address(&evidence.chain, &sale_graph.addresses[vertex]),
                 wash_id,
             );
         }
@@ -143,8 +151,8 @@ pub fn detect_behaviors(
         .map(|_| CycleValues::default())
         .collect::<Vec<_>>();
     for (event_index, sale) in evidence.sales.iter().enumerate() {
-        let seller = sale.seller.to_ascii_lowercase();
-        let buyer = sale.buyer.to_ascii_lowercase();
+        let seller = normalize_chain_address(&evidence.chain, &sale.seller);
+        let buyer = normalize_chain_address(&evidence.chain, &sale.buyer);
         if let (Some(&left), Some(&right)) =
             (wash_by_address.get(&seller), wash_by_address.get(&buyer))
         {
@@ -157,8 +165,8 @@ pub fn detect_behaviors(
         }
     }
     for (event_index, sale) in evidence.sales.iter().enumerate() {
-        let seller = sale.seller.to_ascii_lowercase();
-        let buyer = sale.buyer.to_ascii_lowercase();
+        let seller = normalize_chain_address(&evidence.chain, &sale.seller);
+        let buyer = normalize_chain_address(&evidence.chain, &sale.buyer);
         let Some(&wash_id) = wash_by_address.get(&seller) else {
             continue;
         };
@@ -188,7 +196,7 @@ pub fn detect_behaviors(
         &malicious_refs,
         cfg.fan_out,
     );
-    let layered_instances = layered_paths(evidence, transfer_graph, cfg.layered_path_addresses);
+    let layered_instances = layered_paths(evidence, &malicious, cfg.layered_path_addresses);
     let layered_transfer = layered_instances.len() as u64;
 
     let mut indegree = vec![0_u64; transfer_graph.addresses.len()];
@@ -199,17 +207,21 @@ pub fn detect_behaviors(
         .iter()
         .enumerate()
         .filter_map(|(vertex, degree)| {
-            (malicious.contains(transfer_graph.addresses[vertex].as_str())
-                && (*degree >= 3
-                    || (*degree > 0
-                        && transfer_graph.offsets[vertex + 1] - transfer_graph.offsets[vertex]
-                            >= 3)))
-            .then_some(vertex)
+            (malicious.contains(&normalize_chain_address(
+                &evidence.chain,
+                &transfer_graph.addresses[vertex],
+            )) && *degree >= 3)
+                .then_some(vertex)
         })
         .collect::<Vec<_>>();
     let inventory_concentration = inventory_vertices.len() as u64;
 
-    let mut instances = cycle_instances(&evidence.sales, &sale_graph, &wash_components, &cycle_values);
+    let mut instances = cycle_instances(
+        &evidence.sales,
+        &sale_graph,
+        &wash_components,
+        &cycle_values,
+    );
     instances.extend(
         cycle_values
             .iter()
@@ -221,7 +233,11 @@ pub fn detect_behaviors(
     );
     instances.extend(star.instances);
     instances.extend(layered_instances);
-    instances.extend(inventory_instances(evidence, transfer_graph, &inventory_vertices));
+    instances.extend(inventory_instances(
+        evidence,
+        transfer_graph,
+        &inventory_vertices,
+    ));
     instances.sort_by(|left, right| {
         (
             left.kind,
@@ -281,25 +297,18 @@ fn star_behaviors(
     for (component_id, component) in components.iter().enumerate() {
         for &vertex in component {
             component_by_vertex[vertex] = component_id;
-            malicious_component[component_id] |=
-                malicious.contains(graph.addresses[vertex].as_str());
+            let normalized = normalize_chain_address(&evidence.chain, &graph.addresses[vertex]);
+            malicious_component[component_id] |= malicious.contains(normalized.as_str());
         }
     }
     let address_ids = graph.address_index();
     let honest: AHashSet<String> = roles
         .iter()
-        .filter(|(_, role)| {
-            matches!(
-                role,
-                AddressRole::LikelyVictim | AddressRole::CorruptedVictim
-            )
-        })
-        .map(|(address, _)| address.to_ascii_lowercase())
+        .filter(|(_, role)| matches!(role, AddressRole::LikelyVictim))
+        .map(|(address, _)| address.clone())
         .collect();
-    let malicious_lower: AHashSet<String> = malicious
-        .iter()
-        .map(|a| a.to_ascii_lowercase())
-        .collect();
+    let malicious_normalized: AHashSet<String> =
+        malicious.iter().map(|a| (*a).to_owned()).collect();
     let mut dag_targets = (0..components.len())
         .map(|_| BTreeSet::new())
         .collect::<Vec<_>>();
@@ -337,8 +346,8 @@ fn star_behaviors(
         }
         dag_targets[left].insert(right);
         outgoing_events[left].push(PropEvent::Sale(event_index));
-        valuable_outgoing[left] |= sale.native_amount.unwrap_or(0.0) > 0.0
-            || sale.usd_amount.unwrap_or(0.0) > 0.0;
+        valuable_outgoing[left] |=
+            sale.native_amount.unwrap_or(0.0) > 0.0 || sale.usd_amount.unwrap_or(0.0) > 0.0;
     }
 
     let mut instances = Vec::new();
@@ -367,10 +376,7 @@ fn star_behaviors(
         }
         let mut instance = instance_from_prop_events(kind, evidence, &outgoing_events[component]);
         instance.fan_out = Some(dag_targets[component].len() as u64);
-        // Linked buyers + loss: direct paid sales from this star component to
-        // non-malicious counterparties (paper Sybil/Fraud/Poisoning 关联损失).
-        // Prefer role-tagged victims; also count paid non-malicious buyers when
-        // holder snapshots are incomplete (otherwise linked_loss stays 0 in practice).
+        // Paid exposure is limited to role-attributed victims.
         let mut linked_buyers = AHashSet::new();
         let mut linked_loss_native = 0.0_f64;
         let mut linked_loss_usd = 0.0_f64;
@@ -379,15 +385,14 @@ fn star_behaviors(
                 continue;
             };
             let sale = &evidence.sales[*index];
-            let buyer = sale.buyer.to_ascii_lowercase();
-            if buyer.is_empty() || malicious_lower.contains(&buyer) {
+            let buyer = normalize_chain_address(&evidence.chain, &sale.buyer);
+            if buyer.is_empty() || malicious_normalized.contains(&buyer) {
                 continue;
             }
             let paid_native = sale.native_amount.filter(|v| *v > 0.0);
             let paid_usd = sale.usd_amount.filter(|v| *v > 0.0);
-            let paid = paid_native.is_some() || paid_usd.is_some();
             let role_victim = honest.contains(&buyer);
-            if !role_victim && !paid {
+            if !role_victim {
                 continue;
             }
             linked_buyers.insert(buyer);
@@ -396,6 +401,12 @@ fn star_behaviors(
             }
             if let Some(usd) = paid_usd {
                 linked_loss_usd += usd;
+                instance.linked_loss_events.push(LinkedLossEvent {
+                    tx_hash: sale.tx_hash.clone(),
+                    buyer: sale.buyer.clone(),
+                    token_id: sale.token_id.clone(),
+                    usd_amount: usd,
+                });
             }
         }
         let mut linked_buyer_list = linked_buyers.into_iter().collect::<Vec<_>>();
@@ -426,6 +437,10 @@ enum ValueSide {
 }
 
 fn add_value(values: &mut CycleValues, sale: &SaleEvent, side: ValueSide) {
+    match side {
+        ValueSide::Internal => values.internal_event_count += 1,
+        ValueSide::Exit => values.exit_event_count += 1,
+    }
     if let Some(native) = sale.native_amount.filter(|value| *value >= 0.0) {
         match side {
             ValueSide::Internal => {
@@ -453,14 +468,12 @@ fn add_value(values: &mut CycleValues, sale: &SaleEvent, side: ValueSide) {
 }
 
 fn exit_price_exceeds_internal(values: &CycleValues) -> bool {
-    if values.internal_usd_count > 0 && values.exit_usd_count > 0 {
-        return (values.exit_usd_sum / values.exit_usd_count as f64)
-            > (values.internal_usd_sum / values.internal_usd_count as f64);
-    }
-    values.internal_native_count > 0
-        && values.exit_native_count > 0
-        && (values.exit_native_sum / values.exit_native_count as f64)
-            > (values.internal_native_sum / values.internal_native_count as f64)
+    values.internal_event_count > 0
+        && values.exit_event_count > 0
+        && values.internal_usd_count == values.internal_event_count
+        && values.exit_usd_count == values.exit_event_count
+        && (values.exit_usd_sum / values.exit_usd_count as f64)
+            > (values.internal_usd_sum / values.internal_usd_count as f64)
 }
 
 fn cycle_instances(
@@ -517,6 +530,19 @@ fn pump_instance(
     instance.linked_buyers.dedup();
     instance.linked_loss_native = values.exit_native_sum;
     instance.linked_loss_usd = values.exit_usd_sum;
+    instance.linked_loss_events = selected
+        .iter()
+        .filter_map(|sale| {
+            sale.usd_amount
+                .filter(|amount| *amount > 0.0)
+                .map(|usd_amount| LinkedLossEvent {
+                    tx_hash: sale.tx_hash.clone(),
+                    buyer: sale.buyer.clone(),
+                    token_id: sale.token_id.clone(),
+                    usd_amount,
+                })
+        })
+        .collect();
     instance.exit_to_internal_price_ratio = comparable_average_ratio(values);
     let cycle_nfts = values
         .internal_events
@@ -533,24 +559,19 @@ fn pump_instance(
 }
 
 fn comparable_average_ratio(values: &CycleValues) -> Option<f64> {
-    let (internal_sum, internal_count, exit_sum, exit_count) =
-        if values.internal_usd_count > 0 && values.exit_usd_count > 0 {
-            (
-                values.internal_usd_sum,
-                values.internal_usd_count,
-                values.exit_usd_sum,
-                values.exit_usd_count,
-            )
-        } else if values.internal_native_count > 0 && values.exit_native_count > 0 {
-            (
-                values.internal_native_sum,
-                values.internal_native_count,
-                values.exit_native_sum,
-                values.exit_native_count,
-            )
-        } else {
-            return None;
-        };
+    if values.internal_event_count == 0
+        || values.exit_event_count == 0
+        || values.internal_usd_count != values.internal_event_count
+        || values.exit_usd_count != values.exit_event_count
+    {
+        return None;
+    }
+    let (internal_sum, internal_count, exit_sum, exit_count) = (
+        values.internal_usd_sum,
+        values.internal_usd_count,
+        values.exit_usd_sum,
+        values.exit_usd_count,
+    );
     let internal = internal_sum / internal_count as f64;
     (internal > 0.0).then(|| (exit_sum / exit_count as f64) / internal)
 }
@@ -607,97 +628,201 @@ fn gini(values: &[u64]) -> Option<f64> {
 
 fn layered_paths(
     evidence: &EvidenceBundle,
-    graph: &AddressGraph,
+    malicious: &AHashSet<String>,
     minimum_addresses: usize,
 ) -> Vec<BehaviorInstance> {
-    let address_ids = graph.address_index();
-    let mut edge_events = AHashMap::<(usize, usize), Vec<PropEvent>>::new();
+    let mut outgoing = AHashMap::<(String, String), Vec<PropEvent>>::new();
     for (event_index, transfer) in evidence.transfers.iter().enumerate() {
-        let (Some(&from), Some(&to)) = (
-            address_ids.get(transfer.from.as_str()),
-            address_ids.get(transfer.to.as_str()),
-        ) else {
+        if transfer.token_id.is_empty() || transfer.from.is_empty() || transfer.to.is_empty() {
             continue;
-        };
-        edge_events
-            .entry((from, to))
+        }
+        outgoing
+            .entry((transfer.token_id.clone(), transfer.from.clone()))
             .or_default()
             .push(PropEvent::Transfer(event_index));
     }
     for (event_index, sale) in evidence.sales.iter().enumerate() {
-        let (Some(&from), Some(&to)) = (
-            address_ids.get(sale.seller.as_str()),
-            address_ids.get(sale.buyer.as_str()),
-        ) else {
+        if sale.token_id.is_empty() || sale.seller.is_empty() || sale.buyer.is_empty() {
             continue;
-        };
-        edge_events
-            .entry((from, to))
+        }
+        outgoing
+            .entry((sale.token_id.clone(), sale.seller.clone()))
             .or_default()
             .push(PropEvent::Sale(event_index));
     }
-    let Some(path) = first_layered_path(graph, minimum_addresses) else {
-        return Vec::new();
-    };
-    let addresses = path
-        .iter()
-        .map(|&member| graph.addresses[member].clone())
-        .collect::<Vec<_>>();
-    let selected = path
-        .windows(2)
-        .filter_map(|pair| edge_events.get(&(pair[0], pair[1]))?.first().copied())
-        .collect::<Vec<_>>();
-    if selected.len() + 1 != path.len() {
-        return Vec::new();
+    for events in outgoing.values_mut() {
+        events.sort_by_key(|event| prop_event_order(evidence, *event));
     }
-    let mut instance = instance_from_prop_events(BehaviorKind::LayeredTransfer, evidence, &selected);
-    instance.addresses = addresses;
-    instance.path_length = Some(minimum_addresses as u64);
-    instance.low_value_hops = Some(
-        selected
-            .iter()
-            .filter(|event| match event {
-                PropEvent::Transfer(_) => true,
-                PropEvent::Sale(index) => {
-                    let sale = &evidence.sales[*index];
-                    sale.usd_amount.unwrap_or(f64::MAX) <= 1.0
-                        && sale.native_amount.unwrap_or(f64::MAX) <= 0.001
-                }
-            })
-            .count() as u64,
-    );
-    vec![instance]
+
+    let mut instances = Vec::new();
+    let mut seen_paths = BTreeSet::new();
+    let starts = outgoing
+        .keys()
+        .filter(|(_, from)| malicious.contains(&normalize_chain_address(&evidence.chain, from)))
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    for (token_id, start) in starts {
+        let Some(selected) =
+            layered_event_path_from(evidence, &outgoing, &token_id, &start, minimum_addresses)
+        else {
+            continue;
+        };
+        let addresses = layered_path_addresses(evidence, &start, &selected);
+        let path_key = (
+            token_id,
+            addresses.clone(),
+            selected
+                .iter()
+                .map(|event| prop_event_transaction(evidence, *event).to_owned())
+                .collect::<Vec<_>>(),
+        );
+        if !seen_paths.insert(path_key) {
+            continue;
+        }
+        let mut instance =
+            instance_from_prop_events(BehaviorKind::LayeredTransfer, evidence, &selected);
+        instance.path_length = Some(addresses.len() as u64);
+        instance.addresses = addresses;
+        instance.low_value_hops = Some(
+            selected
+                .iter()
+                .filter(|event| match event {
+                    PropEvent::Transfer(_) => true,
+                    PropEvent::Sale(index) => evidence.sales[*index]
+                        .usd_amount
+                        .is_some_and(|value| (0.0..=1.0).contains(&value)),
+                })
+                .count() as u64,
+        );
+        instances.push(instance);
+    }
+    instances
 }
 
-fn first_layered_path(graph: &AddressGraph, minimum_addresses: usize) -> Option<Vec<usize>> {
+fn layered_event_path_from(
+    evidence: &EvidenceBundle,
+    outgoing: &AHashMap<(String, String), Vec<PropEvent>>,
+    token_id: &str,
+    start: &str,
+    minimum_addresses: usize,
+) -> Option<Vec<PropEvent>> {
     if minimum_addresses == 0 {
         return Some(Vec::new());
     }
-    for start in 0..graph.addresses.len() {
-        let mut path = Vec::with_capacity(minimum_addresses);
-        path.push(start);
-        let mut next_edges = Vec::with_capacity(minimum_addresses);
-        next_edges.push(graph.offsets[start]);
-        while let Some(next_edge) = next_edges.last_mut() {
-            if path.len() == minimum_addresses {
-                return Some(path);
-            }
-            let vertex = *path.last().expect("nonempty layered path");
-            if *next_edge == graph.offsets[vertex + 1] {
-                next_edges.pop();
-                path.pop();
-                continue;
-            }
-            let next = graph.edges[*next_edge];
-            *next_edge += 1;
-            if path.contains(&next) {
-                continue;
-            }
-            path.push(next);
-            next_edges.push(graph.offsets[next]);
+    fn search(
+        evidence: &EvidenceBundle,
+        outgoing: &AHashMap<(String, String), Vec<PropEvent>>,
+        token_id: &str,
+        addresses: &mut Vec<String>,
+        selected: &mut Vec<PropEvent>,
+        minimum_addresses: usize,
+    ) -> bool {
+        if addresses.len() >= minimum_addresses {
+            return true;
         }
+        let Some(current) = addresses.last() else {
+            return false;
+        };
+        let Some(events) = outgoing.get(&(token_id.to_owned(), current.clone())) else {
+            return false;
+        };
+        for &event in events {
+            if selected
+                .last()
+                .is_some_and(|previous| !prop_event_precedes(evidence, *previous, event))
+            {
+                continue;
+            }
+            let next = prop_event_to(evidence, event);
+            if next.is_empty() || addresses.iter().any(|address| address == next) {
+                continue;
+            }
+            addresses.push(next.to_owned());
+            selected.push(event);
+            if search(
+                evidence,
+                outgoing,
+                token_id,
+                addresses,
+                selected,
+                minimum_addresses,
+            ) {
+                return true;
+            }
+            selected.pop();
+            addresses.pop();
+        }
+        false
     }
-    None
+
+    let mut addresses = vec![start.to_owned()];
+    let mut selected = Vec::with_capacity(minimum_addresses.saturating_sub(1));
+    search(
+        evidence,
+        outgoing,
+        token_id,
+        &mut addresses,
+        &mut selected,
+        minimum_addresses,
+    )
+    .then_some(selected)
+}
+
+fn layered_path_addresses(
+    evidence: &EvidenceBundle,
+    start: &str,
+    events: &[PropEvent],
+) -> Vec<String> {
+    std::iter::once(start.to_owned())
+        .chain(
+            events
+                .iter()
+                .map(|event| prop_event_to(evidence, *event).to_owned()),
+        )
+        .collect()
+}
+
+fn prop_event_to(evidence: &EvidenceBundle, event: PropEvent) -> &str {
+    match event {
+        PropEvent::Transfer(index) => &evidence.transfers[index].to,
+        PropEvent::Sale(index) => &evidence.sales[index].buyer,
+    }
+}
+
+fn prop_event_transaction(evidence: &EvidenceBundle, event: PropEvent) -> &str {
+    match event {
+        PropEvent::Transfer(index) => &evidence.transfers[index].tx_hash,
+        PropEvent::Sale(index) => &evidence.sales[index].tx_hash,
+    }
+}
+
+fn prop_event_order(
+    evidence: &EvidenceBundle,
+    event: PropEvent,
+) -> (Option<u64>, Option<i64>, usize) {
+    match event {
+        PropEvent::Transfer(index) => (
+            evidence.transfers[index].block_number,
+            evidence.transfers[index].timestamp,
+            index,
+        ),
+        PropEvent::Sale(index) => (
+            evidence.sales[index].block_number,
+            evidence.sales[index].timestamp,
+            index,
+        ),
+    }
+}
+
+fn prop_event_precedes(evidence: &EvidenceBundle, previous: PropEvent, next: PropEvent) -> bool {
+    let (previous_block, previous_time, _) = prop_event_order(evidence, previous);
+    let (next_block, next_time, _) = prop_event_order(evidence, next);
+    match (previous_block, next_block) {
+        (Some(previous), Some(next)) => previous < next,
+        _ => previous_time
+            .zip(next_time)
+            .is_some_and(|(previous, next)| previous < next),
+    }
 }
 
 fn inventory_instances(
@@ -705,10 +830,7 @@ fn inventory_instances(
     graph: &AddressGraph,
     vertices: &[usize],
 ) -> Vec<BehaviorInstance> {
-    let use_usd = evidence
-        .sales
-        .iter()
-        .any(|sale| sale.usd_amount.is_some());
+    let all_sales_priced = evidence.sales.iter().all(|sale| sale.usd_amount.is_some());
     let mut total_nfts = BTreeSet::new();
     let mut total_value = 0.0_f64;
     let selected_vertices = vertices
@@ -727,12 +849,7 @@ fn inventory_instances(
     }
     for (event_index, sale) in evidence.sales.iter().enumerate() {
         total_nfts.insert(sale.token_id.as_str());
-        let value = if use_usd {
-            sale.usd_amount.unwrap_or(0.0)
-        } else {
-            sale.native_amount.unwrap_or(0.0)
-        }
-        .max(0.0);
+        let value = sale.usd_amount.unwrap_or(0.0).max(0.0);
         total_value += value;
         if let Some(slot) = selected_vertices.get(sale.buyer.as_str()) {
             inbound[*slot].push(PropEvent::Sale(event_index));
@@ -755,13 +872,8 @@ fn inventory_instances(
             instance.source_address_count = Some(sources.len() as u64);
             instance.nft_share = (!total_nfts.is_empty())
                 .then(|| instance.nfts.len() as f64 / total_nfts.len() as f64);
-            let selected_value = if use_usd {
-                instance.usd_value
-            } else {
-                instance.native_value
-            };
             instance.value_share =
-                (total_value > 0.0).then(|| selected_value / total_value);
+                (all_sales_priced && total_value > 0.0).then(|| instance.usd_value / total_value);
             instance
         })
         .collect()
@@ -790,7 +902,9 @@ fn instance_from_prop_events(
     };
     for event in events {
         match event {
-            PropEvent::Transfer(index) => absorb_transfer(&mut instance, &evidence.transfers[*index]),
+            PropEvent::Transfer(index) => {
+                absorb_transfer(&mut instance, &evidence.transfers[*index])
+            }
             PropEvent::Sale(index) => absorb_sale(&mut instance, &evidence.sales[*index]),
         }
     }
@@ -839,4 +953,101 @@ fn min_option<T: Ord>(left: Option<T>, right: Option<T>) -> Option<T> {
 
 fn max_option<T: Ord>(left: Option<T>, right: Option<T>) -> Option<T> {
     left.into_iter().chain(right).max()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        CycleValues, comparable_average_ratio, exit_price_exceeds_internal, layered_paths,
+    };
+    use crate::enrich::{EvidenceBundle, TransferEvent};
+    use ahash::AHashSet;
+
+    fn propagation(
+        tx_hash: &str,
+        token_id: &str,
+        from: &str,
+        to: &str,
+        block_number: u64,
+    ) -> TransferEvent {
+        TransferEvent {
+            tx_hash: tx_hash.into(),
+            token_id: token_id.into(),
+            from: from.into(),
+            to: to.into(),
+            timestamp: Some(block_number as i64),
+            block_number: Some(block_number),
+            is_mint: false,
+            gas_native: None,
+            fee_payer: None,
+            mint_payment_native: None,
+            mint_payment_usd: None,
+            mint_payment_receiver: None,
+        }
+    }
+
+    #[test]
+    fn pump_price_comparison_never_falls_back_to_native_units() {
+        let values = CycleValues {
+            internal_event_count: 1,
+            internal_native_sum: 1.0,
+            internal_native_count: 1,
+            exit_event_count: 1,
+            exit_native_sum: 10.0,
+            exit_native_count: 1,
+            ..CycleValues::default()
+        };
+
+        assert!(!exit_price_exceeds_internal(&values));
+        assert_eq!(comparable_average_ratio(&values), None);
+    }
+
+    #[test]
+    fn pump_price_comparison_requires_complete_usd_groups() {
+        let complete = CycleValues {
+            internal_event_count: 2,
+            internal_usd_sum: 20.0,
+            internal_usd_count: 2,
+            exit_event_count: 1,
+            exit_usd_sum: 30.0,
+            exit_usd_count: 1,
+            ..CycleValues::default()
+        };
+        assert!(exit_price_exceeds_internal(&complete));
+        assert_eq!(comparable_average_ratio(&complete), Some(3.0));
+
+        let incomplete = CycleValues {
+            internal_event_count: 2,
+            internal_usd_sum: 10.0,
+            internal_usd_count: 1,
+            exit_event_count: 1,
+            exit_usd_sum: 30.0,
+            exit_usd_count: 1,
+            ..CycleValues::default()
+        };
+        assert!(!exit_price_exceeds_internal(&incomplete));
+        assert_eq!(comparable_average_ratio(&incomplete), None);
+    }
+
+    #[test]
+    fn layered_paths_require_same_token_and_forward_time() {
+        let mut malicious = AHashSet::new();
+        malicious.insert("0xop".into());
+
+        let mut valid = EvidenceBundle::empty(1, "ethereum", "0xcand");
+        valid.transfers = vec![
+            propagation("0x1", "7", "0xop", "0xa", 10),
+            propagation("0x2", "7", "0xa", "0xb", 11),
+        ];
+        assert_eq!(layered_paths(&valid, &malicious, 3).len(), 1);
+
+        let mut different_token = valid.clone();
+        different_token.transfers[1].token_id = "8".into();
+        assert!(layered_paths(&different_token, &malicious, 3).is_empty());
+
+        let mut reverse_time = valid;
+        reverse_time.transfers[1].block_number = Some(9);
+        reverse_time.transfers[1].timestamp = Some(9);
+        assert!(layered_paths(&reverse_time, &malicious, 3).is_empty());
+    }
 }

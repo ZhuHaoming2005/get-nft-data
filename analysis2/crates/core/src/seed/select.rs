@@ -5,7 +5,7 @@ use std::path::Path;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::enrich::http::HttpClient;
 use crate::enrich::opensea::{self, OpenSeaRankedItem};
@@ -68,9 +68,7 @@ impl Default for SelectSeedsOptions {
 ///
 /// Creates a dedicated Tokio runtime. From an existing async context, call
 /// [`select_seeds_async`] instead.
-pub fn select_seeds(
-    opts: &SelectSeedsOptions,
-) -> Result<(Vec<SeedRecord>, Value), Analysis2Error> {
+pub fn select_seeds(opts: &SelectSeedsOptions) -> Result<(Vec<SeedRecord>, Value), Analysis2Error> {
     if tokio::runtime::Handle::try_current().is_ok() {
         return Err(Analysis2Error::invalid(
             "select_seeds cannot run inside an async runtime; use select_seeds_async",
@@ -88,9 +86,7 @@ pub async fn select_seeds_async(
     opts: &SelectSeedsOptions,
 ) -> Result<(Vec<SeedRecord>, Value), Analysis2Error> {
     if opts.seeds_per_chain == 0 {
-        return Err(Analysis2Error::invalid(
-            "seeds_per_chain must be positive",
-        ));
+        return Err(Analysis2Error::invalid("seeds_per_chain must be positive"));
     }
     let chains = normalize_chains(&opts.chains)?;
     if chains.is_empty() {
@@ -157,11 +153,14 @@ async fn select_evm_chain(
         .opensea_base_url
         .as_deref()
         .unwrap_or(opensea::default_base_url());
-    let ranked = match opensea::fetch_top_contracts(client, base, api_key, chain, requested).await
-    {
+    let ranked = match opensea::fetch_top_contracts(client, base, api_key, chain, requested).await {
         Ok(items) => items,
         Err(error) => {
-            crate::enrich::print_provider_error("opensea", "select_seeds_top_collections", &error.to_string());
+            crate::enrich::print_provider_error(
+                "opensea",
+                "select_seeds_top_collections",
+                &error.to_string(),
+            );
             return Ok((
                 Vec::new(),
                 incomplete_status(requested, 0, format!("opensea_error: {error}")),
@@ -458,8 +457,7 @@ mod tests {
             .await;
         let _me_listings = server
             .mock_async(|when, then| {
-                when.method(GET)
-                    .path("/collections/needs-resolve/listings");
+                when.method(GET).path("/collections/needs-resolve/listings");
                 then.status(500).body("boom");
             })
             .await;
@@ -555,8 +553,7 @@ mod tests {
 
         let _me_listings = server
             .mock_async(|when, then| {
-                when.method(GET)
-                    .path("/collections/needs-resolve/listings");
+                when.method(GET).path("/collections/needs-resolve/listings");
                 then.status(200).json_body(json!([{
                     "mintAddress": "So11111111111111111111111111111111111111112"
                 }]));
@@ -606,19 +603,25 @@ mod tests {
         assert_eq!(audit["chains"]["ethereum"]["collected"], 1);
 
         assert_eq!(poly.len(), 1);
-        assert_eq!(poly[0].address, "0x2222222222222222222222222222222222222222");
+        assert_eq!(
+            poly[0].address,
+            "0x2222222222222222222222222222222222222222"
+        );
         assert_eq!(audit["chains"]["polygon"]["collected"], 1);
 
         assert_eq!(sol.len(), 2);
-        assert_eq!(sol[0].address, "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263");
+        assert_eq!(
+            sol[0].address,
+            "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
+        );
         assert_eq!(sol[0].source, "magic_eden");
-        assert_eq!(sol[1].address, "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
+        assert_eq!(
+            sol[1].address,
+            "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+        );
         assert_eq!(audit["chains"]["solana"]["complete"], true);
 
-        let dir = std::env::temp_dir().join(format!(
-            "analysis2-seed-test-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("analysis2-seed-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         write_seed_outputs(&dir, &seeds, &audit).unwrap();
         let loaded = load_seeds_json(&dir.join("seeds.json")).unwrap();

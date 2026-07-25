@@ -222,11 +222,7 @@ impl HttpClient {
                 opensea_n,
                 TokenBucketRateLimiter::opensea_default(),
             ),
-            helius: ProviderLane::new(
-                "helius",
-                helius_n,
-                TokenBucketRateLimiter::helius_default(),
-            ),
+            helius: ProviderLane::new("helius", helius_n, TokenBucketRateLimiter::helius_default()),
             etherscan: ProviderLane::new(
                 "etherscan",
                 etherscan_n,
@@ -288,14 +284,8 @@ impl HttpClient {
         headers: &[(&str, &str)],
         body: &Value,
     ) -> Result<Value, Analysis2Error> {
-        self.request_on_lane(
-            reqwest::Method::POST,
-            url,
-            headers,
-            Some(body),
-            &self.other,
-        )
-        .await
+        self.request_on_lane(reqwest::Method::POST, url, headers, Some(body), &self.other)
+            .await
     }
 
     /// POST on the Helius lane (5 req/s + provider-local 429 cool-down).
@@ -320,14 +310,8 @@ impl HttpClient {
         url: &str,
         headers: &[(&str, &str)],
     ) -> Result<Value, Analysis2Error> {
-        self.request_on_lane(
-            reqwest::Method::GET,
-            url,
-            headers,
-            None,
-            &self.etherscan,
-        )
-        .await
+        self.request_on_lane(reqwest::Method::GET, url, headers, None, &self.etherscan)
+            .await
     }
 
     /// Shared retry loop for one provider lane: rate token → concurrency permit → HTTP.
@@ -345,16 +329,12 @@ impl HttpClient {
         for attempt in 0..=self.retries {
             // Rate / cool-down is provider-local.
             lane.limiter.acquire().await?;
-            let _permit = lane
-                .in_flight
-                .acquire()
-                .await
-                .map_err(|_| {
-                    Analysis2Error::http(format!(
-                        "HTTP concurrency pool closed provider={}",
-                        lane.name
-                    ))
-                })?;
+            let _permit = lane.in_flight.acquire().await.map_err(|_| {
+                Analysis2Error::http(format!(
+                    "HTTP concurrency pool closed provider={}",
+                    lane.name
+                ))
+            })?;
             let mut builder = self
                 .http
                 .request(method.clone(), url)
@@ -410,8 +390,7 @@ impl HttpClient {
                 }
             }
         }
-        let final_error =
-            last_error.unwrap_or_else(|| Analysis2Error::http("HTTP request failed"));
+        let final_error = last_error.unwrap_or_else(|| Analysis2Error::http("HTTP request failed"));
         // 404 is an expected miss for unknown collections — quiet one-liner, not full body dump.
         if is_http_not_found(&final_error) {
             eprintln!(
@@ -576,10 +555,7 @@ fn format_transport_error(
     }
     // Keep the library message but strip raw secrets if any leaked in.
     // Prefer `to_string()` over `without_url()` so we can borrow `&Error`.
-    let detail = one_line_error(
-        &redact_sensitive_text(&error.to_string()),
-        ERROR_BODY_CHARS,
-    );
+    let detail = one_line_error(&redact_sensitive_text(&error.to_string()), ERROR_BODY_CHARS);
     parts.push(format!("detail={detail}"));
     parts.join(" ")
 }
@@ -618,8 +594,7 @@ pub fn is_http_status(error: &Analysis2Error, status: u16) -> bool {
             let lower = message.to_ascii_lowercase();
             let code = status.to_string();
             // "HTTP 429 …", "HTTP 429 Too Many Requests …", "status=429 …"
-            lower.contains(&format!("http {code}"))
-                || lower.contains(&format!("status={code}"))
+            lower.contains(&format!("http {code}")) || lower.contains(&format!("status={code}"))
         }
         _ => false,
     }
@@ -755,7 +730,10 @@ fn redact_endpoint(url: &str) -> String {
 
 fn strip_wrapping_punct(s: &str) -> &str {
     s.trim_matches(|c: char| {
-        matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | ',' | ';' | '.')
+        matches!(
+            c,
+            '(' | ')' | '[' | ']' | '{' | '}' | '"' | '\'' | ',' | ';' | '.'
+        )
     })
 }
 
@@ -946,9 +924,19 @@ mod tests {
 
         // Concurrency: hold Alchemy's only in-flight permit and ensure OpenSea
         // can still acquire its own permit immediately.
-        let alchemy_permit = client.alchemy.in_flight.clone().try_acquire_owned().unwrap();
+        let alchemy_permit = client
+            .alchemy
+            .in_flight
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
         let os_start = Instant::now();
-        let _os_permit = client.opensea.in_flight.clone().try_acquire_owned().unwrap();
+        let _os_permit = client
+            .opensea
+            .in_flight
+            .clone()
+            .try_acquire_owned()
+            .unwrap();
         assert!(
             os_start.elapsed() < Duration::from_millis(20),
             "opensea concurrency must not be blocked by a full alchemy pool"

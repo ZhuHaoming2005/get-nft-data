@@ -9,8 +9,8 @@ use crate::dedup::metadata::MetadataIndex;
 
 use super::csr::{CsrIndex, UriChainIndex};
 use super::ids::{
-    compare_token_ids_desc, ChainId, ChainTotals, Contract, ContractId, MetadataRecord, Nft, NftId,
-    SourceOrder, StringId,
+    ChainId, ChainTotals, Contract, ContractId, MetadataRecord, Nft, NftId, SourceOrder, StringId,
+    compare_token_ids_desc,
 };
 use super::string_pool::StringPool;
 
@@ -243,10 +243,20 @@ impl ResidentStore {
         } else {
             existing_name
         };
-        let token_uri_id =
-            self.merge_uri_value(existing_token, token_uri_norm, "token_uri_norm", chain, &token_id)?;
-        let image_uri_id =
-            self.merge_uri_value(existing_image, image_uri_norm, "image_uri_norm", chain, &token_id)?;
+        let token_uri_id = self.merge_uri_value(
+            existing_token,
+            token_uri_norm,
+            "token_uri_norm",
+            chain,
+            &token_id,
+        )?;
+        let image_uri_id = self.merge_uri_value(
+            existing_image,
+            image_uri_norm,
+            "image_uri_norm",
+            chain,
+            &token_id,
+        )?;
 
         let nft = &mut self.nfts[nft_id as usize];
         nft.name_id = name_id;
@@ -369,9 +379,7 @@ impl ResidentStore {
 
     /// NFT ids for a contract (CSR slice; empty when missing).
     pub fn nfts_for_contract(&self, contract_id: ContractId) -> &[NftId] {
-        self.contract_nft_csr
-            .values_for(contract_id)
-            .unwrap_or(&[])
+        self.contract_nft_csr.values_for(contract_id).unwrap_or(&[])
     }
 
     /// Free URI indexes after the URI query stage.

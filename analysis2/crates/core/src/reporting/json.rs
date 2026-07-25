@@ -1,10 +1,11 @@
 //! JSON writers and seed-report payloads for offline dedup runs.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::dedup::candidates::CandidateRegistry;
 use crate::dedup::hits::{Dimension, HitGraph};
@@ -12,16 +13,15 @@ use crate::entity::{ContractId, NftId, ResidentStore};
 use crate::error::Analysis2Error;
 
 use super::aggregate::{
-    build_all_chains_duplicate_scale, build_scope_duplicate_scale, build_seed_duplicate_scale,
-    matrix_secondary_chains, AllChainsRelationRef, DuplicateScaleRow, ScopeScaleFilter,
-    SeedDuplicateScale,
+    AllChainsRelationRef, DuplicateScaleRow, ScopeScaleFilter, SeedDuplicateScale,
+    build_scope_duplicate_scale_for_chains, build_seed_duplicate_scale,
 };
 use super::layout::{
-    ensure_output_layout, intermediate_path, seed_report_dir, summary_scope_path,
     SCOPE_ALL_CHAINS, SCOPE_CHAIN_MATRIX, SCOPE_CROSS_CHAIN, SCOPE_INTRA_CHAIN,
-    SCOPE_LABEL_ALL_CHAINS, SCOPE_LABEL_CROSS_CHAIN,
+    SCOPE_LABEL_ALL_CHAINS, SCOPE_LABEL_CROSS_CHAIN, ensure_output_layout, intermediate_path,
+    seed_report_dir, summary_scope_path,
 };
-use super::manifest::{count_failed_seeds, FailureRecord, RunManifest, RunManifestSeeds};
+use super::manifest::{FailureRecord, RunManifest, RunManifestSeeds, count_failed_seeds};
 
 /// Minimal seed entry accepted by `--seeds` before `select-seeds` lands.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,12 +112,14 @@ pub fn resolve_seed_contract(
             seed.chain
         )));
     }
-    store.contract_id(&seed.chain, &seed.address).ok_or_else(|| {
-        Analysis2Error::invalid(format!(
-            "seed contract not in snapshot: {} / {}",
-            seed.chain, seed.address
-        ))
-    })
+    store
+        .contract_id(&seed.chain, &seed.address)
+        .ok_or_else(|| {
+            Analysis2Error::invalid(format!(
+                "seed contract not in snapshot: {} / {}",
+                seed.chain, seed.address
+            ))
+        })
 }
 
 /// Build the per-seed dedup report payload from a populated HitGraph.
@@ -171,13 +173,6 @@ pub(crate) fn write_json(path: &Path, value: &impl Serialize) -> Result<(), Anal
         .map_err(|e| Analysis2Error::invalid(format!("json encode {}: {e}", path.display())))?;
     fs::write(path, body)?;
     Ok(())
-}
-
-fn row_has_duplicate(rows: &[DuplicateScaleRow]) -> bool {
-    rows.iter()
-        .find(|r| r.category == "total")
-        .map(|r| r.duplicate_nft_count > 0 || r.duplicate_contract_count > 0)
-        .unwrap_or(false)
 }
 
 /// Write all offline dedup artifacts under `output_dir`.
@@ -257,9 +252,20 @@ pub(crate) fn write_four_scope_paper_summaries_public(
     output_dir: &Path,
     store: &ResidentStore,
     reports: &[&SeedDedupReport],
-    paper_summary: &serde_json::Value,
+    all_summary: &serde_json::Value,
+    intra_summary: &serde_json::Value,
+    cross_summary: &serde_json::Value,
+    matrix_summaries: &BTreeMap<(String, String), serde_json::Value>,
 ) -> Result<(), Analysis2Error> {
-    write_four_scope_paper_summaries(output_dir, store, reports, paper_summary)
+    write_four_scope_paper_summaries(
+        output_dir,
+        store,
+        reports,
+        all_summary,
+        intra_summary,
+        cross_summary,
+        matrix_summaries,
+    )
 }
 
 fn output_layout_manifest() -> serde_json::Value {
@@ -342,29 +348,61 @@ pub fn write_four_scope_paper_summaries(
     output_dir: &Path,
     store: &ResidentStore,
     reports: &[&SeedDedupReport],
-    paper_summary: &Value,
+    all_summary: &Value,
+    intra_summary: &Value,
+    cross_summary: &Value,
+    matrix_summaries: &BTreeMap<(String, String), Value>,
 ) -> Result<(), Analysis2Error> {
     let rels = scope_relations(reports);
     let (intra_detail, matrix_detail, cross_detail) = per_seed_scale_detail(reports);
+    let primary_chains: ahash::AHashSet<String> = reports
+        .iter()
+        .map(|report| report.seed.chain.to_ascii_lowercase())
+        .collect();
 
-    let intra_scale =
-        build_scope_duplicate_scale(store, rels.iter().copied(), ScopeScaleFilter::Intra);
-    let cross_scale =
-        build_scope_duplicate_scale(store, rels.iter().copied(), ScopeScaleFilter::Cross);
-    let all_scale = build_all_chains_duplicate_scale(store, rels.iter().copied());
+    let intra_scale = build_scope_duplicate_scale_for_chains(
+        store,
+        rels.iter().copied(),
+        ScopeScaleFilter::Intra,
+        &primary_chains,
+    );
+    let cross_scale = build_scope_duplicate_scale_for_chains(
+        store,
+        rels.iter().copied(),
+        ScopeScaleFilter::Cross,
+        &primary_chains,
+    );
+    let all_scale = build_scope_duplicate_scale_for_chains(
+        store,
+        rels.iter().copied(),
+        ScopeScaleFilter::All,
+        &primary_chains,
+    );
 
-    let secondaries = matrix_secondary_chains(rels.iter().copied());
     let mut matrix_blocks = Vec::new();
-    for sec in &secondaries {
-        let rows = build_scope_duplicate_scale(
-            store,
-            rels.iter().copied(),
-            ScopeScaleFilter::MatrixSecondary(sec.as_str()),
-        );
-        matrix_blocks.push(json!({
-            "secondary_chain": sec,
-            "rows": rows,
-        }));
+    let mut primaries: Vec<_> = primary_chains.iter().cloned().collect();
+    primaries.sort();
+    for primary in &primaries {
+        for secondary in &store.chains {
+            if primary.eq_ignore_ascii_case(secondary) {
+                continue;
+            }
+            let rows = build_scope_duplicate_scale_for_chains(
+                store,
+                rels.iter().copied(),
+                ScopeScaleFilter::Matrix {
+                    primary_chain: primary,
+                    secondary_chain: secondary,
+                },
+                &primary_chains,
+            );
+            matrix_blocks.push(json!({
+                "primary_chain": primary,
+                "secondary_chain": secondary,
+                "rows": rows,
+                "summary": matrix_summaries.get(&(primary.clone(), secondary.to_ascii_lowercase())),
+            }));
+        }
     }
     // Overall matrix scale = all cross-chain relations (same numerators as cross).
     let matrix_scale = cross_scale.clone();
@@ -373,36 +411,36 @@ pub fn write_four_scope_paper_summaries(
         output_dir,
         SCOPE_INTRA_CHAIN,
         SCOPE_INTRA_CHAIN,
-        paper_summary,
+        intra_summary,
         &intra_scale,
-        json!({ "seeds": intra_detail }),
+        json!({ "seed_scale_detail": intra_detail }),
     )?;
     write_one_scope_paper(
         output_dir,
         SCOPE_CHAIN_MATRIX,
         SCOPE_CHAIN_MATRIX,
-        paper_summary,
+        cross_summary,
         &matrix_scale,
         json!({
             "matrix_blocks": matrix_blocks,
-            "seeds": matrix_detail,
+            "seed_scale_detail": matrix_detail,
         }),
     )?;
     write_one_scope_paper(
         output_dir,
         SCOPE_CROSS_CHAIN,
         SCOPE_LABEL_CROSS_CHAIN,
-        paper_summary,
+        cross_summary,
         &cross_scale,
-        json!({ "seeds": cross_detail }),
+        json!({ "seed_scale_detail": cross_detail }),
     )?;
     write_one_scope_paper(
         output_dir,
         SCOPE_ALL_CHAINS,
         SCOPE_LABEL_ALL_CHAINS,
-        paper_summary,
+        all_summary,
         &all_scale,
-        json!({ "seeds": seed_index_json(reports) }),
+        json!({ "seed_index": seed_index_json(reports) }),
     )?;
     Ok(())
 }
@@ -441,44 +479,85 @@ fn write_scope_rollups(
     reports: &[&SeedDedupReport],
     failures: &[FailureRecord],
 ) -> Result<(), Analysis2Error> {
-    // Offline dedup path: paper fields are seed/dedup counts only (no deep analysis).
-    let with_dup = reports
-        .iter()
-        .filter(|r| {
-            row_has_duplicate(&r.duplicate_scale.intra_chain)
-                || row_has_duplicate(&r.duplicate_scale.cross_chain_summary)
+    let paper_for = |filter: ScopeScaleFilter<'_>| {
+        let mut candidates = ahash::AHashSet::new();
+        let mut candidates_with_ids = ahash::AHashSet::new();
+        let mut nft_ids = ahash::AHashSet::new();
+        let mut fallback_by_candidate = ahash::AHashMap::<String, u64>::new();
+        let mut with_dup = 0u64;
+        for report in reports {
+            let mut seed_has_duplicate = false;
+            for relation in &report.relations {
+                let same = report
+                    .seed
+                    .chain
+                    .eq_ignore_ascii_case(&relation.candidate_chain);
+                let matches = match filter {
+                    ScopeScaleFilter::All => true,
+                    ScopeScaleFilter::Intra => same,
+                    ScopeScaleFilter::Cross => !same,
+                    ScopeScaleFilter::Matrix { .. } => false,
+                };
+                if !matches {
+                    continue;
+                }
+                seed_has_duplicate = true;
+                let key = format!(
+                    "{}:{}",
+                    relation.candidate_chain, relation.candidate_address
+                );
+                candidates.insert(key.clone());
+                nft_ids.extend(relation.nft_ids.iter().copied());
+                if !relation.nft_ids.is_empty() {
+                    candidates_with_ids.insert(key.clone());
+                }
+                fallback_by_candidate
+                    .entry(key)
+                    .and_modify(|count| *count = (*count).max(relation.nft_count))
+                    .or_insert(relation.nft_count);
+            }
+            with_dup += u64::from(seed_has_duplicate);
+        }
+        let missing_id_nfts: u64 = fallback_by_candidate
+            .iter()
+            .filter(|(candidate, _)| !candidates_with_ids.contains(*candidate))
+            .map(|(_, count)| *count)
+            .sum();
+        let analyzed = reports.len() as u64;
+        let selected_n = selected.len() as u64;
+        let representative_nfts = nft_ids.len() as u64 + missing_id_nfts;
+        json!({
+            "analysis_available": false,
+            "selected_seed_count": selected_n,
+            "analyzed_seed_count": analyzed,
+            "incomplete_seed_count": 0,
+            "failed_seed_count": count_failed_seeds(failures),
+            "seed_completion_ratio": (selected_n > 0).then_some(analyzed as f64 / selected_n as f64),
+            "seed_with_duplicate_count": with_dup,
+            "seed_duplicate_ratio": (analyzed > 0).then_some(with_dup as f64 / analyzed as f64),
+            "representative_candidate_count": representative_nfts,
+            "representative_candidate_nft_count": representative_nfts,
+            "candidate_contract_count": candidates.len() as u64,
+            "suspected_duplicate_contract_count": Value::Null,
+            "legit_duplicate_contract_count": Value::Null,
+            "infringing_nft_count": Value::Null,
+            "data_quality": {
+                "analysis_available": false,
+                "failure_record_count": failures.len() as u64,
+                "failure_record_count_scope": "global_run",
+            },
         })
-        .count() as u64;
-    let analyzed = reports.len() as u64;
-    let selected_n = selected.len() as u64;
-    let paper = json!({
-        "selected_seed_count": selected_n,
-        "analyzed_seed_count": analyzed,
-        "incomplete_seed_count": 0,
-        "failed_seed_count": count_failed_seeds(failures),
-        "seed_completion_ratio": if selected_n == 0 { None } else { Some(analyzed as f64 / selected_n as f64) },
-        "seed_with_duplicate_count": with_dup,
-        "seed_duplicate_ratio": if analyzed == 0 { None } else { Some(with_dup as f64 / analyzed as f64) },
-        "representative_candidate_count": 0,
-        "candidate_contract_count": 0,
-        "suspected_duplicate_contract_count": 0,
-        "legit_duplicate_contract_count": 0,
-        "infringing_nft_count": 0,
-        "address_classification": {
-            "malicious_address_count": 0,
-            "repeat_infringing_malicious_address_count": 0,
-            "honest_address_count": 0,
-            "total_address_count": 0,
-        },
-        "behaviors": {},
-        "behavior_contract_count": 0,
-        "wash_cycle_size_distribution": [],
-        "economics": {},
-        "data_quality": {
-            "failure_record_count": failures.len() as u64,
-        },
-    });
-    write_four_scope_paper_summaries(output_dir, store, reports, &paper)
+    };
+    let all_paper = paper_for(ScopeScaleFilter::All);
+    let intra_paper = paper_for(ScopeScaleFilter::Intra);
+    let cross_paper = paper_for(ScopeScaleFilter::Cross);
+    write_four_scope_paper_summaries(
+        output_dir,
+        store,
+        reports,
+        &all_paper,
+        &intra_paper,
+        &cross_paper,
+        &BTreeMap::new(),
+    )
 }
-
-

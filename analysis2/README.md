@@ -149,8 +149,9 @@ On the next `run` with the same output dir / params, the cache is **auto-resumed
 (even without `--reuse-evidence`): already-cached candidates skip HTTP; only missing
 ones are fetched. `--reuse-evidence` makes a missing/invalid cache a hard error.
 Pagination limits must match the cache. Seed membership and API-key presence do
-not invalidate candidate-scoped evidence; matching candidate contracts are
-reused and only missing candidates are fetched.
+not invalidate candidate-scoped HTTP evidence; matching candidate contracts are
+reused, but newly introduced seed relations and failed evidence fields are
+re-probed before they can enter formal summaries.
 
 ### Fast re-run (dedup + evidence)
 
@@ -176,15 +177,27 @@ anchors, and the seeds list must match the cache or the run fails fast.
 
 - **EVM gas:** Alchemy/ETH `eth_getTransactionReceipt` → `TransferEvent.gas_native` /
   `fee_payer`; `quality.gas` Complete/Truncated/Empty/Failed/NotRequested.
-- **EVM value flows:** native EXTERNAL transfers around operator seeds →
-  `ValueFlowEdge` (Funding / Withdrawal / RevenueBackflow); Cashout vs CEX tracing is MVP-limited.
+- **EVM value flows:** full-history native EXTERNAL transfers around addresses
+  classified as operators from candidate NFT activity → `ValueFlowEdge`
+  (Funding / Withdrawal / RevenueBackflow).
+  Page-capped histories are `Truncated` and excluded from formal summaries.
+- **USD policy:** report amounts use execution-day Alchemy spot prices. Payment
+  token addresses are preferred over symbols; unpriced or peg-assumed amounts
+  remain in detail quality metadata but do not enter formal summaries.
+- **Exposure semantics:** buyer payments are reported as `paid_exposure`, not
+  realized loss. A paid mint/secondary buyer is a victim only when that address
+  has never appeared as a seller; every other observed participant is an operator.
+- **Shared candidates:** candidate-wide funding/withdrawal amounts appear in
+  every related per-seed report; all run summaries re-union formal relations and
+  count each candidate once.
 - **Solana decode:** Helius `getSignaturesForAsset` stubs → deduped `getTransaction` jsonParsed
   fills from/to/timestamp/fee and SOL value-flow edges; signature-only stubs stay Truncated.
 - **MVP gaps:** Bubblegum/compressed NFT mint completeness (no token balances → Truncated);
-  Cashout classification is coarse (often Withdrawal); enrich-time controllers may be empty so
-  operator seeds lean on mint `fee_payer`.
-- **Economics:** when `quality.gas` is Complete, Setup/Lure use operator-paid transfer gas;
-  Withdrawal/Cashout edges with known `gas_native` contribute Exit.
+  Cashout classification is coarse (often Withdrawal).
+- **Economics:** when `quality.gas` is Complete or Truncated, every observed
+  operator-paid receipt cost remains usable; missing receipts keep formal
+  completeness truncated. Withdrawal/Cashout edges with known `gas_native`
+  contribute Exit.
 
 Additional outputs vs `run-dedup`:
 

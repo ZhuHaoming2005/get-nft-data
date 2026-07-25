@@ -276,16 +276,18 @@ impl DimensionNftSets {
 
 fn rows_from_dimension_sets(
     store: &ResidentStore,
-    primary_chain: ChainId,
+    denominator_chains: impl IntoIterator<Item = ChainId>,
     mut sets: DimensionNftSets,
 ) -> Vec<DuplicateScaleRow> {
     // Image URI is supplemental to token URI within the same reporting scope.
     sets.image_uri.retain(|nft| !sets.token_uri.contains(nft));
-    let totals = store
-        .totals
-        .get(&primary_chain)
-        .cloned()
-        .unwrap_or_default();
+    let mut nft_denom = 0u64;
+    let mut contract_denom = 0u64;
+    for chain in denominator_chains {
+        let totals = store.totals.get(&chain).cloned().unwrap_or_default();
+        nft_denom += totals.nfts;
+        contract_denom += totals.contracts;
+    }
     let mut rows = Vec::with_capacity(5);
     let mut union_nfts = AHashSet::new();
     for (dimension, nfts) in [
@@ -300,8 +302,8 @@ fn rows_from_dimension_sets(
             category_name(dimension),
             nfts.len() as u64,
             contracts.len() as u64,
-            totals.nfts,
-            totals.contracts,
+            nft_denom,
+            contract_denom,
         ));
     }
     let union_contracts = contracts_for_nfts(&union_nfts, store);
@@ -309,8 +311,8 @@ fn rows_from_dimension_sets(
         "total",
         union_nfts.len() as u64,
         union_contracts.len() as u64,
-        totals.nfts,
-        totals.contracts,
+        nft_denom,
+        contract_denom,
     ));
     rows
 }
@@ -325,13 +327,21 @@ pub fn build_duplicate_scale_rows(
     matrix_secondary: Option<ChainId>,
     contract_nfts: &AHashMap<ContractId, Vec<NftId>>,
 ) -> Vec<DuplicateScaleRow> {
-    let totals = store
-        .totals
-        .get(&primary_chain)
-        .cloned()
-        .unwrap_or_default();
-    let nft_denom = totals.nfts;
-    let contract_denom = totals.contracts;
+    let denominator_chains: Vec<ChainId> = match scope {
+        ScopeKind::IntraChain => vec![primary_chain],
+        ScopeKind::ChainMatrix => matrix_secondary.into_iter().collect(),
+        ScopeKind::CrossChainSummary => (0..store.chains.len())
+            .map(|idx| idx as ChainId)
+            .filter(|chain| *chain != primary_chain)
+            .collect(),
+    };
+    let (nft_denom, contract_denom) =
+        denominator_chains
+            .into_iter()
+            .fold((0u64, 0u64), |(nfts, contracts), chain| {
+                let totals = store.totals.get(&chain).cloned().unwrap_or_default();
+                (nfts + totals.nfts, contracts + totals.contracts)
+            });
 
     let dims = dimension_sets(
         graph,
@@ -406,7 +416,7 @@ pub fn build_seed_duplicate_scale(
 
     let intra_chain = rows_from_dimension_sets(
         store,
-        primary,
+        std::iter::once(primary),
         std::mem::take(&mut by_secondary[primary as usize]),
     );
 
@@ -416,7 +426,11 @@ pub fn build_seed_duplicate_scale(
         if secondary == primary {
             continue;
         }
-        let rows = rows_from_dimension_sets(store, primary, std::mem::take(&mut by_secondary[idx]));
+        let rows = rows_from_dimension_sets(
+            store,
+            std::iter::once(secondary),
+            std::mem::take(&mut by_secondary[idx]),
+        );
         chain_matrix.push(ChainMatrixBlock {
             secondary_chain: store.chain_name(secondary).to_owned(),
             rows,
@@ -424,7 +438,13 @@ pub fn build_seed_duplicate_scale(
     }
     chain_matrix.sort_by(|a, b| a.secondary_chain.cmp(&b.secondary_chain));
 
-    let cross_chain_summary = rows_from_dimension_sets(store, primary, cross);
+    let cross_chain_summary = rows_from_dimension_sets(
+        store,
+        (0..store.chains.len())
+            .map(|idx| idx as ChainId)
+            .filter(|chain| *chain != primary),
+        cross,
+    );
 
     SeedDuplicateScale {
         intra_chain,
@@ -453,8 +473,11 @@ pub enum ScopeScaleFilter<'a> {
     Intra,
     /// Different-chain only (cross_chain_summary).
     Cross,
-    /// Cross-chain into a fixed secondary (matrix cell aggregate).
-    MatrixSecondary(&'a str),
+    /// One directional primary → secondary matrix cell.
+    Matrix {
+        primary_chain: &'a str,
+        secondary_chain: &'a str,
+    },
 }
 
 fn relation_matches(rel: &AllChainsRelationRef<'_>, filter: ScopeScaleFilter<'_>) -> bool {
@@ -463,51 +486,59 @@ fn relation_matches(rel: &AllChainsRelationRef<'_>, filter: ScopeScaleFilter<'_>
         ScopeScaleFilter::All => true,
         ScopeScaleFilter::Intra => same,
         ScopeScaleFilter::Cross => !same,
-        ScopeScaleFilter::MatrixSecondary(sec) => {
-            !same && rel.candidate_chain.eq_ignore_ascii_case(sec)
+        ScopeScaleFilter::Matrix {
+            primary_chain,
+            secondary_chain,
+        } => {
+            !same
+                && rel.seed_chain.eq_ignore_ascii_case(primary_chain)
+                && rel.candidate_chain.eq_ignore_ascii_case(secondary_chain)
         }
     }
 }
 
 fn snapshot_denominators(
     store: &ResidentStore,
-    seed_chains: &AHashSet<String>,
+    denominator_chains: &AHashSet<String>,
 ) -> (u64, u64) {
-    // Prefer sum of totals for chains that appear as seed primaries; fall back
-    // to the full multi-chain universe when none recorded.
     let mut nft_denom = 0u64;
     let mut contract_denom = 0u64;
-    if seed_chains.is_empty() {
-        for chain_id in 0..store.chains.len() {
-            let totals = store
-                .totals
-                .get(&(chain_id as ChainId))
-                .cloned()
-                .unwrap_or_default();
-            nft_denom += totals.nfts;
-            contract_denom += totals.contracts;
-        }
-        return (nft_denom, contract_denom);
-    }
-    for name in seed_chains {
+    for name in denominator_chains {
         if let Some(&cid) = store.chain_ids.get(name) {
             let totals = store.totals.get(&cid).cloned().unwrap_or_default();
             nft_denom += totals.nfts;
             contract_denom += totals.contracts;
         }
     }
-    if nft_denom == 0 && contract_denom == 0 {
-        for chain_id in 0..store.chains.len() {
-            let totals = store
-                .totals
-                .get(&(chain_id as ChainId))
-                .cloned()
-                .unwrap_or_default();
-            nft_denom += totals.nfts;
-            contract_denom += totals.contracts;
-        }
-    }
     (nft_denom, contract_denom)
+}
+
+fn denominator_chains(
+    store: &ResidentStore,
+    primary_chains: &AHashSet<String>,
+    filter: ScopeScaleFilter<'_>,
+) -> AHashSet<String> {
+    match filter {
+        ScopeScaleFilter::All => store
+            .chains
+            .iter()
+            .map(|chain| chain.to_ascii_lowercase())
+            .collect(),
+        ScopeScaleFilter::Intra => primary_chains.clone(),
+        ScopeScaleFilter::Cross => store
+            .chains
+            .iter()
+            .filter(|candidate| {
+                primary_chains
+                    .iter()
+                    .any(|primary| !candidate.eq_ignore_ascii_case(primary))
+            })
+            .map(|chain| chain.to_ascii_lowercase())
+            .collect(),
+        ScopeScaleFilter::Matrix {
+            secondary_chain, ..
+        } => std::iter::once(secondary_chain.to_ascii_lowercase()).collect(),
+    }
 }
 
 /// Batch-level duplicate scale for one reporting scope (set-union numerators).
@@ -516,15 +547,33 @@ pub fn build_scope_duplicate_scale<'a>(
     relations: impl IntoIterator<Item = AllChainsRelationRef<'a>>,
     filter: ScopeScaleFilter<'_>,
 ) -> Vec<DuplicateScaleRow> {
-    let mut seed_chains: AHashSet<String> = AHashSet::new();
+    let relations: Vec<_> = relations.into_iter().collect();
+    let primary_chains = relations
+        .iter()
+        .map(|rel| rel.seed_chain.to_ascii_lowercase())
+        .collect();
+    build_scope_duplicate_scale_for_chains(store, relations, filter, &primary_chains)
+}
+
+/// Batch-level duplicate scale with an explicit formal-primary universe.
+///
+/// Denominators are independent of positive hits. Numerators always identify
+/// candidate-side NFTs/contracts, so cross/matrix denominators use candidate
+/// chain snapshot totals.
+pub fn build_scope_duplicate_scale_for_chains<'a>(
+    store: &ResidentStore,
+    relations: impl IntoIterator<Item = AllChainsRelationRef<'a>>,
+    filter: ScopeScaleFilter<'_>,
+    primary_chains: &AHashSet<String>,
+) -> Vec<DuplicateScaleRow> {
     let mut filtered: Vec<AllChainsRelationRef<'a>> = Vec::new();
     for rel in relations {
         if relation_matches(&rel, filter) {
-            seed_chains.insert(rel.seed_chain.to_ascii_lowercase());
             filtered.push(rel);
         }
     }
-    let (nft_denom, contract_denom) = snapshot_denominators(store, &seed_chains);
+    let denominator_chains = denominator_chains(store, primary_chains, filter);
+    let (nft_denom, contract_denom) = snapshot_denominators(store, &denominator_chains);
 
     let mut token_uri_nfts = AHashSet::new();
     let mut image_uri_nfts = AHashSet::new();

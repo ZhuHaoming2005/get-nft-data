@@ -39,7 +39,7 @@ pub fn select_documents(
 
 #[cfg(test)]
 mod tests {
-    use super::{select_documents, AnchorRef};
+    use super::{AnchorRef, select_documents};
 
     fn refs(pairs: &[(u32, u32)]) -> Vec<AnchorRef> {
         pairs
@@ -56,20 +56,14 @@ mod tests {
         // Descending token keys 3,2,1 on left; 4,3,1 on right → shared 3 then 1 → pick 3.
         let left = refs(&[(3, 30), (2, 20), (1, 10)]);
         let right = refs(&[(4, 41), (3, 31), (1, 11)]);
-        assert_eq!(
-            select_documents(true, &left, true, &right),
-            Some((30, 31))
-        );
+        assert_eq!(select_documents(true, &left, true, &right), Some((30, 31)));
     }
 
     #[test]
     fn no_shared_token_uses_both_max_documents() {
         let left = refs(&[(2, 20), (1, 10)]);
         let right = refs(&[(4, 40), (3, 30)]);
-        assert_eq!(
-            select_documents(true, &left, true, &right),
-            Some((20, 40))
-        );
+        assert_eq!(select_documents(true, &left, true, &right), Some((20, 40)));
     }
 
     #[test]
@@ -81,10 +75,7 @@ mod tests {
             select_documents(false, &left, false, &right),
             Some((90, 91))
         );
-        assert_eq!(
-            select_documents(true, &left, false, &right),
-            Some((90, 91))
-        );
+        assert_eq!(select_documents(true, &left, false, &right), Some((90, 91)));
     }
 
     #[test]

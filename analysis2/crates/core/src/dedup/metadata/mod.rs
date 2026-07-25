@@ -90,8 +90,13 @@ impl MetadataSeedQuery<'_> {
                 let right = &self.index.documents[right_doc as usize];
                 let left_terms = self.index.document_terms(left_doc);
                 let right_terms = self.index.document_terms(right_doc);
-                let score =
-                    similarity_score_if_at_least(left, left_terms, right, right_terms, self.threshold);
+                let score = similarity_score_if_at_least(
+                    left,
+                    left_terms,
+                    right,
+                    right_terms,
+                    self.threshold,
+                );
                 score_cache.insert(cache_key, score);
                 score?
             }

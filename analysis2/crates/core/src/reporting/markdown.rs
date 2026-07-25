@@ -41,17 +41,26 @@ fn u64_cell(v: &Value) -> String {
     }
 }
 
+fn percent_value(ratio: f64) -> String {
+    let percent = ratio * 100.0;
+    if percent == 0.0 || percent.abs() >= 0.01 {
+        format!("{percent:.2}%")
+    } else {
+        format!("{percent:.6}%")
+    }
+}
+
 fn pct_cell(ratio: &Value, numer: &Value, denom: &Value) -> String {
     match ratio.as_f64() {
         Some(r) if denom.as_u64().unwrap_or(0) > 0 || denom.as_f64().unwrap_or(0.0) > 0.0 => {
             format!(
-                "{:.2}% ({}/{})",
-                r * 100.0,
+                "{} ({}/{})",
+                percent_value(r),
                 u64_cell(numer),
                 u64_cell(denom)
             )
         }
-        Some(r) => format!("{:.2}%", r * 100.0),
+        Some(r) => percent_value(r),
         None => "null".into(),
     }
 }
@@ -65,8 +74,8 @@ fn scale_table(rows: &[DuplicateScaleRow]) -> String {
             .duplicate_nft_ratio
             .map(|v| {
                 format!(
-                    "{:.2}% ({}/{})",
-                    v * 100.0,
+                    "{} ({}/{})",
+                    percent_value(v),
                     row.duplicate_nft_ratio_numerator,
                     row.duplicate_nft_ratio_denominator
                 )
@@ -76,8 +85,8 @@ fn scale_table(rows: &[DuplicateScaleRow]) -> String {
             .duplicate_contract_ratio
             .map(|v| {
                 format!(
-                    "{:.2}% ({}/{})",
-                    v * 100.0,
+                    "{} ({}/{})",
+                    percent_value(v),
                     row.duplicate_contract_ratio_numerator,
                     row.duplicate_contract_ratio_denominator
                 )
@@ -160,7 +169,7 @@ pub fn write_seed_full_report_md(
     ));
     if let Some(a) = &report.analysis {
         body.push_str(&format!(
-            "- suspected_duplicate_contract_count: {}\n- legit_duplicate_contract_count: {}\n- infringing_nft_count: {}\n- honest_loss_usd: {}\n- operator_output_usd: {}\n",
+            "- suspected_duplicate_contract_count: {}\n- legit_duplicate_contract_count: {}\n- infringing_nft_count: {}\n- honest_paid_exposure_usd: {}\n- operator_output_usd: {}\n",
             a.suspected_duplicate_contract_count,
             a.legit_duplicate_contract_count,
             a.infringing_nft_count,
@@ -243,8 +252,8 @@ pub fn write_all_chains_md(
                 let c_n = u64_cell(&row["duplicate_contract_count"]);
                 let nft_ratio = match row["duplicate_nft_ratio"].as_f64() {
                     Some(r) => format!(
-                        "{:.2}% ({}/{})",
-                        r * 100.0,
+                        "{} ({}/{})",
+                        percent_value(r),
                         u64_cell(&row["duplicate_nft_ratio_numerator"]),
                         u64_cell(&row["duplicate_nft_ratio_denominator"])
                     ),
@@ -252,8 +261,8 @@ pub fn write_all_chains_md(
                 };
                 let c_ratio = match row["duplicate_contract_ratio"].as_f64() {
                     Some(r) => format!(
-                        "{:.2}% ({}/{})",
-                        r * 100.0,
+                        "{} ({}/{})",
+                        percent_value(r),
                         u64_cell(&row["duplicate_contract_ratio_numerator"]),
                         u64_cell(&row["duplicate_contract_ratio_denominator"])
                     ),
@@ -278,18 +287,22 @@ pub fn write_all_chains_md(
     // Matrix: additional per-secondary-chain scale tables.
     if let Some(blocks) = summary.get("matrix_blocks").and_then(|v| v.as_array()) {
         for block in blocks {
+            let primary = block
+                .get("primary_chain")
+                .and_then(|v| v.as_str())
+                .unwrap_or("?");
             let sec = block
                 .get("secondary_chain")
                 .and_then(|v| v.as_str())
                 .unwrap_or("?");
-            body.push_str(&format!("\n### Matrix → {sec}\n\n"));
+            body.push_str(&format!("\n### Matrix {primary} → {sec}\n\n"));
             if let Some(rows) = block.get("rows").and_then(|v| v.as_array()) {
                 body.push_str("| 类别 | 重复 NFT 数 | NFT 占比 | 重复合约数 | 合约占比 |\n| --- | ---: | ---: | ---: | ---: |\n");
                 for row in rows {
                     let nft_ratio = match row["duplicate_nft_ratio"].as_f64() {
                         Some(r) => format!(
-                            "{:.2}% ({}/{})",
-                            r * 100.0,
+                            "{} ({}/{})",
+                            percent_value(r),
                             u64_cell(&row["duplicate_nft_ratio_numerator"]),
                             u64_cell(&row["duplicate_nft_ratio_denominator"])
                         ),
@@ -297,8 +310,8 @@ pub fn write_all_chains_md(
                     };
                     let c_ratio = match row["duplicate_contract_ratio"].as_f64() {
                         Some(r) => format!(
-                            "{:.2}% ({}/{})",
-                            r * 100.0,
+                            "{} ({}/{})",
+                            percent_value(r),
                             u64_cell(&row["duplicate_contract_ratio_numerator"]),
                             u64_cell(&row["duplicate_contract_ratio_denominator"])
                         ),
@@ -314,7 +327,28 @@ pub fn write_all_chains_md(
                     ));
                 }
             }
+            if let Some(direction) = block.get("summary") {
+                let econ = &direction["economics"];
+                body.push_str("\n| 候选合约 | 疑似合约 | 侵权 NFT | 行为合约 | 攻击者产出 USD | 买家损失 USD | Gas USD |\n| ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n");
+                body.push_str(&format!(
+                    "| {} | {} | {} | {} | {} | {} | {} |\n",
+                    u64_cell(&direction["candidate_contract_count"]),
+                    u64_cell(&direction["suspected_duplicate_contract_count"]),
+                    u64_cell(&direction["infringing_nft_count"]),
+                    u64_cell(&direction["behavior_contract_count"]),
+                    f64_cell(&econ["operator_output_usd"]),
+                    f64_cell(&econ["honest_paid_exposure_usd"]),
+                    f64_cell(&econ["total_gas_usd"]),
+                ));
+            }
         }
+    }
+
+    if summary["analysis_available"].as_bool() == Some(false) {
+        body.push_str(
+            "\n## 深度分析\n\n_该产物来自 run-dedup，仅包含去重规模与候选数量；合法性、行为、地址和经济统计未执行，因此不以 0 代替缺失结果。_\n",
+        );
+        return write_text(path, &body);
     }
 
     // ## 地址分类
@@ -329,30 +363,50 @@ pub fn write_all_chains_md(
         u64_cell(&addr["total_address_count"]),
     ));
 
-    // ## 攻击者成本 (native gas; multi-chain USD gas not summed)
+    // ## 攻击者成本（all monetary fields use run-time USD prices）
     let econ = &summary["economics"];
     body.push_str("\n## 攻击者成本\n\n");
     body.push_str(
-        "| cost | Setup Gas (native) | Lure Gas (native) | Exit Gas (native) | Total Gas (native) | 攻击投入集中度 |\n| --- | ---: | ---: | ---: | ---: | ---: |\n",
+        "| cost | Setup Gas (USD) | Lure Gas (USD) | Exit Gas (USD) | Total Gas (USD) | 攻击投入集中度 |\n| --- | ---: | ---: | ---: | ---: | ---: |\n",
     );
     let conc = match econ["top_contract_gas_contribution_ratio"].as_f64() {
         Some(r) => format!(
-            "{:.2}% ({}/{})",
-            r * 100.0,
-            f64_cell(&econ["top_contract_gas_contribution_numerator"]),
-            f64_cell(&econ["top_contract_gas_contribution_denominator"])
+            "{} ({}/{})",
+            percent_value(r),
+            f64_cell(&econ["top_contract_gas_contribution_numerator_usd"]),
+            f64_cell(&econ["top_contract_gas_contribution_denominator_usd"])
         ),
         None => "null".into(),
     };
     body.push_str(&format!(
         "| gas | {} | {} | {} | {} | {} |\n",
-        f64_cell(&econ["setup_gas_native"]),
-        f64_cell(&econ["lure_gas_native"]),
-        f64_cell(&econ["exit_gas_native"]),
-        f64_cell(&econ["total_gas_native"]),
+        f64_cell(&econ["setup_gas_usd"]),
+        f64_cell(&econ["lure_gas_usd"]),
+        f64_cell(&econ["exit_gas_usd"]),
+        f64_cell(&econ["total_gas_usd"]),
         conc,
     ));
-    body.push_str("\n> 说明：跨链汇总只可靠加总 USD；gas 按各链 native 单位分别累计展示，不混加为 ETH。\n");
+    body.push_str(
+        "\n> 说明：所有金额均按程序执行时取得的现价换算为 USD；无法定价的支付不会按 0 USD 计入。\n",
+    );
+    if econ["usd_valuation_complete"].as_bool() == Some(false) {
+        body.push_str(
+            "\n> 警告：本范围存在无法取得执行日价格的交易或 Gas；USD 金额是已定价子集，不应解释为完整总额。\n",
+        );
+    }
+
+    body.push_str("\n## 成交与操作者产出\n\n");
+    body.push_str(
+        "| 成交总额 USD | 市场协议费 USD | 创作者版税 USD | 操作者收到的版税 USD | 操作者总产出 USD |\n| ---: | ---: | ---: | ---: | ---: |\n",
+    );
+    body.push_str(&format!(
+        "| {} | {} | {} | {} | {} |\n",
+        f64_cell(&econ["gross_sales_volume_usd"]),
+        f64_cell(&econ["marketplace_fee_usd"]),
+        f64_cell(&econ["royalty_fee_usd"]),
+        f64_cell(&econ["operator_royalty_usd"]),
+        f64_cell(&econ["operator_output_usd"]),
+    ));
 
     // ## 产出投入比 (USD/USD only; contracts without priced gas excluded from counts)
     body.push_str("\n## 产出投入比\n\n");
@@ -365,8 +419,8 @@ pub fn write_all_chains_md(
     };
     let ge1 = match econ["output_input_ratio_ge1_share"].as_f64() {
         Some(r) => format!(
-            "{:.2}% ({}/{})",
-            r * 100.0,
+            "{} ({}/{})",
+            percent_value(r),
             u64_cell(&econ["output_input_ratio_ge1_count"]),
             u64_cell(&econ["output_input_ratio_count"])
         ),
@@ -374,8 +428,8 @@ pub fn write_all_chains_md(
     };
     let lt1 = match econ["output_input_ratio_lt1_share"].as_f64() {
         Some(r) => format!(
-            "{:.2}% ({}/{})",
-            r * 100.0,
+            "{} ({}/{})",
+            percent_value(r),
             u64_cell(&econ["output_input_ratio_lt1_count"]),
             u64_cell(&econ["output_input_ratio_count"])
         ),
@@ -383,29 +437,35 @@ pub fn write_all_chains_md(
     };
     body.push_str(&format!(
         "| total | {} | {} | {} | {} | {} |\n",
-        f64_cell(&econ["operator_output_usd"]),
-        f64_cell(&econ["inferred_input_usd"]),
+        f64_cell(&econ["ratio_operator_output_usd"]),
+        f64_cell(&econ["attacker_input_usd"]),
         ratio_s,
         ge1,
         lt1,
     ));
+    body.push_str(&format!(
+        "\n- candidate/operator funding_usd: {}\n- operator_internal_backflow_usd: {}\n- candidate/operator withdrawal_usd: {}\n",
+        f64_cell(&econ["funding_usd"]),
+        f64_cell(&econ["revenue_backflow_usd"]),
+        f64_cell(&econ["withdrawal_usd"])
+    ));
 
-    // ## 诚实买家损失
+    // ## 诚实买家付费暴露
     let infringing = u64_cell(&summary["infringing_nft_count"]);
     let stuck = u64_cell(&econ["stuck_nft_count"]);
     let stuck_ratio = match econ["stuck_nft_ratio"].as_f64() {
-        Some(r) => format!("{:.2}% ({stuck}/{infringing})", r * 100.0),
+        Some(r) => format!("{} ({stuck}/{infringing})", percent_value(r)),
         None => format!("n/a ({stuck}/{infringing})"),
     };
-    body.push_str("\n## 诚实买家损失\n\n");
+    body.push_str("\n## 诚实买家付费暴露\n\n");
     body.push_str(
-        "| 套牢 NFT | NFT 套牢占比 | 二级市场损失 USD | 付费 mint 损失 USD | 总损失 USD |\n| ---: | ---: | ---: | ---: | ---: |\n",
+        "| 套牢 NFT | NFT 套牢占比 | 二级市场付费暴露 USD | 付费 mint 暴露 USD | 总付费暴露 USD |\n| ---: | ---: | ---: | ---: | ---: |\n",
     );
     body.push_str(&format!(
         "| {stuck} | {stuck_ratio} | {} | {} | {} |\n",
-        f64_cell(&econ["secondary_sale_loss_usd"]),
-        f64_cell(&econ["paid_mint_loss_usd"]),
-        f64_cell(&econ["honest_loss_usd"]),
+        f64_cell(&econ["secondary_sale_paid_exposure_usd"]),
+        f64_cell(&econ["paid_mint_exposure_usd"]),
+        f64_cell(&econ["honest_paid_exposure_usd"]),
     ));
 
     // ## 恶意行为汇总
@@ -419,7 +479,7 @@ pub fn write_all_chains_md(
         )
     ));
     body.push_str(
-        "| 行为 | 合约数 | 覆盖率 | 实例数 | 行为占比 | 地址数 | NFT 数 | 关联买家 | 关联损失 USD |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| 行为 | 合约数 | 覆盖率 | 实例数 | 行为占比 | 地址数 | NFT 数 | 关联买家 | 关联付费暴露 USD |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
     let suspected = summary["suspected_duplicate_contract_count"]
         .as_u64()
@@ -441,13 +501,13 @@ pub fn write_all_chains_md(
             };
             let contracts = u64_cell(&row["contract_count"]);
             let coverage = match row.get("contract_coverage_ratio").and_then(|v| v.as_f64()) {
-                Some(r) => format!("{:.2}% ({contracts}/{suspected})", r * 100.0),
+                Some(r) => format!("{} ({contracts}/{suspected})", percent_value(r)),
                 None if key == "total" => format!("n/a ({contracts}/{suspected})"),
                 None => "null".into(),
             };
             let instances = u64_cell(&row["instance_count"]);
             let inst_ratio = match row.get("instance_ratio").and_then(|v| v.as_f64()) {
-                Some(r) => format!("{:.2}%", r * 100.0),
+                Some(r) => percent_value(r),
                 None if key == "total" => "100.00%".into(),
                 None => "null".into(),
             };
@@ -461,7 +521,7 @@ pub fn write_all_chains_md(
                 u64_cell(&row["address_count"]),
                 u64_cell(&row["nft_count"]),
                 u64_cell(&row["linked_buyer_count"]),
-                f64_cell(&row["linked_loss_usd"]),
+                f64_cell(&row["linked_paid_exposure_usd"]),
             ));
         }
     }
@@ -492,19 +552,51 @@ pub fn write_all_chains_md(
 
     // ## 数据质量
     let dq = &summary["data_quality"];
+    let gas = &dq["evidence"]["gas"];
+    let pricing = &dq["pricing"];
+    let dimensions = &dq["dedup_dimensions"];
     body.push_str("\n## 数据质量\n\n");
     body.push_str(&format!(
-        "- 代表候选样本数: {}\n- 候选合约数: {}\n- 疑似重复合约数: {}\n- 官方参与型重复合约数: {}\n- 疑似侵权 NFT 数: {}\n- gas 证据 Complete/Empty/Failed/Truncated/NotRequested: {} / {} / {} / {} / {}\n- failure_record_count: {}\n",
+        "- 代表候选 NFT 数: {}\n- 候选合约数: {}\n- 疑似重复合约数: {}\n- 官方参与型重复合约数: {}\n- 疑似侵权 NFT 数: {}\n- 合法关系验证 Complete/Incomplete: {} / {}\n- gas 证据 Complete/Empty/Failed/Truncated/NotRequested: {} / {} / {} / {} / {}\n- 销售定价 Priced/Unpriced/Amountless/AssumedPeg/Total: {} / {} / {} / {} / {}\n- 操作者销售净收入 Priced/Unpriced/Unknown/Total: {} / {} / {} / {}\n- 版税接收方 Unknown: {}\n- 操作者付费 mint 收入 Priced/Unpriced/Operator/AllPaid/UnknownReceiver: {} / {} / {} / {} / {}\n- 诚实买家付费 mint 损失定价 Priced/Unpriced/Total: {} / {} / {}\n- Gas 成本定价 Priced/Unpriced/Total: {} / {} / {}\n- 操作者产出完整: {}\n- USD 估值完整: {}\n- 去重维度 token_uri/image_uri/metadata/name: {} / {} / {} / {}\n- failure_record_count: {}\n",
         u64_cell(dq.get("representative_candidate_count").unwrap_or(&summary["representative_candidate_count"])),
         u64_cell(dq.get("candidate_contract_count").unwrap_or(&summary["candidate_contract_count"])),
         u64_cell(dq.get("suspected_duplicate_contract_count").unwrap_or(&summary["suspected_duplicate_contract_count"])),
         u64_cell(dq.get("legit_duplicate_contract_count").unwrap_or(&summary["legit_duplicate_contract_count"])),
         u64_cell(dq.get("infringing_nft_count").unwrap_or(&summary["infringing_nft_count"])),
-        u64_cell(&dq["gas_evidence_complete"]),
-        u64_cell(&dq["gas_evidence_empty"]),
-        u64_cell(&dq["gas_evidence_failed"]),
-        u64_cell(&dq["gas_evidence_truncated"]),
-        u64_cell(&dq["gas_evidence_not_requested"]),
+        u64_cell(&dq["legit_relation_verification_complete"]),
+        u64_cell(&dq["legit_relation_verification_incomplete"]),
+        u64_cell(&gas["complete"]),
+        u64_cell(&gas["empty"]),
+        u64_cell(&gas["failed"]),
+        u64_cell(&gas["truncated"]),
+        u64_cell(&gas["not_requested"]),
+        u64_cell(&pricing["priced_sale_count"]),
+        u64_cell(&pricing["unpriced_sale_count"]),
+        u64_cell(&pricing["amountless_sale_count"]),
+        u64_cell(&pricing["assumed_stablecoin_peg_sale_count"]),
+        u64_cell(&pricing["sale_count"]),
+        u64_cell(&pricing["priced_operator_sale_proceeds_count"]),
+        u64_cell(&pricing["unpriced_operator_sale_proceeds_count"]),
+        u64_cell(&pricing["unknown_operator_sale_proceeds_count"]),
+        u64_cell(&pricing["operator_sale_count"]),
+        u64_cell(&pricing["unknown_royalty_recipient_count"]),
+        u64_cell(&pricing["priced_operator_paid_mint_payment_count"]),
+        u64_cell(&pricing["unpriced_operator_paid_mint_payment_count"]),
+        u64_cell(&pricing["operator_paid_mint_payment_count"]),
+        u64_cell(&pricing["paid_mint_payment_count"]),
+        u64_cell(&pricing["unknown_paid_mint_receiver_count"]),
+        u64_cell(&pricing["priced_honest_paid_mint_exposure_count"]),
+        u64_cell(&pricing["unpriced_honest_paid_mint_exposure_count"]),
+        u64_cell(&pricing["honest_paid_mint_exposure_count"]),
+        u64_cell(&pricing["priced_gas_cost_contract_count"]),
+        u64_cell(&pricing["unpriced_gas_cost_contract_count"]),
+        u64_cell(&pricing["gas_cost_contract_count"]),
+        pricing["operator_output_complete"],
+        pricing["usd_valuation_complete"],
+        dimensions["token_uri_enabled"],
+        dimensions["image_uri_enabled"],
+        dimensions["metadata_enabled"],
+        dimensions["name_enabled"],
         u64_cell(&dq["failure_record_count"]),
     ));
 

@@ -2,9 +2,9 @@
 
 use serde_json::Value;
 
-use super::alchemy::{normalize_token_id, FetchOutcome};
+use super::alchemy::{FetchOutcome, normalize_token_id};
 use super::http::HttpClient;
-use super::types::{now_unix, EvidenceObservation, EvidenceStatus, TransferEvent};
+use super::types::{EvidenceObservation, EvidenceStatus, TransferEvent, now_unix};
 
 fn etherscan_chain_id(chain: &str) -> Option<&'static str> {
     match chain {
@@ -64,7 +64,9 @@ pub async fn fetch_transfers(
                     .get("message")
                     .and_then(Value::as_str)
                     .unwrap_or("empty etherscan result");
-                if message.eq_ignore_ascii_case("OK") || message.eq_ignore_ascii_case("No transactions found") {
+                if message.eq_ignore_ascii_case("OK")
+                    || message.eq_ignore_ascii_case("No transactions found")
+                {
                     break;
                 }
                 return FetchOutcome::failed("etherscan", "etherscan_transfers", message);
@@ -145,7 +147,8 @@ pub fn parse_etherscan_transfer(item: &Value, fallback_contract: &str) -> Transf
         is_mint,
         gas_native: None,
         fee_payer: None,
-            mint_payment_native: None,
-            mint_payment_usd: None,
+        mint_payment_native: None,
+        mint_payment_usd: None,
+        mint_payment_receiver: None,
     }
 }

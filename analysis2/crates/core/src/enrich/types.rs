@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use crate::entity::ContractId;
 
 /// Distinct quality states for provider fetches.
-#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum EvidenceStatus {
     #[default]
@@ -55,12 +57,23 @@ pub enum ValueFlowKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ValueFlowEdge {
     pub tx_hash: String,
+    /// Provider-stable event identity within the transaction (instruction,
+    /// trace, or transfer id). Required to distinguish multiple real transfers
+    /// sharing the same transaction and endpoints.
+    #[serde(default)]
+    pub event_id: Option<String>,
     pub from: String,
     pub to: String,
     pub kind: ValueFlowKind,
     pub native_amount: Option<f64>,
     pub usd_amount: Option<f64>,
     pub timestamp: Option<i64>,
+    /// Transaction fee paid for this money-flow transaction, when decoded.
+    #[serde(default)]
+    pub gas_native: Option<f64>,
+    /// Fee payer used to decide whether the fee is an operator cost.
+    #[serde(default)]
+    pub fee_payer: Option<String>,
 }
 
 /// Normalized NFT transfer / mint event.
@@ -83,10 +96,13 @@ pub struct TransferEvent {
     /// USD conversion of [`mint_payment_native`] via run-time spot prices.
     #[serde(default)]
     pub mint_payment_usd: Option<f64>,
+    /// Payment recipient for the paid mint, when the same transaction exposes it.
+    #[serde(default)]
+    pub mint_payment_receiver: Option<String>,
 }
 
 /// Normalized NFT sale / market activity event.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct SaleEvent {
     pub tx_hash: String,
     pub token_id: String,
@@ -98,6 +114,55 @@ pub struct SaleEvent {
     pub native_amount: Option<f64>,
     pub usd_amount: Option<f64>,
     pub currency_symbol: Option<String>,
+    /// Payment-token contract/mint when the provider exposes it.
+    ///
+    /// `None` is valid for a chain-native payment. Non-native symbols without
+    /// this identity are priced only when the symbol quote is unambiguous.
+    #[serde(default)]
+    pub currency_address: Option<String>,
+    /// Exact payment amount in the payment token's smallest unit when supplied
+    /// by the provider. Used for price-sensitive ERC-2981 `royaltyInfo` calls.
+    #[serde(default)]
+    pub sale_price_raw: Option<String>,
+    /// Seller net proceeds when provider fee breakdown is available.
+    #[serde(default)]
+    pub seller_proceeds_native: Option<f64>,
+    #[serde(default)]
+    pub seller_proceeds_usd: Option<f64>,
+    /// Marketplace/protocol fee split when supplied by the sale provider.
+    #[serde(default)]
+    pub marketplace_fee_native: Option<f64>,
+    #[serde(default)]
+    pub marketplace_fee_usd: Option<f64>,
+    #[serde(default)]
+    pub marketplace_fee_currency_symbol: Option<String>,
+    #[serde(default)]
+    pub marketplace_fee_currency_address: Option<String>,
+    /// Creator royalty split and recipient when provable.
+    #[serde(default)]
+    pub royalty_fee_native: Option<f64>,
+    #[serde(default)]
+    pub royalty_fee_usd: Option<f64>,
+    #[serde(default)]
+    pub royalty_fee_currency_symbol: Option<String>,
+    #[serde(default)]
+    pub royalty_fee_currency_address: Option<String>,
+    #[serde(default)]
+    pub royalty_recipient: Option<String>,
+    /// Receipt fee for the sale transaction.
+    #[serde(default)]
+    pub gas_native: Option<f64>,
+    #[serde(default)]
+    pub fee_payer: Option<String>,
+}
+
+/// Contract-creation transaction evidence used for Setup gas and lifecycle timing.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+pub struct DeploymentEvent {
+    pub tx_hash: String,
+    pub timestamp: Option<i64>,
+    pub gas_native: Option<f64>,
+    pub fee_payer: Option<String>,
 }
 
 /// Holder balance for one token (or owner for Solana mint).
@@ -114,6 +179,8 @@ pub struct PriceBucket {
     pub chain: String,
     pub day_utc: i64,
     pub symbol: String,
+    #[serde(default)]
+    pub token_address: Option<String>,
     pub usd_per_native: f64,
 }
 
@@ -121,6 +188,8 @@ pub struct PriceBucket {
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LegitSignals {
+    /// The seed collection permits unrestricted reuse (CC0 / public domain).
+    pub seed_open_license: bool,
     pub verified_migration: bool,
     pub authorized_reissue: bool,
     pub official_controller_continuity: bool,
@@ -134,7 +203,8 @@ pub struct LegitSignals {
 
 impl LegitSignals {
     pub fn is_legit_duplicate(&self) -> bool {
-        self.verified_migration
+        self.seed_open_license
+            || self.verified_migration
             || self.authorized_reissue
             || self.official_controller_continuity
             || self.official_collection_relation
@@ -143,6 +213,7 @@ impl LegitSignals {
 
     /// Merge another relation's signals (OR flags, union evidence keys).
     pub fn merge_or(&mut self, other: &LegitSignals) {
+        self.seed_open_license |= other.seed_open_license;
         self.verified_migration |= other.verified_migration;
         self.authorized_reissue |= other.authorized_reissue;
         self.official_controller_continuity |= other.official_controller_continuity;
@@ -196,8 +267,8 @@ pub struct EvidenceBundle {
     pub provenance: Vec<EvidenceObservation>,
     /// Known controllers / collection authorities (operator seeds for attribution).
     pub controllers: Vec<String>,
+    pub deployment: Option<DeploymentEvent>,
     pub deployment_timestamp: Option<i64>,
-    pub duplicate_content_timestamp: Option<i64>,
     pub legit: LegitSignals,
     /// Per-seed relation signals keyed by `"chain:address"`.
     #[serde(default)]
@@ -211,7 +282,11 @@ impl Default for EvidenceBundle {
 }
 
 impl EvidenceBundle {
-    pub fn empty(contract_id: ContractId, chain: impl Into<String>, address: impl Into<String>) -> Self {
+    pub fn empty(
+        contract_id: ContractId,
+        chain: impl Into<String>,
+        address: impl Into<String>,
+    ) -> Self {
         Self {
             contract_id,
             chain: chain.into(),
@@ -224,8 +299,8 @@ impl EvidenceBundle {
             quality: EvidenceQuality::default(),
             provenance: Vec::new(),
             controllers: Vec::new(),
+            deployment: None,
             deployment_timestamp: None,
-            duplicate_content_timestamp: None,
             legit: LegitSignals::default(),
             relation_legit: std::collections::BTreeMap::new(),
         }
@@ -239,6 +314,54 @@ impl EvidenceBundle {
         self.provenance.clear();
         self.provenance.shrink_to_fit();
     }
+
+    /// Clone contract-wide evidence for a reporting scope and retain only that
+    /// scope's seed-relation classifications.
+    ///
+    /// Duplicate detection is contract-level: once a candidate contract is hit
+    /// in a scope, every NFT in that contract has equal standing in deep
+    /// analysis. `token_ids` remains part of the selector API because callers
+    /// use it to decide whether the contract belongs to a scope, but it must not
+    /// narrow transfers, sales, or holders inside an included contract.
+    pub fn filtered_for_analysis(
+        &self,
+        _token_ids: &ahash::AHashSet<String>,
+        seed_keys: &ahash::AHashSet<String>,
+    ) -> Self {
+        let mut scoped = self.clone();
+        scoped
+            .relation_legit
+            .retain(|seed_key, _| seed_keys.contains(seed_key));
+        scoped.legit = LegitSignals::default();
+        finalize_legit_signals(&mut scoped);
+        scoped
+    }
+}
+
+/// Chain-aware address normalization.
+///
+/// EVM addresses are case-insensitive; Solana base58 public keys are not.
+pub fn normalize_chain_address(chain: &str, address: &str) -> String {
+    let address = address.trim();
+    if chain.trim().eq_ignore_ascii_case("solana") {
+        address.to_owned()
+    } else {
+        address.to_ascii_lowercase()
+    }
+}
+
+/// Normalize transaction identifiers without corrupting case-sensitive Solana
+/// signatures. EVM hashes are hexadecimal and compare case-insensitively.
+pub fn normalize_chain_transaction(chain: &str, tx_hash: &str) -> String {
+    if chain.trim().eq_ignore_ascii_case("solana") {
+        tx_hash.trim().to_owned()
+    } else {
+        tx_hash.trim().to_ascii_lowercase()
+    }
+}
+
+pub fn chain_addresses_equal(chain: &str, left: &str, right: &str) -> bool {
+    normalize_chain_address(chain, left) == normalize_chain_address(chain, right)
 }
 
 /// API keys for enrichment providers. Empty / missing → `not_requested`.
@@ -391,9 +514,107 @@ mod tests {
     fn finalize_legit_marks_complete_when_positive_signal_present() {
         let mut bundle = EvidenceBundle::empty(1, "ethereum", "0xabc");
         bundle.legit.official_collection_relation = true;
-        bundle.legit.evidence_keys.push("collection:official".into());
+        bundle
+            .legit
+            .evidence_keys
+            .push("collection:official".into());
         finalize_legit_signals(&mut bundle);
         assert!(bundle.legit.is_legit_duplicate());
         assert!(bundle.legit.verification_complete);
+    }
+
+    #[test]
+    fn filtered_analysis_keeps_contract_wide_nft_evidence_and_scope_relations() {
+        let mut bundle = EvidenceBundle::empty(1, "ethereum", "0xcand");
+        let transfer = |tx: &str, token: &str| TransferEvent {
+            tx_hash: tx.into(),
+            token_id: token.into(),
+            from: "0xa".into(),
+            to: "0xb".into(),
+            timestamp: Some(1),
+            block_number: Some(1),
+            is_mint: false,
+            gas_native: None,
+            fee_payer: None,
+            mint_payment_native: None,
+            mint_payment_usd: None,
+            mint_payment_receiver: None,
+        };
+        bundle.transfers = vec![transfer("hit-tx", "1"), transfer("other-tx", "2")];
+        bundle.sales = ["1", "2"]
+            .into_iter()
+            .map(|token_id| SaleEvent {
+                tx_hash: format!("sale-{token_id}"),
+                token_id: token_id.into(),
+                seller: "0xseller".into(),
+                buyer: "0xbuyer".into(),
+                native_amount: Some(1.0),
+                ..SaleEvent::default()
+            })
+            .collect();
+        bundle.holders = vec![
+            HolderRecord {
+                token_id: "1".into(),
+                owner: "0xb".into(),
+                balance: Some(1),
+            },
+            HolderRecord {
+                token_id: "2".into(),
+                owner: "0xc".into(),
+                balance: Some(1),
+            },
+        ];
+        bundle.value_flows = vec![
+            ValueFlowEdge {
+                tx_hash: "hit-tx".into(),
+                event_id: None,
+                from: "0xa".into(),
+                to: "0xb".into(),
+                kind: ValueFlowKind::RevenueBackflow,
+                native_amount: Some(1.0),
+                usd_amount: Some(2_000.0),
+                timestamp: Some(1),
+                gas_native: None,
+                fee_payer: None,
+            },
+            ValueFlowEdge {
+                tx_hash: "unrelated".into(),
+                event_id: None,
+                from: "0xa".into(),
+                to: "0xc".into(),
+                kind: ValueFlowKind::Withdrawal,
+                native_amount: Some(9.0),
+                usd_amount: Some(18_000.0),
+                timestamp: Some(2),
+                gas_native: None,
+                fee_payer: None,
+            },
+        ];
+        bundle.relation_legit.insert(
+            "ethereum:0xseed".into(),
+            LegitSignals {
+                verified_migration: true,
+                verification_complete: true,
+                ..Default::default()
+            },
+        );
+        bundle
+            .relation_legit
+            .insert("base:0xother".into(), LegitSignals::default());
+
+        let filtered = bundle.filtered_for_analysis(
+            &["1".to_owned()].into_iter().collect(),
+            &["ethereum:0xseed".to_owned()].into_iter().collect(),
+        );
+        // A contract-level hit includes every NFT event/holder in the candidate,
+        // even when only token 1 produced the original duplicate edge.
+        assert_eq!(filtered.transfers.len(), 2);
+        assert_eq!(filtered.sales.len(), 2);
+        assert_eq!(filtered.holders.len(), 2);
+        // Candidate-wide money flows are copied into every related seed scope;
+        // the run summary de-duplicates them by on-chain event.
+        assert_eq!(filtered.value_flows.len(), 2);
+        assert_eq!(filtered.relation_legit.len(), 1);
+        assert!(filtered.legit.is_legit_duplicate());
     }
 }

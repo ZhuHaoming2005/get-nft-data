@@ -1,50 +1,75 @@
 //! EVM native value-flow edges (Alchemy EXTERNAL transfers).
 //!
-//! MVP: seed operators from controllers + mint fee_payers / non-zero mint `from`,
-//! then query `alchemy_getAssetTransfers` category `external` for each operator
-//! with `fromBlock`/`toBlock` clamped to the NFT activity block window when known.
-//! Unbounded windows (no block numbers) are allowed but marked Truncated.
+//! Derive operators from candidate NFT activity, then query
+//! `alchemy_getAssetTransfers` category `external` for each operator
+//! across the operator's full history. A returned page key is marked
+//! Truncated, so formal reports never pretend a one-page partial history is complete.
 
 use std::collections::BTreeSet;
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 
 use super::alchemy::{self, FetchOutcome, NativeTransfer};
 use super::http::HttpClient;
+use super::roles::victim_addresses;
 use super::types::{
-    now_unix, EvidenceObservation, EvidenceStatus, ProviderEndpoints, SaleEvent, TransferEvent,
-    ValueFlowEdge, ValueFlowKind,
+    DeploymentEvent, EvidenceObservation, EvidenceStatus, ProviderEndpoints, SaleEvent,
+    TransferEvent, ValueFlowEdge, ValueFlowKind, normalize_chain_address, now_unix,
 };
 
 const ZERO: &str = "0x0000000000000000000000000000000000000000";
 /// Cap operator seeds so enrich stays bounded.
 const MAX_OPERATORS: usize = 16;
 
-/// Collect operator / controller seed addresses for value-flow classification.
-///
-/// Seeds = controllers + mint `fee_payer` + non-zero mint `from`.
-/// Non-mint transfer fee_payers are ignored. Second return is true when the
-/// unique seed set exceeded [`MAX_OPERATORS`] and was truncated.
-pub fn collect_operator_seeds(
-    controllers: &[String],
-    transfers: &[TransferEvent],
-) -> (Vec<String>, bool) {
+/// Normalize, sort, and cap a previously classified operator seed set.
+pub fn collect_operator_seeds(addresses: &[String]) -> (Vec<String>, bool) {
     let mut set = BTreeSet::new();
-    for controller in controllers {
-        insert_addr(&mut set, controller);
-    }
-    for transfer in transfers {
-        if !transfer.is_mint {
-            continue;
-        }
-        if let Some(fee_payer) = &transfer.fee_payer {
-            insert_addr(&mut set, fee_payer);
-        }
-        // Mint `from` is usually the zero address; keep non-zero senders as seeds.
-        insert_addr(&mut set, &transfer.from);
+    for address in addresses {
+        insert_addr(&mut set, address);
     }
     let truncated = set.len() > MAX_OPERATORS;
     (set.into_iter().take(MAX_OPERATORS).collect(), truncated)
+}
+
+/// Derive the value-flow query set from the same binary role rule used by
+/// attribution: only a paid mint/secondary buyer with complete transfer
+/// history and no outbound NFT transfer is a victim; every other participant
+/// is an operator.
+pub fn derive_operator_seeds(
+    chain: &str,
+    candidate: &str,
+    controllers: &[String],
+    deployment: Option<&DeploymentEvent>,
+    transfers: &[TransferEvent],
+    sales: &[SaleEvent],
+    transfer_status: EvidenceStatus,
+) -> Vec<String> {
+    let mut all = BTreeSet::new();
+    let victims = victim_addresses(chain, transfers, sales, transfer_status);
+    let mut insert = |raw: &str| {
+        let address = normalize_chain_address(chain, raw);
+        if !address.is_empty() && address != ZERO {
+            all.insert(address);
+        }
+    };
+    insert(candidate);
+    for controller in controllers {
+        insert(controller);
+    }
+    if let Some(payer) = deployment.and_then(|event| event.fee_payer.as_deref()) {
+        insert(payer);
+    }
+    for transfer in transfers {
+        insert(&transfer.from);
+        insert(&transfer.to);
+    }
+    for sale in sales {
+        insert(&sale.seller);
+        insert(&sale.buyer);
+    }
+    all.into_iter()
+        .filter(|address| !victims.contains(address))
+        .collect()
 }
 
 fn insert_addr(set: &mut BTreeSet<String>, raw: &str) {
@@ -55,23 +80,86 @@ fn insert_addr(set: &mut BTreeSet<String>, raw: &str) {
     set.insert(addr);
 }
 
-fn value_flow_request_key(unbounded: bool, operators_truncated: bool) -> String {
+fn value_flow_request_key(operators_truncated: bool, association_incomplete: bool) -> String {
     let mut notes = Vec::new();
     if operators_truncated {
         notes.push(format!(
             "operator seeds truncated at MAX_OPERATORS={MAX_OPERATORS}"
         ));
     }
-    if unbounded {
-        notes.push(
-            "activity block window unknown; used unbounded fromBlock/toBlock".to_owned(),
-        );
+    if association_incomplete {
+        notes.push("candidate activity window or value-flow block number unavailable".into());
     }
     if notes.is_empty() {
         "alchemy_value_flows".into()
     } else {
         format!("alchemy_value_flows ({})", notes.join("; "))
     }
+}
+
+/// Retain flows that can be tied to the candidate's observable NFT activity.
+///
+/// In-window transfers are retained. Outside that window, only the nearest
+/// pre-window funding block and nearest post-window withdrawal block for each
+/// operator are retained as setup/cashout boundary evidence. This prevents a
+/// controller's unrelated lifetime wallet traffic from entering candidate
+/// economics.
+fn activity_related_transfers(
+    raw: &[NativeTransfer],
+    operators: &AHashSet<String>,
+    window: Option<(u64, u64)>,
+) -> (Vec<NativeTransfer>, bool) {
+    let Some((lo, hi)) = window else {
+        return (Vec::new(), true);
+    };
+
+    let mut nearest_funding = AHashMap::<String, u64>::new();
+    let mut nearest_withdrawal = AHashMap::<String, u64>::new();
+    let mut association_incomplete = false;
+
+    for transfer in raw {
+        let from_op = operators.contains(&transfer.from);
+        let to_op = operators.contains(&transfer.to);
+        if !from_op && !to_op {
+            continue;
+        }
+        let Some(block) = transfer.block_number else {
+            association_incomplete = true;
+            continue;
+        };
+        if block < lo && !from_op && to_op {
+            nearest_funding
+                .entry(transfer.to.clone())
+                .and_modify(|current| *current = (*current).max(block))
+                .or_insert(block);
+        } else if block > hi && from_op && !to_op {
+            nearest_withdrawal
+                .entry(transfer.from.clone())
+                .and_modify(|current| *current = (*current).min(block))
+                .or_insert(block);
+        }
+    }
+
+    let selected = raw
+        .iter()
+        .filter(|transfer| {
+            let Some(block) = transfer.block_number else {
+                return false;
+            };
+            if (lo..=hi).contains(&block) {
+                return true;
+            }
+            let from_op = operators.contains(&transfer.from);
+            let to_op = operators.contains(&transfer.to);
+            (block < lo && !from_op && to_op && nearest_funding.get(&transfer.to) == Some(&block))
+                || (block > hi
+                    && from_op
+                    && !to_op
+                    && nearest_withdrawal.get(&transfer.from) == Some(&block))
+        })
+        .cloned()
+        .collect();
+    (selected, association_incomplete)
 }
 
 /// Activity block window from NFT transfers / sales when block numbers are known.
@@ -123,12 +211,15 @@ pub fn classify_native_edge(
     };
     Some(ValueFlowEdge {
         tx_hash: transfer.tx_hash.clone(),
+        event_id: transfer.event_id.clone(),
         from: transfer.from.clone(),
         to: transfer.to.clone(),
         kind,
         native_amount: transfer.value_native,
         usd_amount: None,
         timestamp: transfer.timestamp,
+        gas_native: None,
+        fee_payer: None,
     })
 }
 
@@ -143,7 +234,7 @@ pub async fn fetch_evm_value_flows(
     endpoints: &ProviderEndpoints,
     api_key: Option<&str>,
     chain: &str,
-    controllers: &[String],
+    operator_seeds: &[String],
     transfers: &[TransferEvent],
     sales: &[SaleEvent],
 ) -> FetchOutcome<Vec<ValueFlowEdge>> {
@@ -151,20 +242,17 @@ pub async fn fetch_evm_value_flows(
         return FetchOutcome::skipped("alchemy_value_flows");
     };
 
-    let (operators, operators_truncated) = collect_operator_seeds(controllers, transfers);
+    let (operators, operators_truncated) = collect_operator_seeds(operator_seeds);
     if operators.is_empty() {
-        return FetchOutcome::ok(
-            Vec::new(),
-            0,
-            false,
-            "alchemy",
-            "alchemy_value_flows",
-        );
+        return FetchOutcome::ok(Vec::new(), 0, false, "alchemy", "alchemy_value_flows");
+    }
+    if transfers.is_empty() && sales.is_empty() {
+        return FetchOutcome::ok(Vec::new(), 0, false, "alchemy", "alchemy_value_flows");
     }
 
-    let window = activity_block_window(transfers, sales);
-    let unbounded = window.is_none();
-    let (from_block, to_block) = window.unwrap_or((0, u64::MAX));
+    // Fetch full history so the nearest setup/cashout boundary can be found,
+    // then retain only flows associated with the candidate activity window.
+    let (from_block, to_block) = (0, u64::MAX);
 
     let operator_set: AHashSet<String> = operators.iter().cloned().collect();
     let mut handles = Vec::new();
@@ -202,24 +290,22 @@ pub async fn fetch_evm_value_flows(
 
     for handle in handles {
         match handle.await {
-            Ok(outcome) => {
-                match outcome.status {
-                    EvidenceStatus::NotRequested => {}
-                    EvidenceStatus::Failed => {
-                        any_fail = true;
-                        if let Some(f) = outcome.failure {
-                            failures.push(f);
-                        }
-                    }
-                    EvidenceStatus::Empty | EvidenceStatus::Complete | EvidenceStatus::Truncated => {
-                        any_ok = true;
-                        if outcome.truncated || outcome.status == EvidenceStatus::Truncated {
-                            page_truncated = true;
-                        }
-                        raw.extend(outcome.value);
+            Ok(outcome) => match outcome.status {
+                EvidenceStatus::NotRequested => {}
+                EvidenceStatus::Failed => {
+                    any_fail = true;
+                    if let Some(f) = outcome.failure {
+                        failures.push(f);
                     }
                 }
-            }
+                EvidenceStatus::Empty | EvidenceStatus::Complete | EvidenceStatus::Truncated => {
+                    any_ok = true;
+                    if outcome.truncated || outcome.status == EvidenceStatus::Truncated {
+                        page_truncated = true;
+                    }
+                    raw.extend(outcome.value);
+                }
+            },
             Err(e) => {
                 any_fail = true;
                 failures.push(format!("value_flow task join failed: {e}"));
@@ -236,6 +322,8 @@ pub async fn fetch_evm_value_flows(
         return FetchOutcome::failed("alchemy", "alchemy_value_flows", detail);
     }
 
+    let (raw, association_incomplete) =
+        activity_related_transfers(&raw, &operator_set, activity_block_window(transfers, sales));
     let mut edges = Vec::new();
     let mut seen = BTreeSet::new();
     for transfer in raw {
@@ -244,6 +332,7 @@ pub async fn fetch_evm_value_flows(
         };
         let key = (
             edge.tx_hash.clone(),
+            edge.event_id.clone(),
             edge.from.clone(),
             edge.to.clone(),
             format!("{:?}", edge.kind),
@@ -256,13 +345,14 @@ pub async fn fetch_evm_value_flows(
         }
     }
 
-    let truncated = page_truncated || unbounded || any_fail || operators_truncated;
+    let truncated = page_truncated || any_fail || operators_truncated || association_incomplete;
     let count = edges.len();
-    let request_key = value_flow_request_key(unbounded, operators_truncated);
+    let request_key = value_flow_request_key(operators_truncated, association_incomplete);
     let mut outcome = FetchOutcome::ok(edges, count, truncated, "alchemy", &request_key);
-    // Unbounded window with no edges stays Empty (no page/operator truncation).
-    // Operator-seed truncation must never report Complete — including empty results.
-    if unbounded && count == 0 && !page_truncated && !any_fail && !operators_truncated {
+    // A full-history query with no edges is conclusively Empty when every page
+    // completed. Operator-seed truncation must never report Complete.
+    if count == 0 && !page_truncated && !any_fail && !operators_truncated && !association_incomplete
+    {
         outcome.status = EvidenceStatus::Empty;
         if let Some(obs) = outcome.observation.as_mut() {
             obs.status = EvidenceStatus::Empty;
@@ -325,53 +415,40 @@ mod tests {
             fee_payer: fee_payer.map(str::to_owned),
             mint_payment_native: None,
             mint_payment_usd: None,
+            mint_payment_receiver: None,
         }
     }
 
     #[test]
-    fn operator_seeds_from_controllers_and_mint_fee_payers() {
-        let (seeds, truncated) = collect_operator_seeds(
-            &["0xAAA".into()],
-            &[transfer(
-                "0x1",
-                ZERO,
-                "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                true,
-                Some("0xFeePayer"),
-                Some(10),
-            )],
-        );
+    fn operator_seed_normalization_uses_only_the_classified_input_set() {
+        let (seeds, truncated) = collect_operator_seeds(&["0xAAA".into()]);
         assert!(!truncated);
         assert!(seeds.contains(&"0xaaa".to_owned()));
-        assert!(seeds.contains(&"0xfeepayer".to_owned()));
+        assert!(!seeds.contains(&"0xfeepayer".to_owned()));
     }
 
     #[test]
-    fn non_mint_fee_payer_is_not_operator_seed() {
-        let (seeds, truncated) = collect_operator_seeds(
-            &[],
-            &[
-                transfer(
-                    "0xmint",
-                    ZERO,
-                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    true,
-                    Some("0xMintFeePayer"),
-                    Some(10),
-                ),
-                transfer(
-                    "0xsec",
-                    "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                    "0xcccccccccccccccccccccccccccccccccccccccc",
-                    false,
-                    Some("0xSecondaryFeePayer"),
-                    Some(11),
-                ),
-            ],
+    fn paid_buyer_without_sale_is_excluded_from_derived_operator_seeds() {
+        let mut paid = transfer(
+            "0xmint",
+            ZERO,
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            true,
+            Some("0xMintFeePayer"),
+            Some(10),
         );
-        assert!(!truncated);
-        assert!(seeds.contains(&"0xmintfeepayer".to_owned()));
-        assert!(!seeds.contains(&"0xsecondaryfeepayer".to_owned()));
+        paid.mint_payment_native = Some(1.0);
+        let seeds = derive_operator_seeds(
+            "ethereum",
+            "0xcccccccccccccccccccccccccccccccccccccccc",
+            &[],
+            None,
+            &[paid],
+            &[],
+            EvidenceStatus::Complete,
+        );
+        assert!(!seeds.contains(&"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()));
+        assert!(seeds.contains(&"0xcccccccccccccccccccccccccccccccccccccccc".to_owned()));
     }
 
     #[test]
@@ -379,16 +456,15 @@ mod tests {
         let controllers: Vec<String> = (1..=(MAX_OPERATORS + 3))
             .map(|i| format!("0x{i:040x}"))
             .collect();
-        let (seeds, truncated) = collect_operator_seeds(&controllers, &[]);
+        let (seeds, truncated) = collect_operator_seeds(&controllers);
         assert!(truncated);
         assert_eq!(seeds.len(), MAX_OPERATORS);
     }
 
     #[test]
-    fn request_key_carries_truncation_notes_not_failure() {
-        let key = value_flow_request_key(true, true);
+    fn request_key_carries_operator_truncation_note() {
+        let key = value_flow_request_key(true, false);
         assert!(key.contains("MAX_OPERATORS"));
-        assert!(key.contains("activity block window unknown"));
         assert_eq!(value_flow_request_key(false, false), "alchemy_value_flows");
     }
 
@@ -398,6 +474,7 @@ mod tests {
         ops.insert("0xop".into());
         let funding = NativeTransfer {
             tx_hash: "0xf".into(),
+            event_id: None,
             from: "0xfunder".into(),
             to: "0xop".into(),
             value_native: Some(1.5),
@@ -410,6 +487,7 @@ mod tests {
 
         let withdrawal = NativeTransfer {
             tx_hash: "0xw".into(),
+            event_id: None,
             from: "0xop".into(),
             to: "0xout".into(),
             value_native: Some(0.25),
@@ -427,6 +505,7 @@ mod tests {
         ops.insert("0xb".into());
         let t = NativeTransfer {
             tx_hash: "0xr".into(),
+            event_id: None,
             from: "0xa".into(),
             to: "0xb".into(),
             value_native: Some(0.1),
@@ -482,8 +561,76 @@ mod tests {
             native_amount: None,
             usd_amount: None,
             currency_symbol: None,
+            currency_address: None,
+            seller_proceeds_native: None,
+            seller_proceeds_usd: None,
+            ..SaleEvent::default()
         }];
         assert_eq!(activity_block_window(&transfers, &sales), Some((5, 20)));
         assert_eq!(activity_block_window(&[], &[]), None);
+    }
+
+    #[test]
+    fn activity_filter_keeps_window_and_nearest_setup_and_cashout_only() {
+        let operators = AHashSet::from_iter(["0xop".to_owned()]);
+        let raw = vec![
+            NativeTransfer {
+                tx_hash: "old-funding".into(),
+                from: "0xa".into(),
+                to: "0xop".into(),
+                block_number: Some(1),
+                ..NativeTransfer::default()
+            },
+            NativeTransfer {
+                tx_hash: "setup".into(),
+                from: "0xb".into(),
+                to: "0xop".into(),
+                block_number: Some(9),
+                ..NativeTransfer::default()
+            },
+            NativeTransfer {
+                tx_hash: "during".into(),
+                from: "0xop".into(),
+                to: "0xc".into(),
+                block_number: Some(15),
+                ..NativeTransfer::default()
+            },
+            NativeTransfer {
+                tx_hash: "cashout".into(),
+                from: "0xop".into(),
+                to: "0xd".into(),
+                block_number: Some(21),
+                ..NativeTransfer::default()
+            },
+            NativeTransfer {
+                tx_hash: "late".into(),
+                from: "0xop".into(),
+                to: "0xe".into(),
+                block_number: Some(30),
+                ..NativeTransfer::default()
+            },
+        ];
+        let (selected, incomplete) = activity_related_transfers(&raw, &operators, Some((10, 20)));
+        assert!(!incomplete);
+        let hashes = selected
+            .iter()
+            .map(|transfer| transfer.tx_hash.as_str())
+            .collect::<AHashSet<_>>();
+        assert_eq!(hashes, AHashSet::from_iter(["setup", "during", "cashout"]));
+    }
+
+    #[test]
+    fn activity_filter_marks_missing_blocks_incomplete() {
+        let operators = AHashSet::from_iter(["0xop".to_owned()]);
+        let raw = vec![NativeTransfer {
+            tx_hash: "unknown".into(),
+            from: "0xop".into(),
+            to: "0xout".into(),
+            block_number: None,
+            ..NativeTransfer::default()
+        }];
+        let (selected, incomplete) = activity_related_transfers(&raw, &operators, Some((10, 20)));
+        assert!(selected.is_empty());
+        assert!(incomplete);
     }
 }

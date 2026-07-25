@@ -7,11 +7,11 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use ahash::AHashMap;
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 use crate::error::Analysis2Error;
 
-use super::alchemy::FetchOutcome;
+use super::alchemy::{FetchOutcome, is_open_license_payload};
 use super::controllers::solana_authorities_from_asset;
 use super::http::HttpClient;
 use super::types::{
@@ -34,6 +34,8 @@ pub struct SolanaAssetSnapshot {
     pub assets: Vec<SolanaAsset>,
     pub total: Option<usize>,
     pub truncated: bool,
+    /// Whether sampled seed NFT metadata declares CC0 / public-domain use.
+    pub open_license: bool,
     /// Collection updateAuthority (+ verified creators) extracted while paging assets.
     pub authority: Vec<String>,
 }
@@ -268,6 +270,7 @@ pub async fn fetch_collection_assets(
         }
         let before = snapshot.assets.len();
         for item in &items {
+            snapshot.open_license |= is_open_license_payload(item);
             if snapshot.authority.is_empty() {
                 let authorities = solana_authorities_from_asset(item, result, collection);
                 if !authorities.is_empty() {
@@ -382,6 +385,10 @@ pub async fn fetch_asset_histories(
                         native_amount: None,
                         usd_amount: None,
                         currency_symbol: Some("SOL".into()),
+                        currency_address: None,
+                        seller_proceeds_native: None,
+                        seller_proceeds_usd: None,
+                        ..SaleEvent::default()
                     });
                 } else {
                     transfers.push(TransferEvent {
@@ -396,6 +403,7 @@ pub async fn fetch_asset_histories(
                         fee_payer: None,
                         mint_payment_native: None,
                         mint_payment_usd: None,
+                        mint_payment_receiver: None,
                     });
                 }
             }
@@ -471,16 +479,22 @@ impl DecodeStats {
 }
 
 /// Dedupe signatures → `getTransaction` jsonParsed; attach from/to/timestamp/fee;
-/// extract SOL [`ValueFlowEdge`]s involving fee payers / controllers.
+/// extract SOL [`ValueFlowEdge`]s involving addresses classified as operators.
 ///
 /// Returns `(gas_outcome, value_flows_outcome, stats)`.
+pub struct DecodeContext<'a> {
+    pub candidate: &'a str,
+    pub controllers: &'a [String],
+    pub transfer_discovery_complete: bool,
+}
+
 pub async fn decode_and_attach_transactions(
     client: &HttpClient,
     rpc_url: &str,
     api_key: Option<&str>,
+    context: DecodeContext<'_>,
     transfers: &mut [TransferEvent],
     sales: &mut [SaleEvent],
-    controllers: &[String],
 ) -> (
     FetchOutcome<()>,
     FetchOutcome<Vec<ValueFlowEdge>>,
@@ -523,13 +537,7 @@ pub async fn decode_and_attach_transactions(
     if sig_mints.is_empty() {
         return (
             FetchOutcome::ok((), 0, false, "helius", "helius_get_transaction"),
-            FetchOutcome::ok(
-                Vec::new(),
-                0,
-                false,
-                "helius",
-                "helius_value_flows",
-            ),
+            FetchOutcome::ok(Vec::new(), 0, false, "helius", "helius_value_flows"),
             stats,
         );
     }
@@ -580,18 +588,10 @@ pub async fn decode_and_attach_transactions(
         }
     }
 
-    let mut operators: BTreeSet<String> = BTreeSet::new();
-    for c in controllers {
-        insert_sol_addr(&mut operators, c);
-    }
-
-    let mut value_flows = Vec::new();
-    let mut seen_edges = HashSet::new();
-
-    for tx in decoded.values() {
-        if let Some(payer) = &tx.fee_payer {
-            insert_sol_addr(&mut operators, payer);
-        }
+    let mut preliminary_operators: BTreeSet<String> = BTreeSet::new();
+    insert_sol_addr(&mut preliminary_operators, context.candidate);
+    for c in context.controllers {
+        insert_sol_addr(&mut preliminary_operators, c);
     }
 
     for transfer in transfers.iter_mut() {
@@ -606,33 +606,6 @@ pub async fn decode_and_attach_transactions(
         };
         apply_sale_decode(sale, tx);
     }
-
-    // Recompute operators after fee_payer attach (mint fee payers).
-    for transfer in transfers.iter() {
-        if transfer.is_mint {
-            if let Some(payer) = &transfer.fee_payer {
-                insert_sol_addr(&mut operators, payer);
-            }
-            insert_sol_addr(&mut operators, &transfer.from);
-        }
-    }
-
-    for tx in decoded.values() {
-        for mv in &tx.native_moves {
-            if let Some(edge) = classify_sol_edge(tx, mv, &operators) {
-                let key = (
-                    edge.tx_hash.clone(),
-                    edge.from.clone(),
-                    edge.to.clone(),
-                    edge.kind,
-                );
-                if seen_edges.insert(key) {
-                    value_flows.push(edge);
-                }
-            }
-        }
-    }
-
     stats.transfers_complete = transfers
         .iter()
         .filter(|t| {
@@ -644,11 +617,75 @@ pub async fn decode_and_attach_transactions(
         })
         .count();
     stats.sales_complete = sales.iter().filter(|s| sale_fields_complete(s)).count();
+    let transfer_status = if context.transfer_discovery_complete
+        && (transfers.is_empty() || stats.transfers_all_complete())
+    {
+        if transfers.is_empty() {
+            EvidenceStatus::Empty
+        } else {
+            EvidenceStatus::Complete
+        }
+    } else {
+        EvidenceStatus::Truncated
+    };
+
+    // A decoded Solana mint transaction with one buyer-funded SOL receiver is
+    // direct payment evidence even when the receiver is a Candy Machine or
+    // treasury account that differs from the collection/update authority.
+    // Then derive the same binary operator set used by attribution and rebuild
+    // the value-flow edges against that final set.
+    let preliminary_flows = sol_value_flows(&decoded, &preliminary_operators);
+    super::mint_payment::attach_mint_payments(
+        transfers,
+        &preliminary_flows,
+        &[],
+        "solana",
+        &AHashMap::new(),
+    );
+    let operator_seeds = super::value_flow::derive_operator_seeds(
+        "solana",
+        context.candidate,
+        context.controllers,
+        None,
+        transfers,
+        sales,
+        transfer_status,
+    );
+    let mut operators = BTreeSet::new();
+    for operator in operator_seeds {
+        insert_sol_addr(&mut operators, &operator);
+    }
+    let value_flows = sol_value_flows(&decoded, &operators);
 
     let gas_outcome = gas_outcome_from_stats(&stats, transfers, &failures);
     let vf_outcome = value_flow_outcome(value_flows, &stats, &failures);
 
     (gas_outcome, vf_outcome, stats)
+}
+
+fn sol_value_flows(
+    decoded: &AHashMap<String, DecodedTx>,
+    operators: &BTreeSet<String>,
+) -> Vec<ValueFlowEdge> {
+    let mut value_flows = Vec::new();
+    let mut seen_edges = HashSet::new();
+    for tx in decoded.values() {
+        for mv in &tx.native_moves {
+            if let Some(edge) = classify_sol_edge(tx, mv, operators) {
+                let key = (
+                    edge.tx_hash.clone(),
+                    edge.event_id.clone(),
+                    edge.from.clone(),
+                    edge.to.clone(),
+                    edge.kind,
+                );
+                if seen_edges.insert(key) {
+                    value_flows.push(edge);
+                }
+            }
+        }
+    }
+    value_flows
 }
 
 fn get_transaction_params(signature: &str) -> Value {
@@ -712,12 +749,11 @@ fn parse_transaction_batch_payload(
     let mut out = Vec::with_capacity(signatures.len());
     for (i, signature) in signatures.iter().enumerate() {
         let id = format!("tx-{batch_idx}-{i}");
-        let response = by_id
-            .get(&id)
-            .copied()
-            .or_else(|| responses.get(i));
+        let response = by_id.get(&id).copied().or_else(|| responses.get(i));
         match response {
-            Some(response) => out.push((signature.clone(), transaction_from_rpc_response(response))),
+            Some(response) => {
+                out.push((signature.clone(), transaction_from_rpc_response(response)))
+            }
             None => out.push((signature.clone(), Err("missing batch response".into()))),
         }
     }
@@ -761,7 +797,10 @@ async fn fetch_transactions_singles(
     for handle in handles {
         match handle.await {
             Ok(row) => out.push(row),
-            Err(e) => out.push((String::new(), Err(format!("getTransaction join failed: {e}")))),
+            Err(e) => out.push((
+                String::new(),
+                Err(format!("getTransaction join failed: {e}")),
+            )),
         }
     }
     out
@@ -844,7 +883,12 @@ fn gas_outcome_from_stats(
             "helius_get_transaction: partial failures ({}/{}): {}",
             failures.len(),
             stats.requested,
-            failures.iter().take(3).cloned().collect::<Vec<_>>().join("; ")
+            failures
+                .iter()
+                .take(3)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("; ")
         ));
     }
     outcome
@@ -866,15 +910,15 @@ fn value_flow_outcome(
         };
         return FetchOutcome::failed("helius", "helius_value_flows", detail);
     }
-    let truncated = stats.fetch_failed > 0
-        || stats.null_result > 0
-        || stats.fetched_ok < stats.requested;
+    let truncated =
+        stats.fetch_failed > 0 || stats.null_result > 0 || stats.fetched_ok < stats.requested;
     let count = edges.len();
     FetchOutcome::ok(edges, count, truncated, "helius", "helius_value_flows")
 }
 
 #[derive(Clone, Debug, Default)]
 struct NativeSolMove {
+    event_id: String,
     from: String,
     to: String,
     amount_sol: f64,
@@ -961,6 +1005,25 @@ fn apply_transfer_decode(transfer: &mut TransferEvent, tx: &DecodedTx) {
             transfer.to = to.clone();
         }
     }
+    if transfer.is_mint && !transfer.to.is_empty() {
+        let mut total = 0.0;
+        let mut receivers = BTreeSet::new();
+        for movement in &tx.native_moves {
+            if movement.from == transfer.to
+                && movement.to != transfer.to
+                && movement.amount_sol > 0.0
+            {
+                total += movement.amount_sol;
+                receivers.insert(movement.to.clone());
+            }
+        }
+        if total > 0.0 {
+            transfer.mint_payment_native = Some(total);
+            transfer.mint_payment_receiver = (receivers.len() == 1)
+                .then(|| receivers.into_iter().next())
+                .flatten();
+        }
+    }
 }
 
 fn apply_sale_decode(sale: &mut SaleEvent, tx: &DecodedTx) {
@@ -997,6 +1060,7 @@ fn apply_sale_decode(sale: &mut SaleEvent, tx: &DecodedTx) {
             .sum();
         if paid > 0.0 {
             sale.native_amount = Some(paid);
+            sale.seller_proceeds_native = Some(paid);
             if sale.currency_symbol.is_none() {
                 sale.currency_symbol = Some("SOL".into());
             }
@@ -1040,12 +1104,15 @@ fn classify_sol_edge(
     };
     Some(ValueFlowEdge {
         tx_hash: tx.signature.clone(),
+        event_id: Some(mv.event_id.clone()),
         from: mv.from.clone(),
         to: mv.to.clone(),
         kind,
         native_amount: Some(mv.amount_sol),
         usd_amount: None,
         timestamp: tx.timestamp,
+        gas_native: tx.fee_sol,
+        fee_payer: tx.fee_payer.clone(),
     })
 }
 
@@ -1174,7 +1241,7 @@ fn parse_native_sol_moves(
                 .flatten(),
         );
     }
-    for instruction in &instructions {
+    for (instruction_index, instruction) in instructions.iter().enumerate() {
         let Some(parsed) = instruction.get("parsed") else {
             continue;
         };
@@ -1207,6 +1274,7 @@ fn parse_native_sol_moves(
             continue;
         }
         moves.push(NativeSolMove {
+            event_id: format!("instruction:{instruction_index}"),
             from,
             to,
             amount_sol: lamports as f64 / LAMPORTS_PER_SOL,
@@ -1250,6 +1318,7 @@ fn parse_native_sol_moves(
         let amount = (-sd).min(dd) as f64 / LAMPORTS_PER_SOL;
         if amount > 0.0 {
             moves.push(NativeSolMove {
+                event_id: format!("balance:{si}:{di}"),
                 from: accounts[si].clone(),
                 to: accounts[di].clone(),
                 amount_sol: amount,
@@ -1298,11 +1367,7 @@ fn parse_asset(item: &Value) -> Option<SolanaAsset> {
 
 fn parse_signature_item(item: &Value) -> (String, String) {
     if let Some(arr) = item.as_array() {
-        let sig = arr
-            .first()
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_owned();
+        let sig = arr.first().and_then(Value::as_str).unwrap_or("").to_owned();
         let event = arr
             .get(1)
             .and_then(Value::as_str)
@@ -1330,7 +1395,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    use crate::enrich::types::{status_from_count, EvidenceStatus};
+    use crate::enrich::types::{EvidenceStatus, status_from_count};
     use std::collections::BTreeSet;
 
     #[test]
@@ -1394,6 +1459,80 @@ mod tests {
     }
 
     #[test]
+    fn solana_paid_mint_keeps_unique_same_transaction_treasury_payment() {
+        let mint = "MintPaid111111111111111111111111111111111";
+        let buyer = "BuyerPaid11111111111111111111111111111111";
+        let treasury = "Treasury111111111111111111111111111111111";
+        let tx = DecodedTx {
+            signature: "SigPaid1111111111111111111111111111111111".into(),
+            owner_changes: HashMap::from([(mint.into(), (None, buyer.into(), true))]),
+            native_moves: vec![NativeSolMove {
+                event_id: "instruction:0".into(),
+                from: buyer.into(),
+                to: treasury.into(),
+                amount_sol: 1.25,
+            }],
+            ..DecodedTx::default()
+        };
+        let mut transfer = TransferEvent {
+            tx_hash: tx.signature.clone(),
+            token_id: mint.into(),
+            from: String::new(),
+            to: buyer.into(),
+            timestamp: None,
+            block_number: None,
+            is_mint: true,
+            gas_native: None,
+            fee_payer: None,
+            mint_payment_native: None,
+            mint_payment_usd: None,
+            mint_payment_receiver: None,
+        };
+
+        apply_transfer_decode(&mut transfer, &tx);
+
+        assert_eq!(transfer.mint_payment_native, Some(1.25));
+        assert_eq!(transfer.mint_payment_receiver.as_deref(), Some(treasury));
+    }
+
+    #[test]
+    fn solana_value_flows_keep_distinct_instructions_with_same_endpoints() {
+        let operator = "Operator111111111111111111111111111111111";
+        let receiver = "Receiver111111111111111111111111111111111";
+        let tx = DecodedTx {
+            signature: "SigFlow1111111111111111111111111111111111".into(),
+            native_moves: vec![
+                NativeSolMove {
+                    event_id: "instruction:0".into(),
+                    from: operator.into(),
+                    to: receiver.into(),
+                    amount_sol: 1.0,
+                },
+                NativeSolMove {
+                    event_id: "instruction:1".into(),
+                    from: operator.into(),
+                    to: receiver.into(),
+                    amount_sol: 2.0,
+                },
+            ],
+            ..DecodedTx::default()
+        };
+        let flows = sol_value_flows(
+            &AHashMap::from([(tx.signature.clone(), tx)]),
+            &BTreeSet::from([operator.into()]),
+        );
+
+        assert_eq!(flows.len(), 2);
+        assert_eq!(
+            flows
+                .iter()
+                .filter_map(|edge| edge.native_amount)
+                .sum::<f64>(),
+            3.0
+        );
+    }
+
+    #[test]
     fn parses_standard_transfer_owner_change_and_fee() {
         let mint = "MintDecode1111111111111111111111111111111";
         let result = json!({
@@ -1443,7 +1582,10 @@ mod tests {
         );
         assert_eq!(tx.timestamp, Some(1_700_000_000));
         let (from, to, is_mint) = tx.owner_changes.get(mint).unwrap();
-        assert_eq!(from.as_deref(), Some("Seller11111111111111111111111111111111111"));
+        assert_eq!(
+            from.as_deref(),
+            Some("Seller11111111111111111111111111111111111")
+        );
         assert_eq!(to, "Buyer111111111111111111111111111111111111");
         assert!(!is_mint);
         assert_eq!(tx.native_moves.len(), 1);
@@ -1489,6 +1631,7 @@ mod tests {
             fee_payer: None,
             mint_payment_native: None,
             mint_payment_usd: None,
+            mint_payment_receiver: None,
         };
         apply_transfer_decode(&mut transfer, &tx);
         assert!(transfer.timestamp.is_some());

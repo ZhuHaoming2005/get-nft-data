@@ -5,5 +5,5 @@ mod magic_eden;
 mod select;
 
 pub use select::{
-    select_seeds, select_seeds_async, write_seed_outputs, SeedRecord, SelectSeedsOptions,
+    SeedRecord, SelectSeedsOptions, select_seeds, select_seeds_async, write_seed_outputs,
 };
