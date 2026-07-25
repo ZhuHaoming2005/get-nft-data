@@ -1,6 +1,9 @@
 //! Fill `EvidenceBundle.controllers` from Alchemy / on-chain (EVM) and Helius (Solana).
 
 use serde_json::{Value, json};
+use std::collections::BTreeMap;
+
+use crate::entity::ContractId;
 
 use super::alchemy::FetchOutcome;
 use super::http::HttpClient;
@@ -129,6 +132,231 @@ pub async fn fetch_evm_controllers(
         }
     }
     outcome
+}
+
+/// Fetch controller evidence for many contracts while preserving the exact
+/// per-contract output shape of [`fetch_evm_controllers`]. Contracts are
+/// grouped by chain and sent in bounded metadata/RPC batches; an unusable
+/// provider batch falls back to the original individual path.
+pub async fn fetch_evm_controllers_batch(
+    client: &HttpClient,
+    endpoints: &ProviderEndpoints,
+    api_key: Option<&str>,
+    requests: &[(ContractId, String, String)],
+) -> ahash::AHashMap<ContractId, FetchOutcome<EvmControllerEvidence>> {
+    const CONTRACTS_PER_BATCH: usize = 100;
+
+    let mut out = ahash::AHashMap::with_capacity(requests.len());
+    let Some(api_key) = api_key else {
+        for (id, _, _) in requests {
+            out.insert(*id, FetchOutcome::skipped("contract_controllers"));
+        }
+        return out;
+    };
+
+    let mut by_chain: BTreeMap<String, Vec<(ContractId, String)>> = BTreeMap::new();
+    for (id, chain, contract) in requests {
+        by_chain
+            .entry(chain.clone())
+            .or_default()
+            .push((*id, contract.clone()));
+    }
+
+    for (chain, rows) in by_chain {
+        for chunk in rows.chunks(CONTRACTS_PER_BATCH) {
+            if chunk.len() == 1 {
+                let (id, contract) = &chunk[0];
+                out.insert(
+                    *id,
+                    fetch_evm_controllers(client, endpoints, Some(api_key), &chain, contract).await,
+                );
+                continue;
+            }
+            match fetch_controller_chunk(client, endpoints, api_key, &chain, chunk).await {
+                Some(chunk_rows) => out.extend(chunk_rows),
+                None => {
+                    for (id, contract) in chunk {
+                        out.insert(
+                            *id,
+                            fetch_evm_controllers(
+                                client,
+                                endpoints,
+                                Some(api_key),
+                                &chain,
+                                contract,
+                            )
+                            .await,
+                        );
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+async fn fetch_controller_chunk(
+    client: &HttpClient,
+    endpoints: &ProviderEndpoints,
+    api_key: &str,
+    chain: &str,
+    rows: &[(ContractId, String)],
+) -> Option<ahash::AHashMap<ContractId, FetchOutcome<EvmControllerEvidence>>> {
+    let metadata_url = endpoints.alchemy_nft(chain, api_key, "getContractMetadataBatch")?;
+    let rpc_url = endpoints.alchemy_rpc(chain, api_key)?;
+    let metadata_body = json!({
+        "contractAddresses": rows
+            .iter()
+            .map(|(_, address)| address)
+            .collect::<Vec<_>>()
+    });
+    let rpc_body = Value::Array(
+        rows.iter()
+            .enumerate()
+            .flat_map(|(idx, (_, contract))| {
+                [
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("{idx}:owner"),
+                        "method": "eth_call",
+                        "params": [{"to": contract, "data": "0x8da5cb5b"}, "latest"]
+                    }),
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("{idx}:owner-fallback"),
+                        "method": "eth_call",
+                        "params": [{"to": contract, "data": "0x893d20e8"}, "latest"]
+                    }),
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("{idx}:admin"),
+                        "method": "eth_call",
+                        "params": [{"to": contract, "data": "0xf851a440"}, "latest"]
+                    }),
+                    json!({
+                        "jsonrpc": "2.0",
+                        "id": format!("{idx}:eip1967-admin"),
+                        "method": "eth_getStorageAt",
+                        "params": [contract, EIP1967_ADMIN_SLOT, "latest"]
+                    }),
+                ]
+            })
+            .collect(),
+    );
+    let (metadata_payload, rpc_payload) = tokio::join!(
+        client.post_json_alchemy(&metadata_url, &[], &metadata_body),
+        client.post_json_alchemy(&rpc_url, &[], &rpc_body),
+    );
+    let metadata_payload = metadata_payload.ok()?;
+    let rpc_payload = rpc_payload.ok()?;
+    let metadata_rows = metadata_payload.as_array()?;
+    let rpc_rows = rpc_payload.as_array()?;
+
+    let mut metadata_by_address = ahash::AHashMap::with_capacity(metadata_rows.len());
+    for row in metadata_rows {
+        let metadata = row.get("contractMetadata").unwrap_or(row);
+        let Some(address) = metadata
+            .get("address")
+            .or_else(|| row.get("address"))
+            .and_then(Value::as_str)
+            .and_then(normalize_evm_address)
+        else {
+            continue;
+        };
+        metadata_by_address.insert(address, metadata);
+    }
+
+    let mut rpc_by_id = ahash::AHashMap::with_capacity(rpc_rows.len());
+    for row in rpc_rows {
+        if let Some(id) = row.get("id").and_then(Value::as_str) {
+            rpc_by_id.insert(id.to_owned(), row);
+        }
+    }
+
+    let mut out = ahash::AHashMap::with_capacity(rows.len());
+    for (idx, (contract_id, contract)) in rows.iter().enumerate() {
+        let normalized = normalize_evm_address(contract)?;
+        let metadata = metadata_by_address.get(&normalized).copied();
+        let mut controllers = Vec::new();
+        let mut deployer = None;
+        let mut deployed_block = None;
+        let mut supplemental_failed = metadata.is_none();
+        if let Some(metadata) = metadata {
+            for field in [
+                "contractDeployer",
+                "ownerAddress",
+                "owner",
+                "adminAddress",
+                "proxyAdminAddress",
+            ] {
+                push_evm_address(
+                    &mut controllers,
+                    metadata.get(field).and_then(Value::as_str),
+                );
+            }
+            deployer = [
+                "contractDeployer",
+                "deployerAddress",
+                "deployer",
+                "creatorAddress",
+            ]
+            .into_iter()
+            .find_map(|field| {
+                metadata
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .and_then(normalize_evm_address)
+            });
+            deployed_block = metadata
+                .get("deployedBlockNumber")
+                .and_then(parse_block_number);
+        }
+
+        let storage_id = format!("{idx}:eip1967-admin");
+        if rpc_by_id
+            .get(&storage_id)
+            .is_none_or(|row| row.get("result").and_then(Value::as_str).is_none())
+        {
+            supplemental_failed = true;
+        }
+        let mut owner = None;
+        let mut owner_fallback = None;
+        for suffix in ["owner", "owner-fallback", "admin", "eip1967-admin"] {
+            let id = format!("{idx}:{suffix}");
+            let Some(address) = rpc_by_id
+                .get(&id)
+                .and_then(|row| abi_address(row.get("result").and_then(Value::as_str)))
+            else {
+                continue;
+            };
+            match suffix {
+                "owner" => owner = Some(address),
+                "owner-fallback" => owner_fallback = Some(address),
+                _ => controllers.push(address),
+            }
+        }
+        if let Some(address) = owner.or(owner_fallback) {
+            controllers.push(address);
+        }
+        if let Some(deployer) = deployer {
+            controllers.push(deployer);
+        }
+        controllers.sort();
+        controllers.dedup();
+        let count = controllers.len();
+        let outcome = FetchOutcome::ok(
+            EvmControllerEvidence {
+                addresses: controllers,
+                deployed_block,
+            },
+            count,
+            supplemental_failed,
+            "alchemy",
+            "contract_controllers",
+        );
+        out.insert(*contract_id, outcome);
+    }
+    Some(out)
 }
 
 fn parse_block_number(value: &Value) -> Option<u64> {
@@ -328,6 +556,8 @@ pub fn solana_authorities_from_asset(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use httpmock::Method::POST;
+    use httpmock::MockServer;
     use serde_json::json;
 
     #[test]
@@ -384,5 +614,73 @@ mod tests {
                 .iter()
                 .any(|a| a == "Fake1111111111111111111111111111111111111")
         );
+    }
+
+    #[tokio::test]
+    async fn controller_batch_uses_one_metadata_and_one_rpc_request() {
+        let server = MockServer::start_async().await;
+        let first = "0x1111111111111111111111111111111111111111";
+        let second = "0x2222222222222222222222222222222222222222";
+        let metadata = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/nft/getContractMetadataBatch")
+                    .body_contains("contractAddresses");
+                then.status(200).json_body(json!([
+                    {
+                        "address": first,
+                        "contractDeployer": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "deployedBlockNumber": 10
+                    },
+                    {
+                        "address": second,
+                        "contractDeployer": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "deployedBlockNumber": 20
+                    }
+                ]));
+            })
+            .await;
+        let rpc = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/rpc").body_contains("eip1967-admin");
+                then.status(200).json_body(json!([
+                    {"jsonrpc":"2.0","id":"0:owner","result":"0x000000000000000000000000cccccccccccccccccccccccccccccccccccccccc"},
+                    {"jsonrpc":"2.0","id":"0:owner-fallback","result":"0x"},
+                    {"jsonrpc":"2.0","id":"0:admin","result":"0x"},
+                    {"jsonrpc":"2.0","id":"0:eip1967-admin","result":"0x"},
+                    {"jsonrpc":"2.0","id":"1:owner","result":"0x000000000000000000000000dddddddddddddddddddddddddddddddddddddddd"},
+                    {"jsonrpc":"2.0","id":"1:owner-fallback","result":"0x"},
+                    {"jsonrpc":"2.0","id":"1:admin","result":"0x"},
+                    {"jsonrpc":"2.0","id":"1:eip1967-admin","result":"0x"}
+                ]));
+            })
+            .await;
+        let endpoints = ProviderEndpoints {
+            alchemy_nft_template: format!("{}/nft/{{method}}", server.base_url()),
+            alchemy_rpc_template: format!("{}/rpc", server.base_url()),
+            ..ProviderEndpoints::default()
+        };
+        let client = HttpClient::with_retries(4, 0).unwrap();
+        let rows = fetch_evm_controllers_batch(
+            &client,
+            &endpoints,
+            Some("key"),
+            &[
+                (1, "ethereum".into(), first.into()),
+                (2, "ethereum".into(), second.into()),
+            ],
+        )
+        .await;
+
+        assert_eq!(metadata.hits(), 1);
+        assert_eq!(rpc.hits(), 1);
+        assert_eq!(rows[&1].value.deployed_block, Some(10));
+        assert!(
+            rows[&1]
+                .value
+                .addresses
+                .contains(&"0xcccccccccccccccccccccccccccccccccccccccc".into())
+        );
+        assert_eq!(rows[&2].value.deployed_block, Some(20));
     }
 }

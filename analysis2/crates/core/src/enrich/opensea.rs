@@ -2,10 +2,11 @@
 //!
 //! Rate limit: all requests go through [`HttpClient::get_json_opensea`] which
 //! applies the `top_contract_analysis_rs` token-bucket strategy (burst 4,
-//! refill every 300 ms). Prefer Alchemy / Helius for enrichment; OpenSea is
-//! only for EVM `select-seeds` ranking and last-resort sales / EVM slug fallback.
+//! refill every 300 ms). OpenSea is the canonical Sale provider on every chain.
 
 use serde_json::Value;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use crate::error::Analysis2Error;
 
@@ -13,6 +14,7 @@ use super::http::HttpClient;
 
 const DEFAULT_OPENSEA_BASE: &str = "https://api.opensea.io";
 const PAGE_SIZE: usize = 50;
+const EVENT_PAGE_SIZE: usize = 200;
 
 /// One contract extracted from an OpenSea top-collections page.
 #[derive(Clone, Debug, PartialEq)]
@@ -221,6 +223,7 @@ fn opensea_chain_query(chain: &str) -> &'static str {
     match chain.trim().to_ascii_lowercase().as_str() {
         "polygon" | "matic" => "polygon",
         "base" => "base",
+        "solana" => "solana",
         _ => "ethereum",
     }
 }
@@ -264,7 +267,11 @@ pub fn default_base_url() -> &'static str {
     DEFAULT_OPENSEA_BASE
 }
 
-/// Rare fallback: OpenSea events for a contract when preferred sales lack required fields.
+/// OpenSea Sale events for a contract.
+///
+/// OpenSea's current events API is collection-scoped. Resolve the contract's
+/// collection slug first, then filter collection events back to this contract
+/// because one OpenSea collection may contain multiple contracts.
 pub async fn fetch_contract_sales(
     client: &HttpClient,
     base_url: &str,
@@ -273,17 +280,45 @@ pub async fn fetch_contract_sales(
     contract: &str,
     max_pages: usize,
 ) -> crate::enrich::alchemy::FetchOutcome<Vec<crate::enrich::types::SaleEvent>> {
+    fetch_contract_sales_with_slug(client, base_url, api_key, chain, contract, max_pages, None)
+        .await
+}
+
+/// OpenSea Sale events using a collection slug already resolved by the
+/// legitimacy preflight. Passing the slug avoids repeating the contract lookup.
+pub async fn fetch_contract_sales_with_slug(
+    client: &HttpClient,
+    base_url: &str,
+    api_key: Option<&str>,
+    chain: &str,
+    contract: &str,
+    max_pages: usize,
+    known_slug: Option<&str>,
+) -> crate::enrich::alchemy::FetchOutcome<Vec<crate::enrich::types::SaleEvent>> {
     use crate::enrich::alchemy::FetchOutcome;
     use crate::enrich::types::{EvidenceObservation, EvidenceStatus, now_unix};
 
     let Some(api_key) = api_key else {
         return FetchOutcome::skipped("opensea_sales");
     };
-    let chain_q = opensea_chain_query(chain);
+    let slug = match known_slug.map(str::trim).filter(|slug| !slug.is_empty()) {
+        Some(slug) => slug.to_owned(),
+        None => {
+            match fetch_contract_collection_slug_result(client, base_url, api_key, chain, contract)
+                .await
+            {
+                Ok(Some(slug)) => slug,
+                Ok(None) => {
+                    return FetchOutcome::ok(Vec::new(), 0, false, "opensea", "opensea_sales");
+                }
+                Err(error) => return FetchOutcome::failed("opensea", "opensea_sales", error),
+            }
+        }
+    };
     let base_url = format!(
-        "{}/api/v2/events/nft?chain={chain_q}&contract_address={}&event_type=sale&limit=50",
+        "{}/api/v2/events/collection/{}?event_type=sale&limit={EVENT_PAGE_SIZE}",
         base_url.trim_end_matches('/'),
-        urlencoding_minimal(contract)
+        urlencoding_minimal(&slug)
     );
     let mut sales = Vec::new();
     let mut cursor = None;
@@ -326,7 +361,13 @@ pub async fn fetch_contract_sales(
                 break;
             }
         };
-        sales.extend(parse_sale_events(&payload, chain));
+        for event in event_values(&payload) {
+            if event_matches_contract(event, chain, contract)
+                && let Some(sale) = parse_sale_event(event, chain)
+            {
+                sales.push(sale);
+            }
+        }
         let Some(next) = next_cursor(&payload) else {
             break;
         };
@@ -348,121 +389,203 @@ pub async fn fetch_contract_sales(
 
 /// Parse OpenSea NFT sale events payload.
 pub fn parse_sale_events(payload: &Value, chain: &str) -> Vec<crate::enrich::types::SaleEvent> {
-    use crate::enrich::types::{SaleEvent, normalize_chain_address};
-    let mut out = Vec::new();
-    let events = payload
+    event_values(payload)
+        .filter_map(|event| parse_sale_event(event, chain))
+        .collect()
+}
+
+fn event_values(payload: &Value) -> impl Iterator<Item = &Value> {
+    payload
         .get("asset_events")
         .or_else(|| payload.get("events"))
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    for event in events {
-        let event_type = event
-            .get("event_type")
-            .or_else(|| event.get("type"))
-            .and_then(Value::as_str)
-            .unwrap_or("sale");
-        if !event_type.eq_ignore_ascii_case("sale") && !event_type.eq_ignore_ascii_case("order") {
-            // Still accept order-fulfilled style sale payloads that include payment.
-            if event.get("payment").is_none() && event.get("total_price").is_none() {
-                continue;
-            }
-        }
-        let nft = event.get("nft").or_else(|| event.get("asset"));
-        let token_id = nft
-            .and_then(|n| n.get("identifier").or_else(|| n.get("token_id")))
-            .map(|value| crate::enrich::alchemy::normalize_token_id(Some(value)))
-            .unwrap_or_default();
-        let payment = event.get("payment");
-        let native = payment
-            .and_then(|p| p.get("quantity").or_else(|| p.get("amount")))
-            .and_then(json_number)
-            .or_else(|| event.get("total_price").and_then(json_number));
-        let decimals = payment
-            .and_then(|p| p.get("decimals"))
-            .and_then(Value::as_u64)
-            .unwrap_or(if chain.eq_ignore_ascii_case("solana") {
-                9
-            } else {
-                18
-            }) as i32;
-        let native_amount = native.map(|n| n / 10f64.powi(decimals));
-        let usd_amount = payment
-            .and_then(|p| p.get("price_usd").or_else(|| p.get("usd")))
-            .and_then(json_number);
-        out.push(SaleEvent {
-            tx_hash: event
-                .get("transaction")
-                .and_then(|t| t.get("hash").or(Some(t)))
-                .and_then(Value::as_str)
-                .or_else(|| event.get("transaction_hash").and_then(Value::as_str))
-                .unwrap_or("")
-                .to_owned(),
-            token_id,
-            seller: normalize_chain_address(
-                chain,
-                event
-                    .get("seller")
-                    .and_then(|s| s.get("address").or(Some(s)))
-                    .and_then(Value::as_str)
-                    .unwrap_or(""),
-            ),
-            buyer: normalize_chain_address(
-                chain,
-                event
-                    .get("buyer")
-                    .and_then(|b| b.get("address").or(Some(b)))
-                    .and_then(Value::as_str)
-                    .unwrap_or(""),
-            ),
-            timestamp: event
-                .get("event_timestamp")
-                .and_then(Value::as_i64)
-                .or_else(|| {
-                    event
-                        .get("event_timestamp")
-                        .and_then(Value::as_str)
-                        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .map(|dt| dt.timestamp())
-                }),
-            block_number: None,
-            marketplace: Some("opensea".into()),
-            native_amount,
-            usd_amount,
-            currency_symbol: payment
-                .and_then(|p| p.get("symbol"))
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            currency_address: payment
-                .and_then(|p| {
-                    p.get("contract_address")
-                        .or_else(|| p.get("token_address"))
-                        .or_else(|| p.get("address"))
-                })
-                .and_then(Value::as_str)
-                .map(|address| normalize_chain_address(chain, address)),
-            sale_price_raw: None,
-            // OpenSea activity does not expose a fee split in this payload, so
-            // gross payment must not be mislabeled as seller net proceeds.
-            seller_proceeds_native: None,
-            seller_proceeds_usd: None,
-            marketplace_fee_native: None,
-            marketplace_fee_usd: None,
-            marketplace_fee_currency_symbol: None,
-            marketplace_fee_currency_address: None,
-            royalty_fee_native: None,
-            royalty_fee_usd: None,
-            royalty_fee_currency_symbol: None,
-            royalty_fee_currency_address: None,
-            royalty_recipient: None,
-            gas_native: None,
-            fee_payer: None,
-        });
-    }
-    out
+        .into_iter()
+        .flatten()
 }
 
-/// OpenSea contract → collection slug (fallback when Alchemy has no slug).
+fn parse_sale_event(event: &Value, chain: &str) -> Option<crate::enrich::types::SaleEvent> {
+    use crate::enrich::types::{SaleEvent, normalize_chain_address};
+    let event_type = event
+        .get("event_type")
+        .or_else(|| event.get("type"))
+        .and_then(Value::as_str)
+        .unwrap_or("sale");
+    if !event_type.eq_ignore_ascii_case("sale") && !event_type.eq_ignore_ascii_case("order") {
+        // Still accept order-fulfilled style sale payloads that include payment.
+        if event.get("payment").is_none() && event.get("total_price").is_none() {
+            return None;
+        }
+    }
+    let nft = event.get("nft").or_else(|| event.get("asset"));
+    let token_id = nft
+        .and_then(|n| n.get("identifier").or_else(|| n.get("token_id")))
+        .map(|value| crate::enrich::alchemy::normalize_token_id(Some(value)))
+        .unwrap_or_default();
+    let payment = event.get("payment");
+    let native = payment
+        .and_then(|p| p.get("quantity").or_else(|| p.get("amount")))
+        .and_then(json_number)
+        .or_else(|| event.get("total_price").and_then(json_number));
+    let decimals = payment
+        .and_then(|p| p.get("decimals"))
+        .and_then(Value::as_u64)
+        .unwrap_or(if chain.eq_ignore_ascii_case("solana") {
+            9
+        } else {
+            18
+        }) as i32;
+    let native_amount = native.map(|n| n / 10f64.powi(decimals));
+    let usd_amount = payment
+        .and_then(|p| p.get("price_usd").or_else(|| p.get("usd")))
+        .and_then(json_number);
+    Some(SaleEvent {
+        tx_hash: event
+            .get("transaction")
+            .and_then(|t| t.get("hash").or(Some(t)))
+            .and_then(Value::as_str)
+            .or_else(|| event.get("transaction_hash").and_then(Value::as_str))
+            .unwrap_or("")
+            .to_owned(),
+        token_id,
+        seller: normalize_chain_address(
+            chain,
+            event
+                .get("seller")
+                .and_then(|s| s.get("address").or(Some(s)))
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        ),
+        buyer: normalize_chain_address(
+            chain,
+            event
+                .get("buyer")
+                .and_then(|b| b.get("address").or(Some(b)))
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        ),
+        timestamp: event
+            .get("event_timestamp")
+            .and_then(Value::as_i64)
+            .or_else(|| {
+                event
+                    .get("event_timestamp")
+                    .and_then(Value::as_str)
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .map(|dt| dt.timestamp())
+            }),
+        block_number: None,
+        marketplace: Some("opensea".into()),
+        native_amount,
+        usd_amount,
+        currency_symbol: payment
+            .and_then(|p| p.get("symbol"))
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        currency_address: payment
+            .and_then(|p| {
+                p.get("contract_address")
+                    .or_else(|| p.get("token_address"))
+                    .or_else(|| p.get("address"))
+            })
+            .and_then(Value::as_str)
+            .map(|address| normalize_chain_address(chain, address)),
+        sale_price_raw: None,
+        // OpenSea activity does not expose a fee split in this payload, so
+        // gross payment must not be mislabeled as seller net proceeds.
+        seller_proceeds_native: None,
+        seller_proceeds_usd: None,
+        marketplace_fee_native: None,
+        marketplace_fee_usd: None,
+        marketplace_fee_currency_symbol: None,
+        marketplace_fee_currency_address: None,
+        royalty_fee_native: None,
+        royalty_fee_usd: None,
+        royalty_fee_currency_symbol: None,
+        royalty_fee_currency_address: None,
+        royalty_recipient: None,
+        gas_native: None,
+        fee_payer: None,
+    })
+}
+
+fn address_like(value: &Value) -> Option<&str> {
+    value.as_str().or_else(|| {
+        ["address", "hash", "token", "contract_address"]
+            .into_iter()
+            .find_map(|field| value.get(field).and_then(address_like))
+    })
+}
+
+fn event_matches_contract(event: &Value, chain: &str, expected: &str) -> bool {
+    let nft = event
+        .get("nft")
+        .or_else(|| event.get("asset"))
+        .unwrap_or(&Value::Null);
+    let actual = nft
+        .get("contract")
+        .or_else(|| nft.get("contract_address"))
+        .or_else(|| nft.get("asset_contract"))
+        .or_else(|| event.get("asset_contract_address"))
+        .and_then(address_like);
+    actual.is_none_or(|actual| {
+        super::types::normalize_chain_address(chain, actual)
+            == super::types::normalize_chain_address(chain, expected)
+    })
+}
+
+type ContractSlugCache = Mutex<HashMap<(String, String, String), Option<String>>>;
+
+fn contract_slug_cache() -> &'static ContractSlugCache {
+    static CACHE: OnceLock<ContractSlugCache> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+async fn fetch_contract_collection_slug_result(
+    client: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    chain: &str,
+    contract: &str,
+) -> Result<Option<String>, Analysis2Error> {
+    let chain_q = opensea_chain_query(chain);
+    let key = (
+        base_url.trim_end_matches('/').to_owned(),
+        chain_q.to_owned(),
+        super::types::normalize_chain_address(chain, contract),
+    );
+    if let Ok(cache) = contract_slug_cache().lock()
+        && let Some(slug) = cache.get(&key)
+    {
+        return Ok(slug.clone());
+    }
+    let url = format!(
+        "{}/api/v2/chain/{chain_q}/contract/{}",
+        base_url.trim_end_matches('/'),
+        urlencoding_minimal(contract)
+    );
+    let payload = client
+        .get_json_opensea(&url, &[("x-api-key", api_key)])
+        .await?;
+    let slug = payload
+        .get("collection")
+        .and_then(|collection| {
+            collection.as_str().or_else(|| {
+                collection
+                    .get("slug")
+                    .or_else(|| collection.get("collection_slug"))
+                    .and_then(Value::as_str)
+            })
+        })
+        .map(str::trim)
+        .filter(|slug| !slug.is_empty())
+        .map(str::to_owned);
+    if let Ok(mut cache) = contract_slug_cache().lock() {
+        cache.insert(key, slug.clone());
+    }
+    Ok(slug)
+}
+
+/// OpenSea contract → collection slug.
 pub async fn fetch_contract_collection_slug(
     client: &HttpClient,
     base_url: &str,
@@ -471,28 +594,10 @@ pub async fn fetch_contract_collection_slug(
     contract: &str,
 ) -> Option<String> {
     let api_key = api_key?;
-    let chain_q = opensea_chain_query(chain);
-    let url = format!(
-        "{}/api/v2/chain/{chain_q}/contract/{}",
-        base_url.trim_end_matches('/'),
-        urlencoding_minimal(contract)
-    );
-    let payload = client
-        .get_json_opensea(&url, &[("x-api-key", api_key)])
+    fetch_contract_collection_slug_result(client, base_url, api_key, chain, contract)
         .await
-        .ok()?;
-    if let Some(s) = payload.get("collection").and_then(Value::as_str) {
-        let s = s.trim();
-        return (!s.is_empty()).then(|| s.to_owned());
-    }
-    let collection = payload.get("collection")?;
-    let slug = collection
-        .get("slug")
-        .or_else(|| collection.get("collection_slug"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|s| !s.is_empty())?;
-    Some(slug.to_owned())
+        .ok()
+        .flatten()
 }
 
 #[cfg(test)]
@@ -608,16 +713,24 @@ mod tests {
     #[tokio::test]
     async fn contract_sales_follows_next_cursor_until_complete() {
         let server = MockServer::start_async().await;
+        let contract = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/api/v2/chain/ethereum/contract/0xcontract");
+                then.status(200)
+                    .json_body(json!({"collection": "test-collection"}));
+            })
+            .await;
         let second = server
             .mock_async(|when, then| {
                 when.method(GET)
-                    .path("/api/v2/events/nft")
+                    .path("/api/v2/events/collection/test-collection")
                     .query_param("next", "cursor-1");
                 then.status(200).json_body(json!({
                     "asset_events": [{
                         "event_type": "sale",
                         "transaction_hash": "0xsecond",
-                        "nft": {"identifier": "0x2"},
+                        "nft": {"contract": "0xcontract", "identifier": "0x2"},
                         "seller": "0xseller",
                         "buyer": "0xbuyer",
                         "payment": {"quantity": "2000000000000000000", "decimals": 18}
@@ -627,12 +740,13 @@ mod tests {
             .await;
         let first = server
             .mock_async(|when, then| {
-                when.method(GET).path("/api/v2/events/nft");
+                when.method(GET)
+                    .path("/api/v2/events/collection/test-collection");
                 then.status(200).json_body(json!({
                     "asset_events": [{
                         "event_type": "sale",
                         "transaction_hash": "0xfirst",
-                        "nft": {"identifier": "0x1"},
+                        "nft": {"contract": "0xcontract", "identifier": "0x1"},
                         "seller": "0xseller",
                         "buyer": "0xbuyer",
                         "payment": {"quantity": "1000000000000000000", "decimals": 18}
@@ -661,6 +775,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["1", "2"]
         );
+        assert_eq!(contract.hits(), 1);
         assert_eq!(first.hits(), 1);
         assert_eq!(second.hits(), 1);
     }

@@ -10,8 +10,8 @@ use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 use crate::progress::{NoopProgress, ProgressObserver};
 
-use super::alchemy;
-use super::controllers::{self, normalize_evm_address};
+use super::alchemy::{self, FetchOutcome};
+use super::controllers::{self, EvmControllerEvidence, normalize_evm_address};
 use super::helius;
 use super::http::HttpClient;
 use super::opensea;
@@ -36,16 +36,25 @@ struct SeedCache {
 }
 
 #[derive(Clone, Debug)]
-struct CandidateProbe {
-    chain: String,
-    address: String,
-    controllers: Vec<String>,
-    collection_slug: Option<String>,
+pub(super) struct CandidateProbe {
+    pub chain: String,
+    pub address: String,
+    pub controllers: Vec<String>,
+    pub collection_slug: Option<String>,
+    pub evm_controllers: Option<FetchOutcome<EvmControllerEvidence>>,
+    pub solana_snapshot: Option<FetchOutcome<helius::SolanaAssetSnapshot>>,
+}
+
+#[derive(Clone, Default)]
+struct CandidatePrefetch {
+    evm_controllers: Option<FetchOutcome<EvmControllerEvidence>>,
+    solana_slug: Option<Option<String>>,
 }
 
 pub(super) struct LegitPreflight {
     pub evidence: AHashMap<ContractId, EvidenceBundle>,
     pub candidates_to_enrich: Vec<ContractId>,
+    pub candidate_probes: AHashMap<ContractId, CandidateProbe>,
 }
 
 fn seed_key(chain: &str, address: &str) -> String {
@@ -269,22 +278,34 @@ async fn build_candidate_probe(
     limits: &HttpLimits,
     candidate_id: ContractId,
     resolve_slug: bool,
+    prefetch: CandidatePrefetch,
 ) -> CandidateProbe {
     let contract = &store.contracts[candidate_id as usize];
     let chain = store.chain_name(contract.chain_id).to_owned();
     let address = contract.address.clone();
 
     if store.is_evm_chain(&chain) {
-        let controller_probe = controllers::fetch_evm_controllers(
-            client,
-            &limits.endpoints,
-            keys.alchemy(),
-            &chain,
-            &address,
-        );
+        let controller_probe = async {
+            match prefetch.evm_controllers {
+                Some(outcome) => outcome,
+                None => {
+                    controllers::fetch_evm_controllers(
+                        client,
+                        &limits.endpoints,
+                        keys.alchemy(),
+                        &chain,
+                        &address,
+                    )
+                    .await
+                }
+            }
+        };
         let slug_probe = async {
             if resolve_slug {
-                resolve_collection_slug(client, limits, keys, &chain, &address).await
+                match prefetch.solana_slug {
+                    Some(slug) => slug,
+                    None => resolve_collection_slug(client, limits, keys, &chain, &address).await,
+                }
             } else {
                 None
             }
@@ -293,8 +314,10 @@ async fn build_candidate_probe(
         CandidateProbe {
             chain,
             address,
-            controllers: controllers.value.addresses,
+            controllers: controllers.value.addresses.clone(),
             collection_slug,
+            evm_controllers: Some(controllers),
+            solana_snapshot: None,
         }
     } else {
         let asset_probe = helius::fetch_collection_assets(
@@ -302,7 +325,7 @@ async fn build_candidate_probe(
             &limits.endpoints.helius,
             keys.helius(),
             &address,
-            limits.max_solana_assets.clamp(1, 50),
+            limits.max_solana_assets,
         );
         let slug_probe = async {
             if resolve_slug {
@@ -315,8 +338,10 @@ async fn build_candidate_probe(
         CandidateProbe {
             chain,
             address,
-            controllers: snapshot.value.authority,
+            controllers: snapshot.value.authority.clone(),
             collection_slug,
+            evm_controllers: None,
+            solana_snapshot: Some(snapshot),
         }
     }
 }
@@ -466,6 +491,7 @@ pub(super) async fn prefilter_candidates(
         return Ok(LegitPreflight {
             evidence,
             candidates_to_enrich: registry.candidate_contracts().to_vec(),
+            candidate_probes: AHashMap::new(),
         });
     }
 
@@ -506,6 +532,60 @@ pub(super) async fn prefilter_candidates(
         Some(registry.candidate_contracts().len() as u64),
     );
     let slug_candidates_ref = &slug_candidates;
+    let solana_slug_rows: Vec<(ContractId, String)> = slug_candidates
+        .iter()
+        .filter_map(|&candidate_id| {
+            let contract = &store.contracts[candidate_id as usize];
+            let chain = store.chain_name(contract.chain_id);
+            chain
+                .eq_ignore_ascii_case("solana")
+                .then(|| (candidate_id, contract.address.clone()))
+        })
+        .collect();
+    let solana_slug_addresses: Vec<String> = solana_slug_rows
+        .iter()
+        .map(|(_, address)| address.clone())
+        .collect();
+    let evm_controller_requests: Vec<(ContractId, String, String)> = registry
+        .candidate_contracts()
+        .iter()
+        .filter_map(|&candidate_id| {
+            let contract = &store.contracts[candidate_id as usize];
+            let chain = store.chain_name(contract.chain_id);
+            store
+                .is_evm_chain(chain)
+                .then(|| (candidate_id, chain.to_owned(), contract.address.clone()))
+        })
+        .collect();
+    let (solana_slug_values, prefetched_evm_controllers) = tokio::join!(
+        helius::fetch_collection_identities_batch(
+            client,
+            &limits.endpoints.helius,
+            keys.helius(),
+            &solana_slug_addresses,
+        ),
+        controllers::fetch_evm_controllers_batch(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            &evm_controller_requests,
+        ),
+    );
+    let prefetched_solana_slugs: AHashMap<ContractId, Option<String>> = solana_slug_rows
+        .into_iter()
+        .map(|(candidate_id, address)| {
+            (
+                candidate_id,
+                solana_slug_values
+                    .get(&address)
+                    .cloned()
+                    .flatten()
+                    .map(|slug| slug.to_ascii_lowercase()),
+            )
+        })
+        .collect();
+    let prefetched_solana_slugs_ref = &prefetched_solana_slugs;
+    let prefetched_evm_controllers_ref = &prefetched_evm_controllers;
     let mut candidate_results = stream::iter(registry.candidate_contracts().iter().copied().map(
         |candidate_id| async move {
             (
@@ -517,6 +597,10 @@ pub(super) async fn prefilter_candidates(
                     limits,
                     candidate_id,
                     slug_candidates_ref.contains(&candidate_id),
+                    CandidatePrefetch {
+                        evm_controllers: prefetched_evm_controllers_ref.get(&candidate_id).cloned(),
+                        solana_slug: prefetched_solana_slugs_ref.get(&candidate_id).cloned(),
+                    },
                 )
                 .await,
             )
@@ -578,9 +662,10 @@ pub(super) async fn prefilter_candidates(
 
     let mut evidence = AHashMap::with_capacity(candidate_probes.len());
     let mut candidates_to_enrich = Vec::new();
-    for (candidate_id, probe) in candidate_probes {
-        let mut bundle = EvidenceBundle::empty(candidate_id, probe.chain, probe.address);
-        bundle.controllers = probe.controllers;
+    for (&candidate_id, probe) in &candidate_probes {
+        let mut bundle =
+            EvidenceBundle::empty(candidate_id, probe.chain.clone(), probe.address.clone());
+        bundle.controllers = probe.controllers.clone();
         if let Some(rows) = relation_legit.remove(&candidate_id) {
             for (key, signals) in rows {
                 bundle.relation_legit.insert(key, signals);
@@ -599,6 +684,7 @@ pub(super) async fn prefilter_candidates(
     Ok(LegitPreflight {
         evidence,
         candidates_to_enrich,
+        candidate_probes,
     })
 }
 

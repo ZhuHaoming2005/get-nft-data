@@ -6,8 +6,10 @@
 //! Truncated, so formal reports never pretend a one-page partial history is complete.
 
 use std::collections::BTreeSet;
+use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
+use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 
 use super::alchemy::{self, FetchOutcome, NativeTransfer};
 use super::http::HttpClient;
@@ -20,6 +22,78 @@ use super::types::{
 const ZERO: &str = "0x0000000000000000000000000000000000000000";
 /// Cap operator seeds so enrich stays bounded.
 const MAX_OPERATORS: usize = 16;
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct ExternalTransferKey {
+    chain: String,
+    address: String,
+    direction: String,
+    from_block: u64,
+    to_block: u64,
+}
+
+type SharedExternalCell = Arc<OnceCell<FetchOutcome<Vec<NativeTransfer>>>>;
+
+/// Run-scoped singleflight for Alchemy EXTERNAL transfer requests. It is shared
+/// by preliminary/final value-flow passes and mint-payment attribution.
+#[derive(Clone, Default)]
+pub struct ExternalTransferCache {
+    cells: Arc<AsyncMutex<AHashMap<ExternalTransferKey, SharedExternalCell>>>,
+}
+
+impl ExternalTransferCache {
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch(
+        &self,
+        client: &HttpClient,
+        endpoints: &ProviderEndpoints,
+        api_key: Option<&str>,
+        chain: &str,
+        address: &str,
+        direction: &str,
+        from_block: u64,
+        to_block: u64,
+        request_id: usize,
+    ) -> FetchOutcome<Vec<NativeTransfer>> {
+        let key = ExternalTransferKey {
+            chain: chain.trim().to_ascii_lowercase(),
+            address: normalize_chain_address(chain, address),
+            direction: direction.to_owned(),
+            from_block,
+            to_block,
+        };
+        let cell = {
+            let mut cells = self.cells.lock().await;
+            cells
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let outcome = cell
+            .get_or_init(|| async {
+                alchemy::fetch_external_transfers(
+                    client, endpoints, api_key, chain, address, direction, from_block, to_block,
+                    request_id,
+                )
+                .await
+            })
+            .await
+            .clone();
+        if !matches!(
+            outcome.status,
+            EvidenceStatus::Complete | EvidenceStatus::Empty
+        ) {
+            let mut cells = self.cells.lock().await;
+            if cells
+                .get(&key)
+                .is_some_and(|known| Arc::ptr_eq(known, &cell))
+            {
+                cells.remove(&key);
+            }
+        }
+        outcome
+    }
+}
 
 /// Normalize, sort, and cap a previously classified operator seed set.
 pub fn collect_operator_seeds(addresses: &[String]) -> (Vec<String>, bool) {
@@ -238,6 +312,54 @@ pub async fn fetch_evm_value_flows(
     transfers: &[TransferEvent],
     sales: &[SaleEvent],
 ) -> FetchOutcome<Vec<ValueFlowEdge>> {
+    fetch_evm_value_flows_impl(
+        client,
+        endpoints,
+        api_key,
+        chain,
+        operator_seeds,
+        transfers,
+        sales,
+        None,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+pub async fn fetch_evm_value_flows_cached(
+    client: &HttpClient,
+    endpoints: &ProviderEndpoints,
+    api_key: Option<&str>,
+    chain: &str,
+    operator_seeds: &[String],
+    transfers: &[TransferEvent],
+    sales: &[SaleEvent],
+    cache: &ExternalTransferCache,
+) -> FetchOutcome<Vec<ValueFlowEdge>> {
+    fetch_evm_value_flows_impl(
+        client,
+        endpoints,
+        api_key,
+        chain,
+        operator_seeds,
+        transfers,
+        sales,
+        Some(cache.clone()),
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_evm_value_flows_impl(
+    client: &HttpClient,
+    endpoints: &ProviderEndpoints,
+    api_key: Option<&str>,
+    chain: &str,
+    operator_seeds: &[String],
+    transfers: &[TransferEvent],
+    sales: &[SaleEvent],
+    cache: Option<ExternalTransferCache>,
+) -> FetchOutcome<Vec<ValueFlowEdge>> {
     let Some(api_key) = api_key else {
         return FetchOutcome::skipped("alchemy_value_flows");
     };
@@ -265,19 +387,39 @@ pub async fn fetch_evm_value_flows(
             let chain = chain.to_owned();
             let address = address.clone();
             let dir = direction.to_owned();
+            let cache = cache.clone();
             handles.push(tokio::spawn(async move {
-                alchemy::fetch_external_transfers(
-                    &client,
-                    &endpoints,
-                    Some(&api_key),
-                    &chain,
-                    &address,
-                    &dir,
-                    from_block,
-                    to_block,
-                    idx,
-                )
-                .await
+                match cache {
+                    Some(cache) => {
+                        cache
+                            .fetch(
+                                &client,
+                                &endpoints,
+                                Some(&api_key),
+                                &chain,
+                                &address,
+                                &dir,
+                                from_block,
+                                to_block,
+                                idx,
+                            )
+                            .await
+                    }
+                    None => {
+                        alchemy::fetch_external_transfers(
+                            &client,
+                            &endpoints,
+                            Some(&api_key),
+                            &chain,
+                            &address,
+                            &dir,
+                            from_block,
+                            to_block,
+                            idx,
+                        )
+                        .await
+                    }
+                }
             }));
         }
     }
@@ -393,7 +535,48 @@ pub async fn fetch_evm_value_flows(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use httpmock::{Method::POST, MockServer};
     use serde_json::json;
+
+    #[tokio::test]
+    async fn external_transfer_cache_singleflights_identical_requests() {
+        let server = MockServer::start_async().await;
+        let rpc = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/rpc")
+                    .body_contains("alchemy_getAssetTransfers");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": "external-from-0",
+                    "result": {"transfers": []}
+                }));
+            })
+            .await;
+        let endpoints = ProviderEndpoints {
+            alchemy_rpc_template: format!("{}/rpc", server.base_url()),
+            ..ProviderEndpoints::default()
+        };
+        let client = HttpClient::with_retries(2, 0).unwrap();
+        let cache = ExternalTransferCache::default();
+        for request_id in 0..2 {
+            let outcome = cache
+                .fetch(
+                    &client,
+                    &endpoints,
+                    Some("key"),
+                    "ethereum",
+                    "0x1111111111111111111111111111111111111111",
+                    "from",
+                    0,
+                    u64::MAX,
+                    request_id,
+                )
+                .await;
+            assert_eq!(outcome.status, EvidenceStatus::Empty);
+        }
+        assert_eq!(rpc.hits(), 1);
+    }
 
     fn transfer(
         tx: &str,

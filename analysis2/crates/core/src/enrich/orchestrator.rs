@@ -8,7 +8,7 @@ use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 use crate::progress::ProgressObserver;
 
-use super::alchemy::{self, FetchOutcome, sales_need_opensea_fallback};
+use super::alchemy::{self, FetchOutcome};
 use super::controllers;
 use super::etherscan;
 use super::helius::{self, holders_from_assets};
@@ -53,8 +53,12 @@ pub async fn enrich_candidates_with_hook(
     let preflight =
         legit_detect::prefilter_candidates(registry, store, &client, keys, limits, progress)
             .await?;
-    let candidates = preflight.candidates_to_enrich;
-    let mut out = preflight.evidence;
+    let legit_detect::LegitPreflight {
+        evidence,
+        candidates_to_enrich: candidates,
+        candidate_probes,
+    } = preflight;
+    let mut out = evidence;
     let enrich_set: ahash::AHashSet<ContractId> = candidates.iter().copied().collect();
 
     // Persist legit-only preflight rows immediately so a cancel mid-HTTP still
@@ -77,6 +81,10 @@ pub async fn enrich_candidates_with_hook(
         .concurrency
         .max(1)
         .saturating_mul(CANDIDATE_TASK_MULTIPLIER);
+    let price_cache = alchemy::PriceRequestCache::default();
+    let external_transfer_cache = value_flow::ExternalTransferCache::default();
+    let receipt_cache = alchemy::ReceiptRequestCache::default();
+    let solana_transaction_cache = helius::TransactionRequestCache::default();
 
     let mut stream = stream::iter(candidates.iter().copied().map(|contract_id| {
         let client = client.clone();
@@ -87,11 +95,39 @@ pub async fn enrich_candidates_with_hook(
             .to_owned();
         let address = store.contracts[contract_id as usize].address.clone();
         let is_evm = store.is_evm_chain(&chain);
+        let probe = candidate_probes.get(&contract_id).cloned();
+        let price_cache = price_cache.clone();
+        let external_transfer_cache = external_transfer_cache.clone();
+        let receipt_cache = receipt_cache.clone();
+        let solana_transaction_cache = solana_transaction_cache.clone();
         async move {
             let bundle = if is_evm {
-                enrich_evm(contract_id, &chain, &address, &client, &keys, &limits).await
+                enrich_evm(
+                    contract_id,
+                    &chain,
+                    &address,
+                    &client,
+                    &keys,
+                    &limits,
+                    probe,
+                    &price_cache,
+                    &external_transfer_cache,
+                    &receipt_cache,
+                )
+                .await
             } else {
-                enrich_solana(contract_id, &chain, &address, &client, &keys, &limits).await
+                enrich_solana(
+                    contract_id,
+                    &chain,
+                    &address,
+                    &client,
+                    &keys,
+                    &limits,
+                    probe,
+                    &price_cache,
+                    &solana_transaction_cache,
+                )
+                .await
             };
             (contract_id, bundle)
         }
@@ -115,6 +151,7 @@ pub async fn enrich_candidates_with_hook(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enrich_evm(
     contract_id: ContractId,
     chain: &str,
@@ -122,6 +159,10 @@ async fn enrich_evm(
     client: &HttpClient,
     keys: &ApiKeys,
     limits: &HttpLimits,
+    prefetch: Option<legit_detect::CandidateProbe>,
+    price_cache: &alchemy::PriceRequestCache,
+    external_transfer_cache: &value_flow::ExternalTransferCache,
+    receipt_cache: &alchemy::ReceiptRequestCache,
 ) -> EvidenceBundle {
     let mut bundle = EvidenceBundle::empty(contract_id, chain, address);
     bundle.quality.gas = EvidenceStatus::NotRequested;
@@ -129,6 +170,27 @@ async fn enrich_evm(
 
     // These provider calls are independent. Starting them together removes
     // three full network round trips from the common EVM critical path.
+    let prefetched_controllers = prefetch
+        .as_ref()
+        .and_then(|probe| probe.evm_controllers.clone());
+    let prefetched_slug = prefetch
+        .as_ref()
+        .and_then(|probe| probe.collection_slug.as_deref());
+    let controllers = async {
+        match prefetched_controllers {
+            Some(outcome) => outcome,
+            None => {
+                controllers::fetch_evm_controllers(
+                    client,
+                    &limits.endpoints,
+                    keys.alchemy(),
+                    chain,
+                    address,
+                )
+                .await
+            }
+        }
+    };
     let (mut transfers, holders, mut sales, controllers_out) = tokio::join!(
         alchemy::fetch_transfers(
             client,
@@ -146,21 +208,16 @@ async fn enrich_evm(
             address,
             limits.max_holder_pages,
         ),
-        alchemy::fetch_sales(
+        opensea::fetch_contract_sales_with_slug(
             client,
-            &limits.endpoints,
-            keys.alchemy(),
+            &limits.endpoints.opensea,
+            keys.opensea(),
             chain,
             address,
             limits.max_sale_pages,
+            prefetched_slug,
         ),
-        controllers::fetch_evm_controllers(
-            client,
-            &limits.endpoints,
-            keys.alchemy(),
-            chain,
-            address,
-        ),
+        controllers,
     );
 
     if matches!(
@@ -186,43 +243,6 @@ async fn enrich_evm(
         }
     }
 
-    if sales_need_opensea_fallback(&sales.value, sales.status) {
-        let os = opensea::fetch_contract_sales(
-            client,
-            &limits.endpoints.opensea,
-            keys.opensea(),
-            chain,
-            address,
-            limits.max_sale_pages,
-        )
-        .await;
-        if matches!(
-            os.status,
-            EvidenceStatus::Empty | EvidenceStatus::Complete | EvidenceStatus::Truncated
-        ) {
-            if matches!(sales.status, EvidenceStatus::Failed)
-                && let Some(failure) = sales.failure.take()
-            {
-                bundle.quality.failures.push(failure);
-            }
-            if sales.value.is_empty() {
-                sales = os;
-            } else {
-                fill_missing_sale_amounts(&mut sales.value, &os.value, chain);
-                sales.status = combine_required_status(Some(sales.status), Some(os.status));
-                sales.truncated |= os.truncated;
-                if let Some(obs) = os.observation {
-                    bundle.provenance.push(obs);
-                }
-            }
-        } else if let Some(obs) = os.observation {
-            bundle.provenance.push(obs);
-            if let Some(failure) = os.failure {
-                bundle.quality.failures.push(failure);
-            }
-        }
-    }
-
     let deployed_block = controllers_out.value.deployed_block;
 
     // Spot price, activity receipt gas, and deployment receipt gas are independent.
@@ -230,7 +250,7 @@ async fn enrich_evm(
     let payment_symbols = price_symbols_for_sales(&sales.value);
     let payment_addresses = price_addresses_for_sales(&sales.value, chain);
     let (prices, gas, deployment, royalty_recipients) = tokio::join!(
-        alchemy::fetch_prices(
+        price_cache.fetch(
             client,
             &limits.endpoints,
             keys.alchemy(),
@@ -238,7 +258,7 @@ async fn enrich_evm(
             &payment_symbols,
             &payment_addresses,
         ),
-        alchemy::fetch_receipt_gas(client, &limits.endpoints, keys.alchemy(), chain, &tx_hashes,),
+        receipt_cache.fetch(client, &limits.endpoints, keys.alchemy(), chain, &tx_hashes,),
         alchemy::fetch_deployment(
             client,
             &limits.endpoints,
@@ -337,7 +357,7 @@ async fn enrich_evm(
     // A controlled-recipient pass supplies mint-payment evidence. After payments are
     // attached, derive the final binary operator set and query that exact set.
     let (mut preliminary_flows, mint_extras) = tokio::join!(
-        value_flow::fetch_evm_value_flows(
+        value_flow::fetch_evm_value_flows_cached(
             client,
             &limits.endpoints,
             keys.alchemy(),
@@ -345,8 +365,16 @@ async fn enrich_evm(
             &preliminary_operator_seeds,
             &bundle.transfers,
             &bundle.sales,
+            external_transfer_cache,
         ),
-        collect_evm_mint_payment_extras(client, keys, limits, chain, &bundle.transfers),
+        collect_evm_mint_payment_extras(
+            client,
+            keys,
+            limits,
+            chain,
+            &bundle.transfers,
+            external_transfer_cache,
+        ),
     );
     apply_runtime_price_to_value_flows(&mut preliminary_flows.value, &bundle.prices, chain);
     mint_payment::attach_mint_payments(
@@ -399,7 +427,7 @@ async fn enrich_evm(
         if let Some(failure) = preliminary_flows.failure.take() {
             bundle.quality.failures.push(failure);
         }
-        value_flow::fetch_evm_value_flows(
+        value_flow::fetch_evm_value_flows_cached(
             client,
             &limits.endpoints,
             keys.alchemy(),
@@ -407,6 +435,7 @@ async fn enrich_evm(
             &operator_seeds,
             &bundle.transfers,
             &bundle.sales,
+            external_transfer_cache,
         )
         .await
     };
@@ -424,14 +453,15 @@ async fn enrich_evm(
     let mut flow_tx_hashes = alchemy::value_flow_tx_hashes(&bundle.value_flows);
     flow_tx_hashes.retain(|hash| !gas.value.contains_key(hash));
     if !flow_tx_hashes.is_empty() {
-        let flow_gas = alchemy::fetch_receipt_gas(
-            client,
-            &limits.endpoints,
-            keys.alchemy(),
-            chain,
-            &flow_tx_hashes,
-        )
-        .await;
+        let flow_gas = receipt_cache
+            .fetch(
+                client,
+                &limits.endpoints,
+                keys.alchemy(),
+                chain,
+                &flow_tx_hashes,
+            )
+            .await;
         let combined = combine_required_status(Some(bundle.quality.gas), Some(flow_gas.status));
         bundle.quality.gas = combined;
         if let Some(obs) = flow_gas.observation.clone() {
@@ -462,6 +492,7 @@ async fn enrich_evm(
     bundle
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn enrich_solana(
     contract_id: ContractId,
     chain: &str,
@@ -469,19 +500,27 @@ async fn enrich_solana(
     client: &HttpClient,
     keys: &ApiKeys,
     limits: &HttpLimits,
+    prefetch: Option<legit_detect::CandidateProbe>,
+    price_cache: &alchemy::PriceRequestCache,
+    transaction_cache: &helius::TransactionRequestCache,
 ) -> EvidenceBundle {
     let mut bundle = EvidenceBundle::empty(contract_id, chain, address);
     bundle.quality.gas = EvidenceStatus::NotRequested;
     bundle.quality.value_flows = EvidenceStatus::NotRequested;
 
-    let snapshot = helius::fetch_collection_assets(
-        client,
-        &limits.endpoints.helius,
-        keys.helius(),
-        address,
-        limits.max_solana_assets,
-    )
-    .await;
+    let snapshot = match prefetch.and_then(|probe| probe.solana_snapshot) {
+        Some(snapshot) => snapshot,
+        None => {
+            helius::fetch_collection_assets(
+                client,
+                &limits.endpoints.helius,
+                keys.helius(),
+                address,
+                limits.max_solana_assets,
+            )
+            .await
+        }
+    };
 
     let holders = holders_from_assets(&snapshot.value.assets);
     let holder_status = match snapshot.status {
@@ -510,15 +549,24 @@ async fn enrich_solana(
         });
     }
 
-    let history = helius::fetch_asset_histories(
-        client,
-        &limits.endpoints.helius,
-        keys.helius(),
-        &snapshot.value.assets,
-        limits.max_history_assets,
-        limits.max_signatures_per_asset,
-    )
-    .await;
+    let (history, mut market_sales) = tokio::join!(
+        helius::fetch_asset_histories(
+            client,
+            &limits.endpoints.helius,
+            keys.helius(),
+            &snapshot.value.assets,
+            limits.max_history_assets,
+            limits.max_signatures_per_asset,
+        ),
+        opensea::fetch_contract_sales(
+            client,
+            &limits.endpoints.opensea,
+            keys.opensea(),
+            chain,
+            address,
+            limits.max_sale_pages,
+        ),
+    );
 
     let transfer_discovery_complete = matches!(
         history.status,
@@ -526,9 +574,12 @@ async fn enrich_solana(
     ) && !history.truncated
         && !snapshot.truncated
         && snapshot.value.assets.len() <= limits.max_history_assets;
-    let (mut transfers, mut sales) = history.value;
+    // Helius histories remain chain evidence for transfers, gas, and value
+    // flows. Their marketplace labels are decoded only to discover related
+    // transactions and are never published as Sale evidence.
+    let (mut transfers, mut helius_sales) = history.value;
 
-    let (gas, value_flows, decode_stats) = helius::decode_and_attach_transactions(
+    let (gas, value_flows, decode_stats) = helius::decode_and_attach_transactions_cached(
         client,
         &limits.endpoints.helius,
         keys.helius(),
@@ -538,22 +589,24 @@ async fn enrich_solana(
             transfer_discovery_complete,
         },
         &mut transfers,
-        &mut sales,
+        &mut helius_sales,
+        transaction_cache,
     )
     .await;
 
-    let payment_symbols = price_symbols_for_sales(&sales);
-    let payment_addresses = price_addresses_for_sales(&sales, chain);
-    let prices = alchemy::fetch_prices(
-        client,
-        &limits.endpoints,
-        keys.alchemy(),
-        chain,
-        &payment_symbols,
-        &payment_addresses,
-    )
-    .await;
-    apply_prices_to_sales(&mut sales, &prices.value, chain);
+    let payment_symbols = price_symbols_for_sales(&market_sales.value);
+    let payment_addresses = price_addresses_for_sales(&market_sales.value, chain);
+    let prices = price_cache
+        .fetch(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            chain,
+            &payment_symbols,
+            &payment_addresses,
+        )
+        .await;
+    apply_prices_to_sales(&mut market_sales.value, &prices.value, chain);
 
     apply_outcome(
         &mut bundle.quality.assets,
@@ -574,12 +627,10 @@ async fn enrich_solana(
         EvidenceStatus::NotRequested => {
             bundle.quality.histories = EvidenceStatus::NotRequested;
             bundle.quality.transfers = EvidenceStatus::NotRequested;
-            bundle.quality.sales = EvidenceStatus::NotRequested;
         }
         EvidenceStatus::Failed => {
             bundle.quality.histories = EvidenceStatus::Failed;
             bundle.quality.transfers = EvidenceStatus::Failed;
-            bundle.quality.sales = EvidenceStatus::Failed;
             if let Some(failure) = history.failure {
                 bundle.quality.failures.push(failure);
             }
@@ -597,15 +648,9 @@ async fn enrich_solana(
                 decode_stats.transfers_all_complete(),
                 &decode_stats,
             );
-            bundle.quality.sales = helius::field_status_after_decode(
-                sales.is_empty(),
-                page_trunc,
-                decode_stats.sales_all_complete(),
-                &decode_stats,
-            );
             bundle.quality.histories = helius::histories_status_after_decode(
                 transfers.is_empty(),
-                sales.is_empty(),
+                helius_sales.is_empty(),
                 page_trunc,
                 &decode_stats,
             );
@@ -622,7 +667,13 @@ async fn enrich_solana(
         bundle.provenance.push(obs);
     }
     bundle.transfers = std::mem::take(&mut transfers);
-    bundle.sales = std::mem::take(&mut sales);
+    apply_outcome(
+        &mut bundle.quality.sales,
+        &mut bundle.provenance,
+        &mut bundle.quality.failures,
+        &market_sales,
+    );
+    bundle.sales = std::mem::take(&mut market_sales.value);
 
     apply_outcome(
         &mut bundle.quality.gas,
@@ -714,6 +765,7 @@ async fn collect_evm_mint_payment_extras(
     limits: &HttpLimits,
     chain: &str,
     transfers: &[TransferEvent],
+    external_transfer_cache: &value_flow::ExternalTransferCache,
 ) -> MintPaymentExtras {
     use super::value_flow::activity_block_window;
     use ahash::{AHashMap, AHashSet};
@@ -747,19 +799,21 @@ async fn collect_evm_mint_payment_extras(
         let endpoints = limits.endpoints.clone();
         let api_key = keys.alchemy().map(str::to_owned);
         let chain = chain.to_owned();
+        let external_transfer_cache = external_transfer_cache.clone();
         handles.push(tokio::spawn(async move {
-            alchemy::fetch_external_transfers(
-                &client,
-                &endpoints,
-                api_key.as_deref(),
-                &chain,
-                &payer,
-                "from",
-                from_block,
-                to_block,
-                idx,
-            )
-            .await
+            external_transfer_cache
+                .fetch(
+                    &client,
+                    &endpoints,
+                    api_key.as_deref(),
+                    &chain,
+                    &payer,
+                    "from",
+                    from_block,
+                    to_block,
+                    idx,
+                )
+                .await
         }));
     }
     for handle in handles {
@@ -1046,38 +1100,6 @@ fn is_evm_native_sentinel(chain: &str, address: &str) -> bool {
         address.trim().to_ascii_lowercase().as_str(),
         "0x0000000000000000000000000000000000000000" | "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee"
     )
-}
-
-fn fill_missing_sale_amounts(preferred: &mut [SaleEvent], fallback: &[SaleEvent], chain: &str) {
-    for sale in preferred.iter_mut() {
-        if let Some(src) = fallback.iter().find(|f| {
-            (!sale.tx_hash.is_empty()
-                && super::types::normalize_chain_transaction(chain, &f.tx_hash)
-                    == super::types::normalize_chain_transaction(chain, &sale.tx_hash))
-                || (f.token_id == sale.token_id
-                    && !sale.token_id.is_empty()
-                    && f.timestamp == sale.timestamp)
-        }) {
-            if sale.native_amount.is_none() {
-                sale.native_amount = src.native_amount;
-            }
-            if sale.usd_amount.is_none() {
-                sale.usd_amount = src.usd_amount;
-            }
-            if sale.currency_symbol.is_none() {
-                sale.currency_symbol = src.currency_symbol.clone();
-            }
-            if sale.currency_address.is_none() {
-                sale.currency_address = src.currency_address.clone();
-            }
-            if sale.seller_proceeds_native.is_none() {
-                sale.seller_proceeds_native = src.seller_proceeds_native;
-            }
-            if sale.seller_proceeds_usd.is_none() {
-                sale.seller_proceeds_usd = src.seller_proceeds_usd;
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -1368,13 +1390,6 @@ mod tests {
                 then.status(200).json_body(json!({ "owners": [] }));
             })
             .await;
-        let _sales = server
-            .mock_async(|when, then| {
-                when.method(GET).path_contains("/getNFTSales");
-                then.status(200).json_body(json!({ "nftSales": [] }));
-            })
-            .await;
-
         let (store, _seed, cand) =
             store_with_candidate("ethereum", "0x1111111111111111111111111111111111111111");
         let limits = HttpLimits {
@@ -1390,10 +1405,22 @@ mod tests {
         };
         let client = HttpClient::with_retries(limits.concurrency, limits.retries).unwrap();
         let contract = &store.contracts[cand as usize];
-        let bundle = enrich_evm(cand, "ethereum", &contract.address, &client, &keys, &limits).await;
+        let bundle = enrich_evm(
+            cand,
+            "ethereum",
+            &contract.address,
+            &client,
+            &keys,
+            &limits,
+            None,
+            &alchemy::PriceRequestCache::default(),
+            &value_flow::ExternalTransferCache::default(),
+            &alchemy::ReceiptRequestCache::default(),
+        )
+        .await;
         assert_eq!(bundle.quality.transfers, EvidenceStatus::Empty);
         assert_eq!(bundle.quality.holders, EvidenceStatus::Empty);
-        assert_eq!(bundle.quality.sales, EvidenceStatus::Empty);
+        assert_eq!(bundle.quality.sales, EvidenceStatus::NotRequested);
         assert_eq!(bundle.quality.gas, EvidenceStatus::Truncated);
         // No operator seeds without mint fee_payers / controllers.
         assert_eq!(bundle.quality.value_flows, EvidenceStatus::Empty);
@@ -1448,13 +1475,6 @@ mod tests {
                 then.status(200).json_body(json!({ "owners": [] }));
             })
             .await;
-        let _sales = server
-            .mock_async(|when, then| {
-                when.method(GET).path_contains("/getNFTSales");
-                then.status(200).json_body(json!({ "nftSales": [] }));
-            })
-            .await;
-
         let (store, seed, cand) =
             store_with_candidate("ethereum", "0x1111111111111111111111111111111111111111");
         let registry = registry_one(seed, cand);
@@ -1470,7 +1490,19 @@ mod tests {
         };
         let client = HttpClient::with_retries(limits.concurrency, limits.retries).unwrap();
         let contract = &store.contracts[cand as usize];
-        let bundle = enrich_evm(cand, "ethereum", &contract.address, &client, &keys, &limits).await;
+        let bundle = enrich_evm(
+            cand,
+            "ethereum",
+            &contract.address,
+            &client,
+            &keys,
+            &limits,
+            None,
+            &alchemy::PriceRequestCache::default(),
+            &value_flow::ExternalTransferCache::default(),
+            &alchemy::ReceiptRequestCache::default(),
+        )
+        .await;
         assert!(
             bundle
                 .controllers
@@ -1549,13 +1581,6 @@ mod tests {
                 }));
             })
             .await;
-        let _sales = server
-            .mock_async(|when, then| {
-                when.method(GET).path_contains("/getNFTSales");
-                then.status(200).json_body(json!({ "nftSales": [] }));
-            })
-            .await;
-
         let (store, _seed, cand) =
             store_with_candidate("ethereum", "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let limits = HttpLimits {
@@ -1571,7 +1596,19 @@ mod tests {
         };
         let client = HttpClient::with_retries(limits.concurrency, limits.retries).unwrap();
         let contract = &store.contracts[cand as usize];
-        let bundle = enrich_evm(cand, "ethereum", &contract.address, &client, &keys, &limits).await;
+        let bundle = enrich_evm(
+            cand,
+            "ethereum",
+            &contract.address,
+            &client,
+            &keys,
+            &limits,
+            None,
+            &alchemy::PriceRequestCache::default(),
+            &value_flow::ExternalTransferCache::default(),
+            &alchemy::ReceiptRequestCache::default(),
+        )
+        .await;
         assert_eq!(
             bundle.quality.transfers,
             EvidenceStatus::Truncated,
@@ -1598,13 +1635,6 @@ mod tests {
                 then.status(500).body("nope");
             })
             .await;
-        let _sales = server
-            .mock_async(|when, then| {
-                when.method(GET).path_contains("/getNFTSales");
-                then.status(500).body("nope");
-            })
-            .await;
-
         let (store, seed, cand) =
             store_with_candidate("ethereum", "0xcccccccccccccccccccccccccccccccccccccccc");
         let registry = registry_one(seed, cand);
@@ -1626,7 +1656,7 @@ mod tests {
         let bundle = map.get(&cand).unwrap();
         assert_eq!(bundle.quality.transfers, EvidenceStatus::Failed);
         assert_eq!(bundle.quality.holders, EvidenceStatus::Failed);
-        assert_eq!(bundle.quality.sales, EvidenceStatus::Failed);
+        assert_eq!(bundle.quality.sales, EvidenceStatus::NotRequested);
         assert!(!bundle.quality.failures.is_empty());
     }
 
@@ -1658,19 +1688,36 @@ mod tests {
                 then.status(200).json_body(json!({ "owners": [] }));
             })
             .await;
+        let _contract = server
+            .mock_async(|when, then| {
+                when.method(GET).path(
+                    "/opensea/api/v2/chain/ethereum/contract/0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                );
+                then.status(200).json_body(json!({
+                    "collection": "priced-collection"
+                }));
+            })
+            .await;
         let _sales = server
             .mock_async(|when, then| {
-                when.method(GET).path_contains("/getNFTSales");
+                when.method(GET)
+                    .path("/opensea/api/v2/events/collection/priced-collection");
                 then.status(200).json_body(json!({
-                    "nftSales": [{
-                        "transactionHash": "0xsale",
-                        "tokenId": "1",
-                        "sellerAddress": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-                        "buyerAddress": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-                        "blockTimestamp": "2024-01-01T12:00:00Z",
-                        "sellerFee": { "amount": "1000000000000000000", "decimals": 18, "symbol": "ETH" },
-                        "protocolFee": { "amount": "0", "decimals": 18, "symbol": "ETH" },
-                        "royaltyFee": { "amount": "0", "decimals": 18, "symbol": "ETH" }
+                    "asset_events": [{
+                        "event_type": "sale",
+                        "transaction_hash": "0xsale",
+                        "nft": {
+                            "contract": "0xeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+                            "identifier": "1"
+                        },
+                        "seller": "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "buyer": "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "event_timestamp": "2024-01-01T12:00:00Z",
+                        "payment": {
+                            "quantity": "1000000000000000000",
+                            "decimals": 18,
+                            "symbol": "ETH"
+                        }
                     }]
                 }));
             })
@@ -1702,7 +1749,7 @@ mod tests {
         };
         let keys = ApiKeys {
             alchemy: Some("key".into()),
-            opensea: None,
+            opensea: Some("osk".into()),
             ..ApiKeys::default()
         };
         let map = enrich_candidates(&registry, &store, &keys, &limits, &NoopProgress)
@@ -1794,66 +1841,6 @@ mod tests {
         assert_eq!(bundle.quality.assets, EvidenceStatus::NotRequested);
         assert_eq!(bundle.quality.histories, EvidenceStatus::NotRequested);
         assert_eq!(bundle.quality.holders, EvidenceStatus::NotRequested);
-    }
-
-    #[tokio::test]
-    async fn alchemy_empty_sales_do_not_call_opensea() {
-        let server = MockServer::start_async().await;
-        let _rpc = server
-            .mock_async(|when, then| {
-                when.method(POST).path_contains("/rpc/");
-                then.status(200).json_body(json!({
-                    "jsonrpc": "2.0",
-                    "id": "1",
-                    "result": { "transfers": [] }
-                }));
-            })
-            .await;
-        let _holders = server
-            .mock_async(|when, then| {
-                when.method(GET).path_contains("/getOwnersForContract");
-                then.status(200).json_body(json!({ "owners": [] }));
-            })
-            .await;
-        let _sales = server
-            .mock_async(|when, then| {
-                when.method(GET).path_contains("/getNFTSales");
-                then.status(200).json_body(json!({ "nftSales": [] }));
-            })
-            .await;
-        let opensea = server
-            .mock_async(|when, then| {
-                when.method(GET).path_contains("/events/nft");
-                then.status(200).json_body(json!({ "asset_events": [] }));
-            })
-            .await;
-
-        let (store, seed, cand) =
-            store_with_candidate("ethereum", "0x2222222222222222222222222222222222222222");
-        let registry = registry_one(seed, cand);
-        let limits = HttpLimits {
-            concurrency: 2,
-            retries: 0,
-            endpoints: mock_endpoints(&server),
-            ..HttpLimits::default()
-        };
-        let keys = ApiKeys {
-            alchemy: Some("key".into()),
-            opensea: Some("osk".into()),
-            ..ApiKeys::default()
-        };
-        let map = enrich_candidates(&registry, &store, &keys, &limits, &NoopProgress)
-            .await
-            .unwrap();
-        let bundle = map.get(&cand).unwrap();
-        assert_eq!(bundle.quality.sales, EvidenceStatus::Empty);
-        assert_eq!(opensea.hits(), 0);
-        assert!(
-            !bundle
-                .provenance
-                .iter()
-                .any(|o| o.source == "opensea" || o.request_key == "opensea_sales")
-        );
     }
 
     #[tokio::test]
@@ -2444,13 +2431,6 @@ mod tests {
                 then.status(200).json_body(json!({ "owners": [] }));
             })
             .await;
-        let _sales = server
-            .mock_async(|when, then| {
-                when.method(GET).path_contains("/getNFTSales");
-                then.status(200).json_body(json!({ "nftSales": [] }));
-            })
-            .await;
-
         let (store, seed, cand) =
             store_with_candidate("ethereum", "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let registry = registry_one(seed, cand);
@@ -2623,13 +2603,6 @@ mod tests {
                 then.status(200).json_body(json!({ "owners": [] }));
             })
             .await;
-        let _sales = server
-            .mock_async(|when, then| {
-                when.method(GET).path_contains("/getNFTSales");
-                then.status(200).json_body(json!({ "nftSales": [] }));
-            })
-            .await;
-
         let (store, _seed, cand) =
             store_with_candidate("ethereum", "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
         let limits = HttpLimits {
@@ -2644,7 +2617,19 @@ mod tests {
         };
         let client = HttpClient::with_retries(limits.concurrency, limits.retries).unwrap();
         let contract = &store.contracts[cand as usize];
-        let bundle = enrich_evm(cand, "ethereum", &contract.address, &client, &keys, &limits).await;
+        let bundle = enrich_evm(
+            cand,
+            "ethereum",
+            &contract.address,
+            &client,
+            &keys,
+            &limits,
+            None,
+            &alchemy::PriceRequestCache::default(),
+            &value_flow::ExternalTransferCache::default(),
+            &alchemy::ReceiptRequestCache::default(),
+        )
+        .await;
         assert_eq!(bundle.quality.gas, EvidenceStatus::Truncated);
         let good = bundle
             .transfers
@@ -2769,13 +2754,6 @@ mod tests {
                 then.status(200).json_body(json!({ "owners": [] }));
             })
             .await;
-        let _sales = server
-            .mock_async(|when, then| {
-                when.method(GET).path_contains("/getNFTSales");
-                then.status(200).json_body(json!({ "nftSales": [] }));
-            })
-            .await;
-
         let (store, seed, cand) =
             store_with_candidate("ethereum", "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let registry = registry_one(seed, cand);
@@ -2893,13 +2871,6 @@ mod tests {
                 then.status(200).json_body(json!({ "owners": [] }));
             })
             .await;
-        let _sales = server
-            .mock_async(|when, then| {
-                when.method(GET).path_contains("/getNFTSales");
-                then.status(200).json_body(json!({ "nftSales": [] }));
-            })
-            .await;
-
         let (store, seed, cand) =
             store_with_candidate("ethereum", "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let registry = registry_one(seed, cand);
@@ -3087,13 +3058,6 @@ mod tests {
                 then.status(200).json_body(json!({ "owners": [] }));
             })
             .await;
-        let _sales = server
-            .mock_async(|when, then| {
-                when.method(GET).path_contains("/getNFTSales");
-                then.status(200).json_body(json!({ "nftSales": [] }));
-            })
-            .await;
-
         let (store, seed, cand) =
             store_with_candidate("ethereum", "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
         let registry = registry_one(seed, cand);

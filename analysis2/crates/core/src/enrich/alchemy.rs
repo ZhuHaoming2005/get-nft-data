@@ -1,10 +1,9 @@
-//! Alchemy NFT / transfers / sales / prices / receipt-gas / native EXTERNAL clients.
-
-use std::sync::{Mutex, OnceLock};
+//! Alchemy NFT / transfers / prices / receipt-gas / native EXTERNAL clients.
 
 use ahash::{AHashMap, AHashSet};
-use num_bigint::BigUint;
 use serde_json::{Value, json};
+use std::sync::Arc;
+use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell};
 
 use super::http::HttpClient;
 use super::types::{
@@ -12,47 +11,6 @@ use super::types::{
     ProviderEndpoints, SaleEvent, TransferEvent, ValueFlowEdge, day_bucket, now_unix,
     status_from_count,
 };
-
-/// Chains where Alchemy NFT `getNFTSales` returned "not enabled for that chain"
-/// (e.g. Base). Remembered process-wide so we do not re-hit the endpoint for
-/// every candidate after the first failure.
-fn nft_sales_disabled_chains() -> &'static Mutex<AHashSet<String>> {
-    static SET: OnceLock<Mutex<AHashSet<String>>> = OnceLock::new();
-    SET.get_or_init(|| Mutex::new(AHashSet::new()))
-}
-
-fn is_nft_sales_disabled_for_chain(chain: &str) -> bool {
-    let key = chain.trim().to_ascii_lowercase();
-    nft_sales_disabled_chains()
-        .lock()
-        .map(|set| set.contains(&key))
-        .unwrap_or(false)
-}
-
-fn remember_nft_sales_disabled(chain: &str) {
-    let key = chain.trim().to_ascii_lowercase();
-    if key.is_empty() {
-        return;
-    }
-    if let Ok(mut set) = nft_sales_disabled_chains().lock() {
-        if set.insert(key.clone()) {
-            eprintln!(
-                "[api/warn] source=alchemy request_key=alchemy_sales chain={key} \
-                 action=disable_endpoint reason=not_enabled_on_network \
-                 note=subsequent_candidates_skip_alchemy_sales"
-            );
-        }
-    }
-}
-
-/// Alchemy 400 body: endpoint not enabled for this chain/network.
-pub(crate) fn is_nft_sales_chain_disabled_error(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("isn't enabled for that chain")
-        || lower.contains("is not enabled for that chain")
-        || lower.contains("isn't enabled for that network")
-        || lower.contains("not enabled for that chain or network")
-}
 
 /// Parsed native EXTERNAL transfer from `alchemy_getAssetTransfers`.
 #[derive(Clone, Debug, Default)]
@@ -69,13 +27,214 @@ pub struct NativeTransfer {
 const ZERO: &str = "0x0000000000000000000000000000000000000000";
 const MAX_COUNT_HEX: &str = "0x3e8";
 
-#[derive(Default)]
+#[derive(Clone, Debug, Default)]
 pub struct FetchOutcome<T> {
     pub value: T,
     pub status: EvidenceStatus,
     pub observation: Option<EvidenceObservation>,
     pub failure: Option<String>,
     pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct PriceRequestKey {
+    chain: String,
+    symbols: Vec<String>,
+    addresses: Vec<String>,
+    require_native: bool,
+}
+
+type SharedPriceCell = Arc<OnceCell<FetchOutcome<Vec<PriceBucket>>>>;
+
+/// Run-scoped price singleflight/cache. Identical symbol/address sets across
+/// candidates share one provider request; incomplete outcomes are evicted so a
+/// later candidate can retry independently.
+#[derive(Clone, Default)]
+pub struct PriceRequestCache {
+    cells: Arc<AsyncMutex<AHashMap<PriceRequestKey, SharedPriceCell>>>,
+}
+
+impl PriceRequestCache {
+    pub async fn fetch(
+        &self,
+        client: &HttpClient,
+        endpoints: &ProviderEndpoints,
+        api_key: Option<&str>,
+        chain: &str,
+        requested_symbols: &[String],
+        requested_addresses: &[String],
+    ) -> FetchOutcome<Vec<PriceBucket>> {
+        let Some(api_key) = api_key else {
+            return FetchOutcome::skipped("alchemy_prices");
+        };
+        let native = native_symbol(chain).to_owned();
+        let native_outcome = self
+            .fetch_subset(
+                client,
+                endpoints,
+                api_key,
+                chain,
+                std::slice::from_ref(&native),
+                &[],
+                true,
+            )
+            .await;
+        let mut extra_symbols: Vec<String> = requested_symbols
+            .iter()
+            .map(|symbol| symbol.trim().to_ascii_uppercase())
+            .filter(|symbol| !symbol.is_empty() && !symbol.eq_ignore_ascii_case(&native))
+            .collect();
+        extra_symbols.sort();
+        extra_symbols.dedup();
+        let mut extra_addresses: Vec<String> = requested_addresses
+            .iter()
+            .map(|address| super::types::normalize_chain_address(chain, address))
+            .filter(|address| !address.is_empty())
+            .collect();
+        extra_addresses.sort();
+        extra_addresses.dedup();
+        if extra_symbols.is_empty() && extra_addresses.is_empty() {
+            return native_outcome;
+        }
+        let extras = self
+            .fetch_subset(
+                client,
+                endpoints,
+                api_key,
+                chain,
+                &extra_symbols,
+                &extra_addresses,
+                false,
+            )
+            .await;
+        combine_price_outcomes(native_outcome, extras)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn fetch_subset(
+        &self,
+        client: &HttpClient,
+        endpoints: &ProviderEndpoints,
+        api_key: &str,
+        chain: &str,
+        symbols: &[String],
+        addresses: &[String],
+        require_native: bool,
+    ) -> FetchOutcome<Vec<PriceBucket>> {
+        let key = price_request_key(chain, symbols, addresses, require_native);
+        let cell = {
+            let mut cells = self.cells.lock().await;
+            cells
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(OnceCell::new()))
+                .clone()
+        };
+        let outcome = cell
+            .get_or_init(|| async {
+                fetch_price_subset(
+                    client,
+                    endpoints,
+                    api_key,
+                    chain,
+                    symbols,
+                    addresses,
+                    require_native,
+                )
+                .await
+            })
+            .await
+            .clone();
+        if !matches!(
+            outcome.status,
+            EvidenceStatus::Complete | EvidenceStatus::Empty
+        ) {
+            let mut cells = self.cells.lock().await;
+            if cells
+                .get(&key)
+                .is_some_and(|known| Arc::ptr_eq(known, &cell))
+            {
+                cells.remove(&key);
+            }
+        }
+        outcome
+    }
+}
+
+fn price_request_key(
+    chain: &str,
+    symbols: &[String],
+    addresses: &[String],
+    require_native: bool,
+) -> PriceRequestKey {
+    let mut symbols: Vec<String> = symbols
+        .iter()
+        .map(|symbol| symbol.trim().to_ascii_uppercase())
+        .filter(|symbol| !symbol.is_empty())
+        .collect();
+    symbols.sort();
+    symbols.dedup();
+    let mut addresses: Vec<String> = addresses
+        .iter()
+        .map(|address| super::types::normalize_chain_address(chain, address))
+        .filter(|address| !address.is_empty())
+        .collect();
+    addresses.sort();
+    addresses.dedup();
+    PriceRequestKey {
+        chain: chain.trim().to_ascii_lowercase(),
+        symbols,
+        addresses,
+        require_native,
+    }
+}
+
+fn combine_price_outcomes(
+    mut native: FetchOutcome<Vec<PriceBucket>>,
+    mut extras: FetchOutcome<Vec<PriceBucket>>,
+) -> FetchOutcome<Vec<PriceBucket>> {
+    if matches!(native.status, EvidenceStatus::NotRequested) {
+        return native;
+    }
+    let native_ok = matches!(
+        native.status,
+        EvidenceStatus::Complete | EvidenceStatus::Empty
+    );
+    let extras_ok = matches!(
+        extras.status,
+        EvidenceStatus::Complete | EvidenceStatus::Empty
+    );
+    if !native_ok && !extras_ok {
+        let failure = [native.failure.take(), extras.failure.take()]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join("; ");
+        return FetchOutcome::failed("alchemy", "alchemy_prices", failure);
+    }
+    native.value.append(&mut extras.value);
+    native.value.sort_by(|left, right| {
+        (&left.chain, &left.symbol, &left.token_address).cmp(&(
+            &right.chain,
+            &right.symbol,
+            &right.token_address,
+        ))
+    });
+    native.value.dedup_by(|left, right| {
+        left.chain == right.chain
+            && left.symbol == right.symbol
+            && left.token_address == right.token_address
+    });
+    let truncated = !native_ok || !extras_ok || native.truncated || extras.truncated;
+    let failures = [native.failure.take(), extras.failure.take()]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let count = native.value.len();
+    let mut outcome = FetchOutcome::ok(native.value, count, truncated, "alchemy", "alchemy_prices");
+    if !failures.is_empty() {
+        outcome.failure = Some(failures.join("; "));
+    }
+    outcome
 }
 
 impl<T: Default> FetchOutcome<T> {
@@ -370,96 +529,6 @@ async fn fetch_holders_pages(
     outcome
 }
 
-/// Fetch NFT sales via Alchemy `getNFTSales`.
-///
-/// Some networks (notably Base) return HTTP 400 "endpoint isn't enabled for
-/// that chain". After the first such response for a chain, later candidates
-/// skip Alchemy sales (`NotRequested`) so OpenSea can still act as fallback
-/// without thousands of identical 400s.
-pub async fn fetch_sales(
-    client: &HttpClient,
-    endpoints: &ProviderEndpoints,
-    api_key: Option<&str>,
-    chain: &str,
-    contract: &str,
-    max_pages: usize,
-) -> FetchOutcome<Vec<SaleEvent>> {
-    let Some(api_key) = api_key else {
-        return FetchOutcome::skipped("alchemy_sales");
-    };
-    if is_nft_sales_disabled_for_chain(chain) {
-        return FetchOutcome::skipped("alchemy_sales");
-    }
-    let Some(base) = endpoints.alchemy_nft(chain, api_key, "getNFTSales") else {
-        return FetchOutcome::failed(
-            "alchemy",
-            "alchemy_sales",
-            format!("unsupported alchemy network for {chain}"),
-        );
-    };
-
-    let mut sales = Vec::new();
-    let mut page_key: Option<String> = None;
-    let mut seen = std::collections::BTreeSet::new();
-    let mut truncated = false;
-    let mut partial_failure = None;
-    let pages = max_pages.max(1);
-
-    for page in 0..pages {
-        let mut url = format!(
-            "{base}?fromBlock=0&toBlock=latest&order=asc&contractAddress={}",
-            urlencoding_minimal(contract)
-        );
-        if let Some(key) = &page_key {
-            url.push_str("&pageKey=");
-            url.push_str(&urlencoding_minimal(key));
-        }
-        let payload = match client.get_json_alchemy(&url, &[]).await {
-            Ok(v) => v,
-            Err(e) => {
-                if sales.is_empty() {
-                    let msg = e.to_string();
-                    if is_nft_sales_chain_disabled_error(&msg) {
-                        remember_nft_sales_disabled(chain);
-                        // NotRequested: preferred provider unavailable on this
-                        // network → OpenSea last-resort path can still run.
-                        return FetchOutcome::skipped("alchemy_sales");
-                    }
-                    return FetchOutcome::failed("alchemy", "alchemy_sales", e);
-                }
-                truncated = true;
-                partial_failure = Some(format!("alchemy_sales: partial page failure: {e}"));
-                break;
-            }
-        };
-        sales.extend(parse_nft_sales(&payload, chain));
-        let next = payload
-            .get("pageKey")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .filter(|s| !s.is_empty());
-        match next {
-            Some(next) => {
-                if !seen.insert(next.clone()) {
-                    truncated = true;
-                    partial_failure = Some("alchemy_sales: repeated pagination cursor".into());
-                    break;
-                }
-                page_key = Some(next);
-                if page + 1 == pages {
-                    truncated = true;
-                }
-            }
-            None => break,
-        }
-    }
-
-    let count = sales.len();
-    let mut outcome = FetchOutcome::ok(sales, count, truncated, "alchemy", "alchemy_sales");
-    outcome.failure = partial_failure;
-    outcome
-}
-
 /// Fetch **current** (run-time) USD prices for the chain native token and
 /// requested common payment symbols.
 ///
@@ -486,6 +555,29 @@ pub async fn fetch_prices(
             symbols.push(symbol);
         }
     }
+    fetch_price_subset(
+        client,
+        endpoints,
+        api_key,
+        chain,
+        &symbols,
+        requested_addresses,
+        true,
+    )
+    .await
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn fetch_price_subset(
+    client: &HttpClient,
+    endpoints: &ProviderEndpoints,
+    api_key: &str,
+    chain: &str,
+    symbols: &[String],
+    requested_addresses: &[String],
+    require_native: bool,
+) -> FetchOutcome<Vec<PriceBucket>> {
+    let native = native_symbol(chain);
     // Alchemy accepts at most 25 symbols per request. Keep broad payment-token
     // coverage by batching instead of letting one oversized request fail every
     // quote for the candidate.
@@ -523,7 +615,7 @@ pub async fn fetch_prices(
             })
         }));
     }
-    if !symbol_fetch_succeeded {
+    if !symbols.is_empty() && !symbol_fetch_succeeded {
         return FetchOutcome::failed(
             "alchemy",
             "alchemy_prices",
@@ -566,10 +658,14 @@ pub async fn fetch_prices(
             address_fetch_failed = true;
         }
     }
-    let native_missing = prices
-        .iter()
-        .all(|price| !price.symbol.eq_ignore_ascii_case(native));
+    let native_missing = require_native
+        && prices
+            .iter()
+            .all(|price| !price.symbol.eq_ignore_ascii_case(native));
     if prices.is_empty() {
+        if !require_native && !symbol_fetch_failed && !address_fetch_failed {
+            return FetchOutcome::ok(Vec::new(), 0, false, "alchemy", "alchemy_prices");
+        }
         return FetchOutcome::failed(
             "alchemy",
             "alchemy_prices",
@@ -742,146 +838,6 @@ pub fn parse_holders(payload: &Value) -> Vec<HolderRecord> {
     out
 }
 
-pub fn parse_nft_sales(payload: &Value, chain: &str) -> Vec<SaleEvent> {
-    let mut out = Vec::new();
-    for item in payload
-        .get("nftSales")
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-    {
-        let seller_fee = fee_amount_and_symbol(item.get("sellerFee"));
-        let protocol_fee = fee_amount_and_symbol(item.get("protocolFee"));
-        let royalty_fee = fee_amount_and_symbol(item.get("royaltyFee"));
-        let seller_fee_address = fee_token_address(item.get("sellerFee"));
-        let protocol_fee_address = fee_token_address(item.get("protocolFee"));
-        let royalty_fee_address = fee_token_address(item.get("royaltyFee"));
-        let royalty_recipient = item
-            .get("royaltyFee")
-            .and_then(|fee| {
-                fee.get("recipientAddress")
-                    .or_else(|| fee.get("receiverAddress"))
-                    .or_else(|| fee.get("recipient"))
-                    .or_else(|| fee.get("feeRecipient"))
-                    .or_else(|| fee.get("receiver"))
-                    .or_else(|| fee.get("to"))
-            })
-            .and_then(Value::as_str)
-            .or_else(|| {
-                [
-                    "royaltyRecipient",
-                    "royalty_recipient",
-                    "royaltyRecipientAddress",
-                    "royalty_recipient_address",
-                    "creatorFeeRecipient",
-                    "creator_fee_recipient",
-                ]
-                .into_iter()
-                .find_map(|field| item.get(field).and_then(Value::as_str))
-            })
-            .map(|address| address.trim().to_ascii_lowercase())
-            .filter(|address| !address.is_empty());
-        let symbol = seller_fee
-            .as_ref()
-            .and_then(|(_, symbol)| symbol.clone())
-            .or_else(|| protocol_fee.as_ref().and_then(|(_, symbol)| symbol.clone()))
-            .or_else(|| royalty_fee.as_ref().and_then(|(_, symbol)| symbol.clone()))
-            .or_else(|| Some(native_symbol(chain).to_owned()));
-        let split_symbols = [
-            seller_fee.as_ref(),
-            protocol_fee.as_ref(),
-            royalty_fee.as_ref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter_map(|(_, fee_symbol)| fee_symbol.as_deref())
-        .map(|fee_symbol| fee_symbol.trim().to_ascii_uppercase())
-        .filter(|fee_symbol| !fee_symbol.is_empty())
-        .collect::<std::collections::BTreeSet<_>>();
-        let native = (seller_fee.is_some() && split_symbols.len() <= 1)
-            .then(|| {
-                [
-                    seller_fee.as_ref(),
-                    protocol_fee.as_ref(),
-                    royalty_fee.as_ref(),
-                ]
-                .into_iter()
-                .flatten()
-                .map(|(amount, _)| *amount)
-                .sum::<f64>()
-            })
-            .filter(|amount| *amount >= 0.0);
-        let sale_price_raw = (seller_fee.is_some() && split_symbols.len() <= 1)
-            .then(|| {
-                [
-                    item.get("sellerFee"),
-                    item.get("protocolFee"),
-                    item.get("royaltyFee"),
-                ]
-                .into_iter()
-                .flatten()
-                .map(fee_raw_amount)
-                .collect::<Option<Vec<_>>>()
-                .map(|amounts| amounts.into_iter().sum::<BigUint>().to_str_radix(10))
-            })
-            .flatten();
-        let seller_proceeds_native = seller_fee.as_ref().map(|(amount, _)| *amount);
-        out.push(SaleEvent {
-            tx_hash: item
-                .get("transactionHash")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_owned(),
-            token_id: normalize_token_id(item.get("tokenId")),
-            seller: item
-                .get("sellerAddress")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase(),
-            buyer: item
-                .get("buyerAddress")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase(),
-            timestamp: item.get("blockTimestamp").and_then(parse_timestamp),
-            block_number: item
-                .get("blockNumber")
-                .and_then(parse_block_number)
-                .or_else(|| item.get("blockNum").and_then(parse_block_number)),
-            marketplace: item
-                .get("marketplace")
-                .and_then(Value::as_str)
-                .map(str::to_owned),
-            native_amount: native,
-            usd_amount: None,
-            currency_symbol: symbol.or_else(|| Some(native_symbol(chain).to_owned())),
-            currency_address: seller_fee_address
-                .clone()
-                .or_else(|| protocol_fee_address.clone())
-                .or_else(|| royalty_fee_address.clone()),
-            sale_price_raw,
-            seller_proceeds_native,
-            seller_proceeds_usd: None,
-            marketplace_fee_native: protocol_fee.as_ref().map(|(amount, _)| *amount),
-            marketplace_fee_usd: None,
-            marketplace_fee_currency_symbol: protocol_fee
-                .as_ref()
-                .and_then(|(_, symbol)| symbol.clone()),
-            marketplace_fee_currency_address: protocol_fee_address,
-            royalty_fee_native: royalty_fee.as_ref().map(|(amount, _)| *amount),
-            royalty_fee_usd: None,
-            royalty_fee_currency_symbol: royalty_fee
-                .as_ref()
-                .and_then(|(_, symbol)| symbol.clone()),
-            royalty_fee_currency_address: royalty_fee_address,
-            royalty_recipient,
-            gas_native: None,
-            fee_payer: None,
-        });
-    }
-    out
-}
-
 fn transfer_token_ids(item: &Value) -> Vec<String> {
     let mut ids = Vec::new();
     if let Some(meta) = item.get("erc1155Metadata").and_then(Value::as_array) {
@@ -959,52 +915,6 @@ fn hex_to_decimal(value: &str) -> Option<String> {
             .map(|digit| char::from(b'0' + *digit))
             .collect(),
     )
-}
-
-fn fee_amount(fee: Option<&Value>) -> Option<f64> {
-    let fee = fee?;
-    if let Some(amount) = json_f64(fee.get("amount")) {
-        let decimals = fee.get("decimals").and_then(Value::as_u64).unwrap_or(18) as i32;
-        return Some(amount / 10f64.powi(decimals));
-    }
-    json_f64(fee.get("value")).or_else(|| json_f64(fee.get("rawAmount").or(fee.get("amount"))))
-}
-
-fn fee_raw_amount(fee: &Value) -> Option<BigUint> {
-    let raw = fee
-        .get("amount")
-        .or_else(|| fee.get("rawAmount"))
-        .or_else(|| fee.get("raw_amount"))?;
-    if let Some(value) = raw.as_u64() {
-        return Some(BigUint::from(value));
-    }
-    let text = raw.as_str()?.trim();
-    let (digits, radix) = text
-        .strip_prefix("0x")
-        .or_else(|| text.strip_prefix("0X"))
-        .map_or((text, 10), |hex| (hex, 16));
-    (!digits.is_empty())
-        .then(|| BigUint::parse_bytes(digits.as_bytes(), radix))
-        .flatten()
-}
-
-fn fee_amount_and_symbol(fee: Option<&Value>) -> Option<(f64, Option<String>)> {
-    let fee = fee?;
-    let amount = fee_amount(Some(fee))?;
-    let symbol = fee.get("symbol").and_then(Value::as_str).map(str::to_owned);
-    Some((amount, symbol))
-}
-
-fn fee_token_address(fee: Option<&Value>) -> Option<String> {
-    fee.and_then(|fee| {
-        fee.get("tokenAddress")
-            .or_else(|| fee.get("contractAddress"))
-            .or_else(|| fee.get("address"))
-    })
-    .and_then(Value::as_str)
-    .map(str::trim)
-    .filter(|address| !address.is_empty())
-    .map(str::to_ascii_lowercase)
 }
 
 fn parse_timestamp(value: &Value) -> Option<i64> {
@@ -1092,6 +1002,139 @@ fn urlencoding_minimal(value: &str) -> String {
 pub struct ReceiptGas {
     pub gas_native: Option<f64>,
     pub fee_payer: Option<String>,
+}
+
+#[derive(Default)]
+struct ReceiptCell {
+    value: AsyncMutex<Option<Result<ReceiptGas, String>>>,
+    notify: Notify,
+}
+
+impl ReceiptCell {
+    async fn set(&self, value: Result<ReceiptGas, String>) {
+        *self.value.lock().await = Some(value);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) -> Result<ReceiptGas, String> {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(value) = self.value.lock().await.clone() {
+                return value;
+            }
+            notified.await;
+        }
+    }
+}
+
+type SharedReceiptCell = Arc<ReceiptCell>;
+
+/// Run-scoped receipt singleflight. Overlapping candidate and value-flow
+/// transaction sets fetch each receipt at most once after a successful result.
+#[derive(Clone, Default)]
+pub struct ReceiptRequestCache {
+    cells: Arc<AsyncMutex<AHashMap<(String, String), SharedReceiptCell>>>,
+}
+
+impl ReceiptRequestCache {
+    pub async fn fetch(
+        &self,
+        client: &HttpClient,
+        endpoints: &ProviderEndpoints,
+        api_key: Option<&str>,
+        chain: &str,
+        tx_hashes: &[String],
+    ) -> FetchOutcome<AHashMap<String, ReceiptGas>> {
+        let Some(api_key) = api_key else {
+            return FetchOutcome::skipped("alchemy_receipts");
+        };
+        if tx_hashes.is_empty() {
+            return FetchOutcome::ok(AHashMap::new(), 0, false, "alchemy", "alchemy_receipts");
+        }
+        let chain_key = chain.trim().to_ascii_lowercase();
+        let mut hashes: Vec<String> = tx_hashes
+            .iter()
+            .map(|hash| hash.trim().to_ascii_lowercase())
+            .filter(|hash| !hash.is_empty())
+            .collect();
+        hashes.sort();
+        hashes.dedup();
+        let mut rows = Vec::with_capacity(hashes.len());
+        let mut leaders = Vec::new();
+        {
+            let mut cells = self.cells.lock().await;
+            for hash in &hashes {
+                let key = (chain_key.clone(), hash.clone());
+                if let Some(cell) = cells.get(&key) {
+                    rows.push((key, cell.clone()));
+                    continue;
+                }
+                let cell = Arc::new(ReceiptCell::default());
+                cells.insert(key.clone(), cell.clone());
+                leaders.push((hash.clone(), cell.clone()));
+                rows.push((key, cell));
+            }
+        }
+        if !leaders.is_empty() {
+            let leader_hashes: Vec<String> = leaders.iter().map(|(hash, _)| hash.clone()).collect();
+            let fetched =
+                fetch_receipt_gas(client, endpoints, Some(api_key), chain, &leader_hashes).await;
+            for (hash, cell) in leaders {
+                let result = fetched
+                    .value
+                    .get(&hash)
+                    .cloned()
+                    .ok_or_else(|| "receipt unavailable".to_owned());
+                cell.set(result).await;
+            }
+        }
+
+        let mut receipts = AHashMap::new();
+        let mut failures = Vec::new();
+        let mut failed_cells = Vec::new();
+        for (key, cell) in &rows {
+            match cell.wait().await {
+                Ok(receipt) => {
+                    receipts.insert(key.1.clone(), receipt.clone());
+                }
+                Err(error) => {
+                    failures.push(format!("{}: {error}", key.1));
+                    failed_cells.push((key.clone(), cell.clone()));
+                }
+            }
+        }
+        if !failed_cells.is_empty() {
+            let mut cells = self.cells.lock().await;
+            for (key, cell) in failed_cells {
+                if cells
+                    .get(&key)
+                    .is_some_and(|known| Arc::ptr_eq(known, &cell))
+                {
+                    cells.remove(&key);
+                }
+            }
+        }
+        if receipts.is_empty() {
+            return FetchOutcome::failed("alchemy", "alchemy_receipts", failures.join("; "));
+        }
+        let truncated = receipts.len() < hashes.len();
+        let mut outcome = FetchOutcome::ok(
+            receipts,
+            hashes.len().saturating_sub(failures.len()),
+            truncated,
+            "alchemy",
+            "alchemy_receipts",
+        );
+        if truncated {
+            outcome.failure = Some(format!(
+                "alchemy_receipts: partial failures ({}/{}): {}",
+                failures.len(),
+                hashes.len(),
+                failures.into_iter().take(3).collect::<Vec<_>>().join("; ")
+            ));
+        }
+        outcome
+    }
 }
 
 /// Resolve missing positive-royalty recipients through ERC-2981 `royaltyInfo`.
@@ -1888,39 +1931,100 @@ pub fn parse_native_transfer(item: &Value) -> Option<NativeTransfer> {
     })
 }
 
-/// Whether sales justify a rare OpenSea fallback.
-///
-/// True `Empty` from Alchemy means no sales — do not call OpenSea.
-/// Fallback only for Failed/NotRequested, or Complete/Truncated rows missing amounts.
-/// Whether OpenSea sales are needed as a **last-resort** fallback.
-///
-/// Prefer Alchemy (and other non-OpenSea sources). Empty Alchemy sales mean
-/// "no sales observed", not "try OpenSea". Only request OpenSea when the
-/// preferred provider failed / was not requested, or returned sales missing
-/// every amount field.
-pub fn sales_need_opensea_fallback(sales: &[SaleEvent], sales_status: EvidenceStatus) -> bool {
-    match sales_status {
-        EvidenceStatus::Failed | EvidenceStatus::NotRequested => true,
-        EvidenceStatus::Complete | EvidenceStatus::Truncated => {
-            !sales.is_empty()
-                && sales
-                    .iter()
-                    .any(|s| s.native_amount.is_none() && s.usd_amount.is_none())
-        }
-        EvidenceStatus::Empty => false,
-    }
-}
-
 #[cfg(test)]
 mod receipt_gas_tests {
     use super::*;
-    use httpmock::{Method::POST, MockServer};
+    use httpmock::{
+        Method::{GET, POST},
+        MockServer,
+    };
 
     #[test]
     fn parse_u128_zero_hex() {
         assert_eq!(parse_u128(Some(&Value::String("0x0".into()))), Some(0));
         assert_eq!(parse_u128(Some(&Value::String("0x00".into()))), Some(0));
         assert_eq!(parse_u128(Some(&Value::String("0X0".into()))), Some(0));
+    }
+
+    #[tokio::test]
+    async fn price_cache_reuses_equivalent_native_requests() {
+        let server = MockServer::start_async().await;
+        let prices = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/key/tokens/by-symbol")
+                    .query_param("symbols", "ETH");
+                then.status(200).json_body(json!({
+                    "data": [{
+                        "symbol": "ETH",
+                        "prices": [{"currency": "usd", "value": "2000"}]
+                    }]
+                }));
+            })
+            .await;
+        let endpoints = ProviderEndpoints {
+            alchemy_prices: server.base_url(),
+            ..ProviderEndpoints::default()
+        };
+        let client = HttpClient::with_retries(2, 0).unwrap();
+        let cache = PriceRequestCache::default();
+        let first = cache
+            .fetch(&client, &endpoints, Some("key"), "ethereum", &[], &[])
+            .await;
+        let second = cache
+            .fetch(
+                &client,
+                &endpoints,
+                Some("key"),
+                "ethereum",
+                &["eth".into()],
+                &[],
+            )
+            .await;
+
+        assert_eq!(prices.hits(), 1);
+        assert_eq!(first.value.len(), 1);
+        assert_eq!(second.value.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn receipt_cache_reuses_transaction_across_candidates() {
+        let server = MockServer::start_async().await;
+        let rpc = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/rpc")
+                    .body_contains("eth_getTransactionReceipt");
+                then.status(200).json_body(json!([{
+                    "jsonrpc": "2.0",
+                    "id": "receipt-0-0",
+                    "result": {
+                        "from": "0x1111111111111111111111111111111111111111",
+                        "gasUsed": "0x5208",
+                        "effectiveGasPrice": "0x3b9aca00"
+                    }
+                }]));
+            })
+            .await;
+        let endpoints = ProviderEndpoints {
+            alchemy_rpc_template: format!("{}/rpc", server.base_url()),
+            ..ProviderEndpoints::default()
+        };
+        let client = HttpClient::with_retries(2, 0).unwrap();
+        let cache = ReceiptRequestCache::default();
+        for _ in 0..2 {
+            let outcome = cache
+                .fetch(
+                    &client,
+                    &endpoints,
+                    Some("key"),
+                    "ethereum",
+                    &["0xabc".into()],
+                )
+                .await;
+            assert_eq!(outcome.value.len(), 1);
+        }
+        assert_eq!(rpc.hits(), 1);
     }
 
     #[test]
@@ -1959,61 +2063,6 @@ mod receipt_gas_tests {
             abi_first_word_address(&encoded).as_deref(),
             Some("0x1234567890abcdef1234567890abcdef12345678")
         );
-    }
-
-    #[test]
-    fn sale_parser_preserves_fee_splits_and_royalty_recipient() {
-        let payload = json!({
-            "nftSales": [{
-                "transactionHash": "0xsale",
-                "tokenId": "1",
-                "sellerAddress": "0xSeller",
-                "buyerAddress": "0xBuyer",
-                "sellerFee": {"amount": "800000000000000000", "decimals": 18, "symbol": "ETH"},
-                "protocolFee": {"amount": "100000000000000000", "decimals": 18, "symbol": "ETH"},
-                "royaltyFee": {
-                    "amount": "100000000000000000",
-                    "decimals": 18,
-                    "symbol": "ETH",
-                    "feeRecipient": "0xCreator"
-                }
-            }]
-        });
-        let sales = parse_nft_sales(&payload, "ethereum");
-        assert_eq!(sales.len(), 1);
-        assert_eq!(sales[0].native_amount, Some(1.0));
-        assert_eq!(sales[0].seller_proceeds_native, Some(0.8));
-        assert_eq!(sales[0].marketplace_fee_native, Some(0.1));
-        assert_eq!(sales[0].royalty_fee_native, Some(0.1));
-        assert_eq!(
-            sales[0].sale_price_raw.as_deref(),
-            Some("1000000000000000000")
-        );
-        assert_eq!(sales[0].royalty_recipient.as_deref(), Some("0xcreator"));
-    }
-
-    #[test]
-    fn sale_without_seller_fee_keeps_gross_amount_unknown() {
-        let payload = json!({
-            "nftSales": [{
-                "transactionHash": "0xsale",
-                "tokenId": "1",
-                "sellerAddress": "0xSeller",
-                "buyerAddress": "0xBuyer",
-                "protocolFee": {
-                    "amount": "100000000000000000",
-                    "decimals": 18,
-                    "symbol": "ETH"
-                }
-            }]
-        });
-        let sales = parse_nft_sales(&payload, "ethereum");
-        assert_eq!(sales.len(), 1);
-        assert_eq!(sales[0].native_amount, None);
-        assert!(sales_need_opensea_fallback(
-            &sales,
-            EvidenceStatus::Complete
-        ));
     }
 
     #[test]
@@ -2188,72 +2237,6 @@ mod receipt_gas_tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].owner, "0xabc");
         assert!(rows[0].token_id.is_empty());
-    }
-}
-
-#[cfg(test)]
-mod sales_fallback_tests {
-    use super::*;
-
-    fn sale_with_amount(native: Option<f64>) -> SaleEvent {
-        SaleEvent {
-            tx_hash: "0x1".into(),
-            token_id: "1".into(),
-            seller: "0xa".into(),
-            buyer: "0xb".into(),
-            timestamp: None,
-            block_number: None,
-            marketplace: None,
-            native_amount: native,
-            usd_amount: None,
-            currency_symbol: Some("ETH".into()),
-            currency_address: None,
-            seller_proceeds_native: native,
-            seller_proceeds_usd: None,
-            ..SaleEvent::default()
-        }
-    }
-
-    #[test]
-    fn detects_alchemy_sales_disabled_on_chain_message() {
-        let msg = r#"HTTP 400 Bad Request body={"error":{"message":"This endpoint isn't enabled for that chain or network just yet - please contact the Alchemy team for support!"}}"#;
-        assert!(super::is_nft_sales_chain_disabled_error(msg));
-        assert!(!super::is_nft_sales_chain_disabled_error(
-            "HTTP 500 internal"
-        ));
-    }
-
-    #[test]
-    fn empty_alchemy_sales_do_not_need_opensea() {
-        assert!(!sales_need_opensea_fallback(&[], EvidenceStatus::Empty));
-    }
-
-    #[test]
-    fn failed_or_not_requested_need_opensea() {
-        assert!(sales_need_opensea_fallback(&[], EvidenceStatus::Failed));
-        assert!(sales_need_opensea_fallback(
-            &[],
-            EvidenceStatus::NotRequested
-        ));
-    }
-
-    #[test]
-    fn complete_or_truncated_need_opensea_only_when_amounts_missing() {
-        // Empty complete/truncated list: do not burn OpenSea quota.
-        assert!(!sales_need_opensea_fallback(&[], EvidenceStatus::Complete));
-        assert!(!sales_need_opensea_fallback(&[], EvidenceStatus::Truncated));
-        assert!(sales_need_opensea_fallback(
-            &[sale_with_amount(None)],
-            EvidenceStatus::Complete
-        ));
-        assert!(sales_need_opensea_fallback(
-            &[sale_with_amount(None)],
-            EvidenceStatus::Truncated
-        ));
-        assert!(!sales_need_opensea_fallback(
-            &[sale_with_amount(Some(1.0))],
-            EvidenceStatus::Complete
-        ));
     }
 }
 

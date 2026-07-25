@@ -115,8 +115,9 @@ cargo run --manifest-path analysis2/Cargo.toml --release -- run `
 ```
 
 API keys are optional per provider: missing keys mark dependent evidence `not_requested`
-and the run continues. OpenSea is used only for sales fallback when preferred providers
-cannot supply amounts. Cancel / OOM paths do **not** write `status: complete` into
+and the run continues. OpenSea is the canonical Sale provider on every chain; Alchemy
+and Helius remain chain-evidence providers. Cancel / OOM paths do **not** write
+`status: complete` into
 `intermediate/run_manifest.json`. Incomplete four-scope seeds are excluded from formal
 summary denominators. Cross-chain economics in `summary/all_chains.json` sum **USD only**.
 
@@ -175,6 +176,11 @@ anchors, and the seeds list must match the cache or the run fails fast.
 
 ### Evidence depth (enrich → economics)
 
+- **Sales:** OpenSea is the only Sale provider for EVM and Solana. The pipeline
+  resolves `contract → collection slug`, reads paginated collection Sale events,
+  and filters multi-contract collections back to the candidate contract.
+  Evidence caches older than v9 are invalidated so Alchemy/Helius Sale rows
+  cannot be reused.
 - **EVM gas:** Alchemy/ETH `eth_getTransactionReceipt` → `TransferEvent.gas_native` /
   `fee_payer`; `quality.gas` Complete/Truncated/Empty/Failed/NotRequested.
 - **EVM value flows:** full-history native EXTERNAL transfers around addresses
@@ -192,6 +198,11 @@ anchors, and the seeds list must match the cache or the run fails fast.
   count each candidate once.
 - **Solana decode:** Helius `getSignaturesForAsset` stubs → deduped `getTransaction` jsonParsed
   fills from/to/timestamp/fee and SOL value-flow edges; signature-only stubs stay Truncated.
+- **Request reuse:** preflight controller/slug/asset results flow into deep enrich. Prices,
+  EVM receipts, EVM external transfers, and Solana transactions use run-scoped
+  singleflight caches. Helius asset histories use 10-call history batches and
+  `getTransaction` uses batches of up to 100; failed/incomplete cache entries remain
+  retryable.
 - **MVP gaps:** Bubblegum/compressed NFT mint completeness (no token balances → Truncated);
   Cashout classification is coarse (often Withdrawal).
 - **Economics:** when `quality.gas` is Complete or Truncated, every observed

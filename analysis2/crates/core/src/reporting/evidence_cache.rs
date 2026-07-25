@@ -22,9 +22,9 @@ use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 use crate::reporting::json::SeedRecord;
 
-// v8 adds seed-level open-license relation evidence and derives value-flow
-// operator seeds from complete contract-wide outbound NFT-transfer history.
-pub const EVIDENCE_CACHE_VERSION: u32 = 8;
+// v9 makes OpenSea the canonical Sale provider on every chain. Older bundles
+// may contain Alchemy/Helius sales and must not be auto-reused.
+pub const EVIDENCE_CACHE_VERSION: u32 = 9;
 pub const DEFAULT_EVIDENCE_CACHE_FILE: &str = "evidence_cache.json";
 /// How many finished candidates to buffer before an append + snapshot flush.
 pub const DEFAULT_EVIDENCE_CACHE_BATCH: usize = 16;

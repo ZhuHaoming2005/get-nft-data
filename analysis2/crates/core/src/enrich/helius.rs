@@ -5,9 +5,11 @@
 //! Compressed NFT / Bubblegum full parity is intentionally out of MVP scope.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::sync::Arc;
 
-use ahash::AHashMap;
+use ahash::{AHashMap, AHashSet};
 use serde_json::{Value, json};
+use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::error::Analysis2Error;
 
@@ -163,6 +165,77 @@ pub async fn fetch_collection_identity(
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+/// Resolve many collection identities through the DAS `getAssetBatch`
+/// endpoint. Missing or malformed batch members fall back to `getAsset`
+/// individually, preserving the previous result semantics.
+pub async fn fetch_collection_identities_batch(
+    client: &HttpClient,
+    rpc_url: &str,
+    api_key: Option<&str>,
+    collections: &[String],
+) -> AHashMap<String, Option<String>> {
+    let mut out = AHashMap::with_capacity(collections.len());
+    let Some(api_key) = api_key else {
+        for collection in collections {
+            out.insert(collection.clone(), None);
+        }
+        return out;
+    };
+    let url = with_api_key(rpc_url, api_key);
+    for chunk in collections.chunks(1_000) {
+        if chunk.len() == 1 {
+            let collection = &chunk[0];
+            out.insert(
+                collection.clone(),
+                fetch_collection_identity(client, rpc_url, Some(api_key), collection).await,
+            );
+            continue;
+        }
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": "collection-identities",
+            "method": "getAssetBatch",
+            "params": {"ids": chunk}
+        });
+        let batch = client
+            .post_json_helius(&url, &[], &body)
+            .await
+            .ok()
+            .and_then(|payload| {
+                payload
+                    .get("result")
+                    .and_then(Value::as_array)
+                    .or_else(|| payload.as_array())
+                    .cloned()
+            });
+        let mut resolved = AHashSet::new();
+        if let Some(rows) = batch {
+            for row in rows {
+                let Some(id) = row.get("id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !chunk.iter().any(|collection| collection == id) {
+                    continue;
+                }
+                let identity =
+                    parse_collection_metadata_identity(&row).or_else(|| Some(id.to_owned()));
+                out.insert(id.to_owned(), identity);
+                resolved.insert(id.to_owned());
+            }
+        }
+        for collection in chunk {
+            if resolved.contains(collection) {
+                continue;
+            }
+            out.insert(
+                collection.clone(),
+                fetch_collection_identity(client, rpc_url, Some(api_key), collection).await,
+            );
+        }
+    }
+    out
+}
+
 fn parse_collection_metadata_identity(asset: &Value) -> Option<String> {
     let content = asset.get("content")?.get("metadata")?;
     for key in ["symbol", "name"] {
@@ -202,7 +275,9 @@ pub async fn fetch_collection_assets(
         return FetchOutcome::skipped("helius_assets");
     };
     let url = with_api_key(rpc_url, api_key);
-    let page_size = 100usize.min(max_assets.max(1));
+    // Helius DAS supports up to 1,000 assets per page. Use the provider
+    // maximum so the common 200-asset snapshot needs one request.
+    let page_size = 1_000usize.min(max_assets.max(1));
     let mut snapshot = SolanaAssetSnapshot::default();
     let mut page = 1usize;
     let mut seen_mints = std::collections::BTreeSet::new();
@@ -335,79 +410,15 @@ pub async fn fetch_asset_histories(
     let selected: Vec<SolanaAsset> = assets.iter().take(max_assets.max(1)).cloned().collect();
     let mut truncated = assets.len() > max_assets;
 
-    let mut handles = Vec::with_capacity(selected.len());
-    for asset in selected {
+    const SIGNATURE_RPC_BATCH_SIZE: usize = 10;
+    let mut handles = Vec::with_capacity(selected.len().div_ceil(SIGNATURE_RPC_BATCH_SIZE).max(1));
+    for (batch_idx, chunk) in selected.chunks(SIGNATURE_RPC_BATCH_SIZE).enumerate() {
         let client = client.clone();
         let url = url.clone();
+        let assets = chunk.to_vec();
         let max_sigs = max_sigs_per_asset.max(1);
         handles.push(tokio::spawn(async move {
-            let body = json!({
-                "jsonrpc": "2.0",
-                "id": format!("sigs-{}", asset.mint),
-                "method": "getSignaturesForAsset",
-                "params": {
-                    "id": asset.mint,
-                    "page": 1,
-                    "limit": max_sigs
-                }
-            });
-            let payload = match client.post_json_helius(&url, &[], &body).await {
-                Ok(v) => v,
-                Err(_) => return Err(()),
-            };
-            if payload.get("error").is_some() {
-                return Err(());
-            }
-            let items = payload
-                .get("result")
-                .and_then(|r| r.get("items"))
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let page_truncated = items.len() >= max_sigs;
-            let mut transfers = Vec::new();
-            let mut sales = Vec::new();
-            for item in items {
-                let (sig, event_type) = parse_signature_item(&item);
-                if sig.is_empty() {
-                    continue;
-                }
-                let kind = event_type.to_ascii_lowercase();
-                if kind.contains("sale") || kind.contains("buy") || kind.contains("list") {
-                    sales.push(SaleEvent {
-                        tx_hash: sig,
-                        token_id: asset.mint.clone(),
-                        seller: String::new(),
-                        buyer: String::new(),
-                        timestamp: None,
-                        block_number: None,
-                        marketplace: Some("helius".into()),
-                        native_amount: None,
-                        usd_amount: None,
-                        currency_symbol: Some("SOL".into()),
-                        currency_address: None,
-                        seller_proceeds_native: None,
-                        seller_proceeds_usd: None,
-                        ..SaleEvent::default()
-                    });
-                } else {
-                    transfers.push(TransferEvent {
-                        tx_hash: sig,
-                        token_id: asset.mint.clone(),
-                        from: String::new(),
-                        to: asset.owner.clone().unwrap_or_default(),
-                        timestamp: None,
-                        block_number: None,
-                        is_mint: kind.contains("mint") || kind.contains("create"),
-                        gas_native: None,
-                        fee_payer: None,
-                        mint_payment_native: None,
-                        mint_payment_usd: None,
-                        mint_payment_receiver: None,
-                    });
-                }
-            }
-            Ok((transfers, sales, page_truncated))
+            fetch_asset_history_batch(&client, &url, batch_idx, &assets, max_sigs).await
         }));
     }
 
@@ -417,15 +428,22 @@ pub async fn fetch_asset_histories(
     let mut failures = 0usize;
     for handle in handles {
         match handle.await {
-            Ok(Ok((mut t, mut s, page_truncated))) => {
-                any_ok = true;
-                if page_truncated {
-                    truncated = true;
+            Ok(rows) => {
+                for row in rows {
+                    match row {
+                        Ok((mut t, mut s, page_truncated)) => {
+                            any_ok = true;
+                            if page_truncated {
+                                truncated = true;
+                            }
+                            transfers.append(&mut t);
+                            sales.append(&mut s);
+                        }
+                        Err(()) => failures += 1,
+                    }
                 }
-                transfers.append(&mut t);
-                sales.append(&mut s);
             }
-            Ok(Err(())) | Err(_) => failures += 1,
+            Err(_) => failures += 1,
         }
     }
 
@@ -445,6 +463,249 @@ pub async fn fetch_asset_histories(
         "helius",
         "helius_histories",
     )
+}
+
+type AssetHistoryRow = Result<(Vec<TransferEvent>, Vec<SaleEvent>, bool), ()>;
+
+fn signature_request(asset: &SolanaAsset, request_id: String, max_sigs: usize) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "getSignaturesForAsset",
+        "params": {
+            "id": asset.mint,
+            "page": 1,
+            "limit": max_sigs
+        }
+    })
+}
+
+async fn fetch_asset_history_batch(
+    client: &HttpClient,
+    url: &str,
+    batch_idx: usize,
+    assets: &[SolanaAsset],
+    max_sigs: usize,
+) -> Vec<AssetHistoryRow> {
+    if assets.len() == 1 {
+        let body = signature_request(&assets[0], format!("sigs-{}", assets[0].mint), max_sigs);
+        return vec![
+            client
+                .post_json_helius(url, &[], &body)
+                .await
+                .map_err(|_| ())
+                .and_then(|payload| parse_asset_history(&assets[0], &payload, max_sigs)),
+        ];
+    }
+
+    let body = Value::Array(
+        assets
+            .iter()
+            .enumerate()
+            .map(|(idx, asset)| {
+                signature_request(asset, format!("sigs-{batch_idx}-{idx}"), max_sigs)
+            })
+            .collect(),
+    );
+    if let Ok(payload) = client.post_json_helius(url, &[], &body).await
+        && let Some(responses) = payload.as_array()
+    {
+        let by_id: AHashMap<&str, &Value> = responses
+            .iter()
+            .filter_map(|row| Some((row.get("id")?.as_str()?, row)))
+            .collect();
+        let rows: Vec<AssetHistoryRow> = assets
+            .iter()
+            .enumerate()
+            .map(|(idx, asset)| {
+                let id = format!("sigs-{batch_idx}-{idx}");
+                by_id
+                    .get(id.as_str())
+                    .copied()
+                    .ok_or(())
+                    .and_then(|response| parse_asset_history(asset, response, max_sigs))
+            })
+            .collect();
+        if rows.iter().all(Result::is_ok) {
+            return rows;
+        }
+    }
+
+    // A malformed/partial batch must not lose an asset history. Retry every
+    // member independently so quality remains identical to the old path.
+    let mut handles = Vec::with_capacity(assets.len());
+    for asset in assets.iter().cloned() {
+        let client = client.clone();
+        let url = url.to_owned();
+        handles.push(tokio::spawn(async move {
+            let body = signature_request(&asset, format!("sigs-{}", asset.mint), max_sigs);
+            client
+                .post_json_helius(&url, &[], &body)
+                .await
+                .map_err(|_| ())
+                .and_then(|payload| parse_asset_history(&asset, &payload, max_sigs))
+        }));
+    }
+    let mut rows = Vec::with_capacity(handles.len());
+    for handle in handles {
+        rows.push(handle.await.unwrap_or(Err(())));
+    }
+    rows
+}
+
+fn parse_asset_history(asset: &SolanaAsset, payload: &Value, max_sigs: usize) -> AssetHistoryRow {
+    if payload.get("error").is_some() {
+        return Err(());
+    }
+    let items = payload
+        .get("result")
+        .and_then(|result| result.get("items"))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let page_truncated = items.len() >= max_sigs;
+    let mut transfers = Vec::new();
+    let mut sales = Vec::new();
+    for item in items {
+        let (signature, event_type) = parse_signature_item(&item);
+        if signature.is_empty() {
+            continue;
+        }
+        let kind = event_type.to_ascii_lowercase();
+        if kind.contains("sale") || kind.contains("buy") || kind.contains("list") {
+            sales.push(SaleEvent {
+                tx_hash: signature,
+                token_id: asset.mint.clone(),
+                seller: String::new(),
+                buyer: String::new(),
+                marketplace: Some("helius".into()),
+                currency_symbol: Some("SOL".into()),
+                ..SaleEvent::default()
+            });
+        } else {
+            transfers.push(TransferEvent {
+                tx_hash: signature,
+                token_id: asset.mint.clone(),
+                from: String::new(),
+                to: asset.owner.clone().unwrap_or_default(),
+                timestamp: None,
+                block_number: None,
+                is_mint: kind.contains("mint") || kind.contains("create"),
+                gas_native: None,
+                fee_payer: None,
+                mint_payment_native: None,
+                mint_payment_usd: None,
+                mint_payment_receiver: None,
+            });
+        }
+    }
+    Ok((transfers, sales, page_truncated))
+}
+
+#[derive(Default)]
+struct TransactionCell {
+    value: AsyncMutex<Option<Result<Option<Value>, String>>>,
+    notify: Notify,
+}
+
+impl TransactionCell {
+    async fn set(&self, value: Result<Option<Value>, String>) {
+        *self.value.lock().await = Some(value);
+        self.notify.notify_waiters();
+    }
+
+    async fn wait(&self) -> Result<Option<Value>, String> {
+        loop {
+            let notified = self.notify.notified();
+            if let Some(value) = self.value.lock().await.clone() {
+                return value;
+            }
+            notified.await;
+        }
+    }
+}
+
+type SharedTransactionCell = Arc<TransactionCell>;
+
+/// Run-scoped `getTransaction` singleflight keyed by the case-sensitive Solana
+/// signature. Successful payloads are reused across related candidates.
+#[derive(Clone, Default)]
+pub struct TransactionRequestCache {
+    cells: Arc<AsyncMutex<AHashMap<String, SharedTransactionCell>>>,
+}
+
+impl TransactionRequestCache {
+    async fn fetch_many(
+        &self,
+        client: &HttpClient,
+        url: &str,
+        signatures: &[String],
+    ) -> Vec<(String, Result<Option<Value>, String>)> {
+        const TX_RPC_BATCH_SIZE: usize = 100;
+        let mut rows = Vec::with_capacity(signatures.len());
+        let mut leaders = Vec::new();
+        {
+            let mut cells = self.cells.lock().await;
+            for signature in signatures {
+                if let Some(cell) = cells.get(signature) {
+                    rows.push((signature.clone(), cell.clone()));
+                    continue;
+                }
+                let cell = Arc::new(TransactionCell::default());
+                cells.insert(signature.clone(), cell.clone());
+                leaders.push((signature.clone(), cell.clone()));
+                rows.push((signature.clone(), cell));
+            }
+        }
+        if !leaders.is_empty() {
+            let mut handles = Vec::with_capacity(leaders.len().div_ceil(TX_RPC_BATCH_SIZE).max(1));
+            for (batch_idx, chunk) in leaders.chunks(TX_RPC_BATCH_SIZE).enumerate() {
+                let client = client.clone();
+                let url = url.to_owned();
+                let signatures: Vec<String> = chunk
+                    .iter()
+                    .map(|(signature, _)| signature.clone())
+                    .collect();
+                handles.push(tokio::spawn(async move {
+                    fetch_transactions_batch(&client, &url, batch_idx, &signatures).await
+                }));
+            }
+            let mut fetched = AHashMap::new();
+            for handle in handles {
+                if let Ok(batch) = handle.await {
+                    fetched.extend(batch);
+                }
+            }
+            for (signature, cell) in leaders {
+                let result = fetched
+                    .remove(&signature)
+                    .unwrap_or_else(|| Err("getTransaction batch join failed".into()));
+                cell.set(result).await;
+            }
+        }
+
+        let mut out = Vec::with_capacity(rows.len());
+        let mut evict = Vec::new();
+        for (signature, cell) in rows {
+            let result = cell.wait().await;
+            if !matches!(result, Ok(Some(_))) {
+                evict.push((signature.clone(), cell.clone()));
+            }
+            out.push((signature, result));
+        }
+        if !evict.is_empty() {
+            let mut cells = self.cells.lock().await;
+            for (signature, cell) in evict {
+                if cells
+                    .get(&signature)
+                    .is_some_and(|known| Arc::ptr_eq(known, &cell))
+                {
+                    cells.remove(&signature);
+                }
+            }
+        }
+        out
+    }
 }
 
 /// Per-signature decode bookkeeping used for quality upgrades.
@@ -500,6 +761,48 @@ pub async fn decode_and_attach_transactions(
     FetchOutcome<Vec<ValueFlowEdge>>,
     DecodeStats,
 ) {
+    decode_and_attach_transactions_impl(client, rpc_url, api_key, context, transfers, sales, None)
+        .await
+}
+
+pub async fn decode_and_attach_transactions_cached(
+    client: &HttpClient,
+    rpc_url: &str,
+    api_key: Option<&str>,
+    context: DecodeContext<'_>,
+    transfers: &mut [TransferEvent],
+    sales: &mut [SaleEvent],
+    cache: &TransactionRequestCache,
+) -> (
+    FetchOutcome<()>,
+    FetchOutcome<Vec<ValueFlowEdge>>,
+    DecodeStats,
+) {
+    decode_and_attach_transactions_impl(
+        client,
+        rpc_url,
+        api_key,
+        context,
+        transfers,
+        sales,
+        Some(cache),
+    )
+    .await
+}
+
+async fn decode_and_attach_transactions_impl(
+    client: &HttpClient,
+    rpc_url: &str,
+    api_key: Option<&str>,
+    context: DecodeContext<'_>,
+    transfers: &mut [TransferEvent],
+    sales: &mut [SaleEvent],
+    cache: Option<&TransactionRequestCache>,
+) -> (
+    FetchOutcome<()>,
+    FetchOutcome<Vec<ValueFlowEdge>>,
+    DecodeStats,
+) {
     let mut stats = DecodeStats {
         transfers_total: transfers.len(),
         sales_total: sales.len(),
@@ -548,42 +851,50 @@ pub async fn decode_and_attach_transactions(
 
     // JSON-RPC batch (fallback to per-signature on parse/transport failure).
     // Cuts HTTP round-trips vs one request per signature for large histories.
-    const TX_RPC_BATCH_SIZE: usize = 40;
-    let mut handles = Vec::with_capacity(signatures.len().div_ceil(TX_RPC_BATCH_SIZE).max(1));
-    for (batch_idx, chunk) in signatures.chunks(TX_RPC_BATCH_SIZE).enumerate() {
-        let client = client.clone();
-        let url = url.clone();
-        let chunk: Vec<String> = chunk.to_vec();
-        handles.push(tokio::spawn(async move {
-            fetch_transactions_batch(&client, &url, batch_idx, &chunk).await
-        }));
-    }
+    // Helius allows up to 100 getTransaction calls in one historical RPC
+    // batch. The fallback below preserves per-signature results on a partial
+    // or malformed batch response.
+    const TX_RPC_BATCH_SIZE: usize = 100;
+    let transaction_rows = if let Some(cache) = cache {
+        cache.fetch_many(client, &url, &signatures).await
+    } else {
+        let mut handles = Vec::with_capacity(signatures.len().div_ceil(TX_RPC_BATCH_SIZE).max(1));
+        for (batch_idx, chunk) in signatures.chunks(TX_RPC_BATCH_SIZE).enumerate() {
+            let client = client.clone();
+            let url = url.clone();
+            let chunk: Vec<String> = chunk.to_vec();
+            handles.push(tokio::spawn(async move {
+                fetch_transactions_batch(&client, &url, batch_idx, &chunk).await
+            }));
+        }
+        let mut transaction_rows = Vec::with_capacity(signatures.len());
+        for handle in handles {
+            match handle.await {
+                Ok(batch) => transaction_rows.extend(batch),
+                Err(error) => transaction_rows.push((
+                    String::new(),
+                    Err(format!("getTransaction join failed: {error}")),
+                )),
+            }
+        }
+        transaction_rows
+    };
 
     let mut decoded: AHashMap<String, DecodedTx> = AHashMap::new();
     let mut failures = Vec::new();
-    for handle in handles {
-        match handle.await {
-            Ok(batch_rows) => {
-                for (sig, result) in batch_rows {
-                    match result {
-                        Ok(Some(payload)) => {
-                            stats.fetched_ok += 1;
-                            let mints = sig_mints.get(&sig).cloned().unwrap_or_default();
-                            decoded.insert(sig.clone(), parse_decoded_tx(&sig, &payload, &mints));
-                        }
-                        Ok(None) => {
-                            stats.null_result += 1;
-                        }
-                        Err(err) => {
-                            stats.fetch_failed += 1;
-                            failures.push(format!("{sig}: {err}"));
-                        }
-                    }
-                }
+    for (sig, result) in transaction_rows {
+        match result {
+            Ok(Some(payload)) => {
+                stats.fetched_ok += 1;
+                let mints = sig_mints.get(&sig).cloned().unwrap_or_default();
+                decoded.insert(sig.clone(), parse_decoded_tx(&sig, &payload, &mints));
             }
-            Err(e) => {
+            Ok(None) => {
+                stats.null_result += 1;
+            }
+            Err(err) => {
                 stats.fetch_failed += 1;
-                failures.push(format!("getTransaction join failed: {e}"));
+                failures.push(format!("{sig}: {err}"));
             }
         }
     }
@@ -1393,10 +1704,78 @@ fn parse_signature_item(item: &Value) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use httpmock::{Method::POST, MockServer};
     use serde_json::json;
 
     use crate::enrich::types::{EvidenceStatus, status_from_count};
     use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn asset_histories_batch_ten_assets_into_one_http_request() {
+        let server = MockServer::start_async().await;
+        let responses: Vec<Value> = (0..10)
+            .map(|idx| {
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": format!("sigs-0-{idx}"),
+                    "result": {
+                        "items": [{
+                            "signature": format!("signature-{idx}"),
+                            "type": "TRANSFER"
+                        }]
+                    }
+                })
+            })
+            .collect();
+        let histories = server
+            .mock_async(move |when, then| {
+                when.method(POST).body_contains("getSignaturesForAsset");
+                then.status(200).json_body(json!(responses));
+            })
+            .await;
+        let assets: Vec<SolanaAsset> = (0..10)
+            .map(|idx| SolanaAsset {
+                mint: format!("mint-{idx}"),
+                owner: Some(format!("owner-{idx}")),
+                compressed: false,
+            })
+            .collect();
+        let client = HttpClient::with_retries(4, 0).unwrap();
+        let outcome =
+            fetch_asset_histories(&client, &server.base_url(), Some("key"), &assets, 10, 1).await;
+
+        assert_eq!(histories.hits(), 1);
+        assert_eq!(outcome.value.0.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn transaction_cache_reuses_signature_across_candidates() {
+        let server = MockServer::start_async().await;
+        let transaction = server
+            .mock_async(|when, then| {
+                when.method(POST).body_contains("getTransaction");
+                then.status(200).json_body(json!([{
+                    "jsonrpc": "2.0",
+                    "id": "tx-0-0",
+                    "result": {
+                        "slot": 1,
+                        "blockTime": 2,
+                        "transaction": {"message": {"accountKeys": []}},
+                        "meta": {"fee": 1}
+                    }
+                }]));
+            })
+            .await;
+        let client = HttpClient::with_retries(4, 0).unwrap();
+        let cache = TransactionRequestCache::default();
+        for _ in 0..2 {
+            let rows = cache
+                .fetch_many(&client, &server.base_url(), &["signature".into()])
+                .await;
+            assert!(matches!(&rows[0].1, Ok(Some(_))));
+        }
+        assert_eq!(transaction.hits(), 1);
+    }
 
     #[test]
     fn parses_collection_grouping() {
