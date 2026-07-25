@@ -80,6 +80,28 @@ pub fn build_contract_nft_map(store: &ResidentStore) -> AHashMap<ContractId, Vec
     map
 }
 
+/// Copy CSR membership only for contracts referenced by contract-wide hit
+/// edges. NFT-specific edges already carry their NFT id and need no expansion.
+pub fn build_contract_nft_map_for_graphs<'a>(
+    store: &ResidentStore,
+    graphs: impl IntoIterator<Item = &'a HitGraph>,
+) -> AHashMap<ContractId, Vec<NftId>> {
+    let contracts: AHashSet<ContractId> = graphs
+        .into_iter()
+        .flat_map(HitGraph::edges)
+        .filter(|edge| edge.candidate_nft.is_none())
+        .map(|edge| edge.candidate_contract)
+        .collect();
+    let mut map = AHashMap::with_capacity(contracts.len());
+    for contract_id in contracts {
+        let ids = store.nfts_for_contract(contract_id);
+        if !ids.is_empty() {
+            map.insert(contract_id, ids.to_vec());
+        }
+    }
+    map
+}
+
 /// Count NFT numerators for one `seed` under `scope`: per-dimension rows + set-union `total`.
 ///
 /// Only edges with `edge.seed_contract == seed` are counted. `image_uri` excludes NFTs already

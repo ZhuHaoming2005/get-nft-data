@@ -77,6 +77,49 @@ pub struct CandidateAnalysis {
 }
 
 impl CandidateAnalysis {
+    /// Reuse contract-wide deep analysis for a reporting relation scope.
+    ///
+    /// Deep graph/behavior/economics facts depend on the candidate contract's
+    /// events, not on which seed relation selected it. Only legitimacy changes
+    /// by scope. A fully legitimate scope is projected to the same empty facts
+    /// that `analyze_candidate` would have returned, without rebuilding graphs.
+    pub fn project_relation_signals(
+        &self,
+        relation_signals: &std::collections::BTreeMap<String, crate::enrich::LegitSignals>,
+    ) -> Self {
+        let mut projected = self.clone();
+        let mut merged = crate::enrich::LegitSignals::default();
+        let mut any_complete = false;
+        for signals in relation_signals.values() {
+            merged.merge_or(signals);
+            any_complete |= signals.verification_complete;
+        }
+        if merged.is_legit_duplicate() || any_complete {
+            merged.verification_complete = true;
+        }
+        projected.legit = legit::classify(&merged);
+        projected.legit_by_seed = relation_signals
+            .iter()
+            .map(|(key, signals)| (key.clone(), legit::classify(signals)))
+            .collect();
+
+        let fully_legit = !projected.legit_by_seed.is_empty()
+            && projected
+                .legit_by_seed
+                .values()
+                .all(|relation| relation.is_legit_duplicate);
+        if fully_legit {
+            projected.attribution.clear();
+            projected.lifecycle = LifecycleFacts::default();
+            projected.value_flow = ValueFlowFacts::default();
+            projected.behaviors = BehaviorFacts::default();
+            projected.behavior_instances.clear();
+            projected.economics = EconomicFacts::default();
+            projected.economics_quality = EconomicsQuality::default();
+        }
+        projected
+    }
+
     /// Whether every required evidence family is complete enough to interpret
     /// the observed USD/behavior values as complete. Partial analyses still
     /// contribute their available results; this flag is quality metadata only.
@@ -1101,5 +1144,49 @@ mod tests {
         assert!(analysis.behavior_instances[0].transactions.is_empty());
         assert_eq!(analysis.behavior_instances[0].linked_loss_usd, 3.0);
         assert_eq!(analysis.economics.honest_loss_usd, 1.0);
+    }
+
+    #[test]
+    fn relation_projection_matches_scoped_reanalysis() {
+        let (store, contract) = store_with_contract("ethereum", "0xcandidate");
+        let mut evidence = EvidenceBundle::empty(contract, "ethereum", "0xcandidate");
+        evidence
+            .transfers
+            .push(transfer("0xtx", "1", "0xoperator", "0xbuyer", 100, false));
+        let legit_key = "ethereum:0xlegit".to_owned();
+        let suspicious_key = "ethereum:0xsuspicious".to_owned();
+        evidence.relation_legit.insert(
+            legit_key.clone(),
+            LegitSignals {
+                verified_migration: true,
+                verification_complete: true,
+                ..LegitSignals::default()
+            },
+        );
+        evidence.relation_legit.insert(
+            suspicious_key.clone(),
+            LegitSignals {
+                verification_complete: true,
+                ..LegitSignals::default()
+            },
+        );
+        crate::enrich::finalize_legit_signals(&mut evidence);
+        let config = PaperConfig {
+            analysis_timestamp: 1_000,
+            ..PaperConfig::default()
+        };
+        let base = analyze_candidate(&store, contract, &evidence, &config).unwrap();
+
+        for key in [legit_key, suspicious_key] {
+            let keys = ahash::AHashSet::from([key.clone()]);
+            let scoped = evidence.filtered_for_analysis(&ahash::AHashSet::new(), &keys);
+            let expected = analyze_candidate(&store, contract, &scoped, &config).unwrap();
+            let signals = scoped.relation_legit.clone();
+            let projected = base.project_relation_signals(&signals);
+            assert_eq!(
+                serde_json::to_value(projected).unwrap(),
+                serde_json::to_value(expected).unwrap()
+            );
+        }
     }
 }

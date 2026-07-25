@@ -20,6 +20,20 @@ fn usd_for_runtime(prices: &[PriceBucket], chain: &str, native: f64) -> Option<f
     }
 }
 
+/// Reprice already-attributed mint payments without re-running native payment
+/// attribution or changing allocation across batch mints.
+pub fn refresh_mint_payment_usd(
+    transfers: &mut [TransferEvent],
+    prices: &[PriceBucket],
+    chain: &str,
+) {
+    for transfer in transfers.iter_mut().filter(|transfer| transfer.is_mint) {
+        transfer.mint_payment_usd = transfer
+            .mint_payment_native
+            .and_then(|native| usd_for_runtime(prices, chain, native));
+    }
+}
+
 fn chain_matches_symbol(chain: &str, symbol: &str) -> bool {
     match chain.trim().to_ascii_lowercase().as_str() {
         "ethereum" | "base" => symbol.eq_ignore_ascii_case("ETH"),

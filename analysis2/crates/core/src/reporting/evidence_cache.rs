@@ -3,12 +3,13 @@
 //! Network evidence is written **incrementally** while enrich runs:
 //! - `evidence_cache.meta.json` — version + params (once)
 //! - `evidence_cache.jsonl` — one compact bundle per line (append in batches)
-//! - `evidence_cache.json` — full snapshot rewritten periodically and at finish
+//! - `evidence_cache.json` — full snapshot written once at finish
 //!
 //! After an interrupt, the next run loads meta+jsonl (and/or the JSON snapshot),
 //! rematerializes bundles, and only HTTP-fetches candidates still missing.
-//! Pagination bounds and the run-time pricing day must match. Adding a provider
-//! key invalidates a cache that could not have collected that provider's data.
+//! Pagination bounds must match. A stale pricing day triggers a price-only
+//! refresh; adding a provider key invalidates a cache that could not have
+//! collected that provider's data.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -302,21 +303,18 @@ pub fn validate_evidence_cache(
         || got.max_signatures_per_asset != expected.max_signatures_per_asset
     {
         return Err(Analysis2Error::invalid(
-            "evidence cache pagination limits do not match current HttpLimits; re-run without --reuse-evidence",
+            "evidence cache pagination limits do not match current HttpLimits",
         ));
     }
-    if got.pricing_day_utc != expected.pricing_day_utc {
-        return Err(Analysis2Error::invalid(
-            "evidence cache pricing day is not the current execution day; re-run without --reuse-evidence",
-        ));
-    }
+    // Price age is handled by a price-only refresh in the pipeline. It must not
+    // invalidate unrelated chain and market evidence.
     if (!got.had_alchemy && expected.had_alchemy)
         || (!got.had_etherscan && expected.had_etherscan)
         || (!got.had_helius && expected.had_helius)
         || (!got.had_opensea && expected.had_opensea)
     {
         return Err(Analysis2Error::invalid(
-            "evidence cache was built without a provider key now available; re-run without --reuse-evidence",
+            "evidence cache was built without a provider key now available",
         ));
     }
     Ok(())
@@ -368,8 +366,9 @@ pub fn rematerialize_evidence(
     Ok(out)
 }
 
-/// Incremental writer: append JSONL in batches and periodically rewrite the
-/// full JSON snapshot so interrupts leave a reusable cache on disk.
+/// Incremental writer: append JSONL in batches so interrupts leave a reusable
+/// cache on disk. The full snapshot and compacted JSONL are written once on
+/// successful completion; rewriting them on every batch makes a run O(N²).
 pub struct EvidenceCacheSink {
     path: PathBuf,
     jsonl_path: PathBuf,
@@ -476,16 +475,13 @@ impl EvidenceCacheSink {
     pub fn push(&mut self, bundle: &EvidenceBundle) -> Result<(), Analysis2Error> {
         let portable = portable_bundle(bundle);
         let key = bundle_key(&portable);
-        let is_new = !self.all.contains_key(&key);
-        self.all.insert(key, portable.clone());
+        self.all.insert(key.clone(), portable.clone());
         // Always re-append when newly enriched so a restarted run that re-fetches
-        // a key still records the latest bytes; note_cached avoids dup on seed.
-        if is_new
-            || !self
-                .pending
-                .iter()
-                .any(|b| bundle_key(b) == bundle_key(&portable))
-        {
+        // a key still records the latest bytes. If multiple selective refreshes
+        // touch one candidate before a flush, retain the newest combined row.
+        if let Some(pending) = self.pending.iter_mut().find(|b| bundle_key(b) == key) {
+            *pending = portable;
+        } else {
             self.pending.push(portable);
         }
         if self.pending.len() >= self.batch_size {
@@ -494,7 +490,8 @@ impl EvidenceCacheSink {
         Ok(())
     }
 
-    /// Append pending lines and rewrite the full JSON snapshot.
+    /// Append pending lines. The JSONL + meta pair is independently resumable,
+    /// so there is no need to clone, sort, and rewrite all prior bundles here.
     pub fn flush(&mut self) -> Result<(), Analysis2Error> {
         if !self.pending.is_empty() {
             let mut f = OpenOptions::new()
@@ -525,23 +522,11 @@ impl EvidenceCacheSink {
                 ))
             })?;
         }
-        // Full snapshot for easy single-file reuse / tools.
-        let mut bundles: Vec<EvidenceBundle> = self.all.values().cloned().collect();
-        bundles.sort_by(|a, b| {
-            a.chain
-                .cmp(&b.chain)
-                .then_with(|| a.address.cmp(&b.address))
-        });
-        let cache = EvidenceCacheFile {
-            version: EVIDENCE_CACHE_VERSION,
-            params: self.params.clone(),
-            bundles,
-        };
-        write_evidence_cache(&self.path, &cache)?;
         Ok(())
     }
 
-    /// Flush remaining and return final cache.
+    /// Flush remaining, write one full snapshot, and compact JSONL to one row
+    /// per stable chain/address key.
     pub fn finish(mut self) -> Result<EvidenceCacheFile, Analysis2Error> {
         self.flush()?;
         let mut bundles: Vec<EvidenceBundle> = self.all.into_values().collect();
@@ -550,12 +535,52 @@ impl EvidenceCacheSink {
                 .cmp(&b.chain)
                 .then_with(|| a.address.cmp(&b.address))
         });
-        Ok(EvidenceCacheFile {
+        let cache = EvidenceCacheFile {
             version: EVIDENCE_CACHE_VERSION,
             params: self.params,
             bundles,
-        })
+        };
+        write_evidence_cache(&self.path, &cache)?;
+        write_compact_jsonl(&self.jsonl_path, &cache.bundles)?;
+        Ok(cache)
     }
+}
+
+fn write_compact_jsonl(path: &Path, bundles: &[EvidenceBundle]) -> Result<(), Analysis2Error> {
+    let tmp = path.with_extension("jsonl.tmp");
+    let mut file = File::create(&tmp).map_err(|e| {
+        Analysis2Error::invalid(format!(
+            "create compact evidence jsonl {}: {e}",
+            tmp.display()
+        ))
+    })?;
+    for bundle in bundles {
+        let line = serde_json::to_string(bundle)
+            .map_err(|e| Analysis2Error::invalid(format!("serialize evidence jsonl: {e}")))?;
+        writeln!(file, "{line}").map_err(|e| {
+            Analysis2Error::invalid(format!(
+                "write compact evidence jsonl {}: {e}",
+                tmp.display()
+            ))
+        })?;
+    }
+    file.flush().map_err(|e| {
+        Analysis2Error::invalid(format!(
+            "flush compact evidence jsonl {}: {e}",
+            tmp.display()
+        ))
+    })?;
+    drop(file);
+    if let Err(rename_error) = fs::rename(&tmp, path) {
+        fs::copy(&tmp, path).map_err(|e| {
+            Analysis2Error::invalid(format!(
+                "replace evidence jsonl {} (rename failed: {rename_error}): {e}",
+                path.display()
+            ))
+        })?;
+        fs::remove_file(&tmp)?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -684,7 +709,8 @@ mod tests {
             // drop without finish — flush already ran at batch_size=2
         }
 
-        assert!(path.is_file());
+        // Mid-run durability comes from the append-only JSONL + meta pair.
+        assert!(!path.is_file());
         assert!(companion_jsonl(&path).is_file());
         let loaded = load_evidence_cache_resumable(&path).unwrap();
         validate_evidence_cache(&loaded, &p).unwrap();
@@ -782,5 +808,24 @@ mod tests {
         };
 
         assert!(validate_evidence_cache(&cache, &current).is_err());
+    }
+
+    #[test]
+    fn validate_accepts_stale_pricing_day_for_selective_refresh() {
+        let cached = evidence_cache_params(
+            &[],
+            "seeds.json",
+            &ApiKeys::default(),
+            &HttpLimits::default(),
+        );
+        let mut current = cached.clone();
+        current.pricing_day_utc += 86_400;
+        let cache = EvidenceCacheFile {
+            version: EVIDENCE_CACHE_VERSION,
+            params: cached,
+            bundles: Vec::new(),
+        };
+        validate_evidence_cache(&cache, &current)
+            .expect("pricing age must not invalidate unrelated cached evidence");
     }
 }

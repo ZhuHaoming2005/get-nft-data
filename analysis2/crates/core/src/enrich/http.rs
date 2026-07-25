@@ -1,7 +1,7 @@
 //! Shared HTTP client scaffolding for seed selection and enrichment.
 
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime};
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
 use serde_json::Value;
@@ -419,8 +419,9 @@ impl HttpClient {
         // 5xx: start from 500ms (503 connection resets need more space than 100ms).
         let backoff = if will_retry {
             if rate_limited {
-                lane.limiter.note_rate_limited(RATE_LIMIT_COOLDOWN);
-                Some(RATE_LIMIT_COOLDOWN)
+                let delay = retry_after_from_error(&error).unwrap_or(RATE_LIMIT_COOLDOWN);
+                lane.limiter.note_rate_limited(delay);
+                Some(delay)
             } else if is_http_status(&error, 503)
                 || is_http_status(&error, 502)
                 || is_http_status(&error, 504)
@@ -493,6 +494,10 @@ async fn read_json_response(
         .and_then(|v| v.to_str().ok())
         .unwrap_or("")
         .to_owned();
+    let retry_after = response
+        .headers()
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(parse_retry_after_header);
     let bytes = response.bytes().await.map_err(|e| {
         Analysis2Error::http(format!(
             "read body failed endpoint={endpoint} status={status}: {e}"
@@ -508,8 +513,11 @@ async fn read_json_response(
     if !status.is_success() {
         let body = String::from_utf8_lossy(&bytes);
         let snippet = one_line_error(&body, ERROR_BODY_CHARS);
+        let retry_hint = retry_after
+            .map(|delay| format!(" retry_after_ms={}", delay.as_millis()))
+            .unwrap_or_default();
         return Err(Analysis2Error::http(format!(
-            "HTTP {status} endpoint={endpoint} content_type={content_type} body={snippet}"
+            "HTTP {status} endpoint={endpoint} content_type={content_type}{retry_hint} body={snippet}"
         )));
     }
     serde_json::from_slice(&bytes).map_err(|e| {
@@ -520,6 +528,32 @@ async fn read_json_response(
              parse_error={e} body={snippet}"
         ))
     })
+}
+
+fn parse_retry_after_header(value: &HeaderValue) -> Option<Duration> {
+    let text = value.to_str().ok()?.trim();
+    if let Ok(seconds) = text.parse::<u64>() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let at = httpdate::parse_http_date(text).ok()?;
+    Some(
+        at.duration_since(SystemTime::now())
+            .unwrap_or(Duration::ZERO),
+    )
+}
+
+fn retry_after_from_error(error: &Analysis2Error) -> Option<Duration> {
+    let Analysis2Error::Http(message) = error else {
+        return None;
+    };
+    let marker = "retry_after_ms=";
+    let start = message.find(marker)? + marker.len();
+    let digits: String = message[start..]
+        .chars()
+        .take_while(char::is_ascii_digit)
+        .collect();
+    let milliseconds = digits.parse::<u64>().ok()?;
+    Some(Duration::from_millis(milliseconds))
 }
 
 fn format_transport_error(
@@ -866,6 +900,18 @@ mod tests {
         assert!(!sanitized.contains('\n'));
         assert!(!sanitized.contains('\r'));
         assert_eq!(sanitized.chars().count(), 500);
+    }
+
+    #[test]
+    fn retry_after_supports_delta_seconds_and_error_round_trip() {
+        let header = HeaderValue::from_static("7");
+        assert_eq!(
+            parse_retry_after_header(&header),
+            Some(Duration::from_secs(7))
+        );
+        let error =
+            Analysis2Error::http("HTTP 429 endpoint=example.test retry_after_ms=7000 body=limited");
+        assert_eq!(retry_after_from_error(&error), Some(Duration::from_secs(7)));
     }
 
     #[tokio::test]

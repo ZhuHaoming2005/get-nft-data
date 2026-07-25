@@ -138,7 +138,7 @@ While enrich runs, network results are checkpointed **in batches** (default ever
 candidates):
 
 ```text
-<output-dir>/intermediate/evidence_cache.json       # full snapshot (rewritten each flush)
+<output-dir>/intermediate/evidence_cache.json       # full snapshot (written once at finish)
 <output-dir>/intermediate/evidence_cache.jsonl      # append-only per-candidate lines
 <output-dir>/intermediate/evidence_cache.meta.json  # version + params
 ```
@@ -146,13 +146,12 @@ candidates):
 (override base path with `--evidence-cache PATH`). Bundles use stable chain/address;
 `contract_id` is remapped on load.
 
-On the next `run` with the same output dir / params, the cache is **auto-resumed**
-(even without `--reuse-evidence`): already-cached candidates skip HTTP; only missing
-ones are fetched. `--reuse-evidence` makes a missing/invalid cache a hard error.
-Pagination limits must match the cache. Seed membership and API-key presence do
-not invalidate candidate-scoped HTTP evidence; matching candidate contracts are
-reused, but newly introduced seed relations and failed evidence fields are
-re-probed before they can enter formal summaries.
+On the next `run` with the same output dir / params, the cache is **auto-resumed**:
+already-cached candidates skip HTTP and only missing ones are fetched. A missing,
+damaged, or incompatible cache automatically falls through to API requests.
+Pagination limits must match the cache. Matching candidate contracts are reused;
+new seed relations, stale prices, and retryable failed fields are selectively
+refreshed when their dependencies permit an equivalent partial update.
 
 ### Fast re-run (dedup + evidence)
 
@@ -163,16 +162,14 @@ cargo run --manifest-path analysis2/Cargo.toml --release -- run `
   --output-dir ./out/run `
   --chains base,ethereum,polygon,solana `
   --evm-chains base,ethereum,polygon `
-  --reuse-dedup `
-  --reuse-evidence `
-  # same thresholds / inputs / seeds / keys as the cache-producing run
   --alchemy-api-key $env:ALCHEMY_API_KEY `
   ...
 ```
 
-`--reuse-dedup` still loads Parquet identity (for candidate expansion + enrich), but
-skips Name/URI/Metadata index build and all seed queries. Inputs, chains, thresholds,
-anchors, and the seeds list must match the cache or the run fails fast.
+A compatible dedup cache still loads Parquet identity (for candidate expansion +
+enrich), but skips Name/URI/Metadata index build and all seed queries. If inputs,
+chains, thresholds, anchors, or seeds do not match, the cache is ignored and the
+dedup stages run normally.
 
 ### Evidence depth (enrich → economics)
 

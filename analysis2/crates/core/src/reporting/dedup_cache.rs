@@ -1,7 +1,7 @@
 //! Durable dedup checkpoint for `run` restarts.
 //!
 //! After seed-scoped URI/Name/Metadata queries finish, the pipeline writes a
-//! portable JSON cache under the output directory. A later `run --reuse-dedup`
+//! portable JSON cache under the output directory. A later `run` automatically
 //! reloads that cache (after loading identity from Parquet) and skips the
 //! expensive query stages. Edges are stored with stable chain/address/token
 //! identities so process-local `ContractId` / `NftId` values can be remapped.
@@ -179,12 +179,12 @@ pub fn validate_dedup_cache(
     let got = &cache.params;
     if got.inputs != expected.inputs {
         return Err(Analysis2Error::invalid(
-            "dedup cache inputs do not match current --input list; re-run without --reuse-dedup",
+            "dedup cache inputs do not match current --input list",
         ));
     }
     if got.chains != expected.chains || got.evm_chains != expected.evm_chains {
         return Err(Analysis2Error::invalid(
-            "dedup cache chains/evm-chains do not match current flags; re-run without --reuse-dedup",
+            "dedup cache chains/evm-chains do not match current flags",
         ));
     }
     let name_threshold_matches = match (got.name_threshold, expected.name_threshold) {
@@ -197,12 +197,12 @@ pub fn validate_dedup_cache(
         || got.metadata_anchors != expected.metadata_anchors
     {
         return Err(Analysis2Error::invalid(
-            "dedup cache thresholds/anchors do not match current flags; re-run without --reuse-dedup",
+            "dedup cache thresholds/anchors do not match current flags",
         ));
     }
     if got.seeds != expected.seeds {
         return Err(Analysis2Error::invalid(
-            "dedup cache seeds list does not match current --seeds file; re-run without --reuse-dedup",
+            "dedup cache seeds list does not match current --seeds file",
         ));
     }
     Ok(())

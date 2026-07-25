@@ -87,22 +87,10 @@ struct RunArgs {
     #[arg(long)]
     dedup_cache: Option<PathBuf>,
 
-    /// Require a usable dedup cache (fail if missing/incompatible). Without this
-    /// flag, a present compatible cache is still auto-reused; missing/invalid
-    /// falls back to a full Name/URI/Metadata query.
-    #[arg(long, default_value_t = false)]
-    reuse_dedup: bool,
-
     /// Path for durable evidence cache (default: `<output-dir>/intermediate/evidence_cache.json`).
     /// Written during enrich. Compatible cache is **auto-resumed** on later runs.
     #[arg(long)]
     evidence_cache: Option<PathBuf>,
-
-    /// Require a usable evidence cache (fail if missing/incompatible). Without this
-    /// flag, a present compatible cache is still auto-resumed; only missing
-    /// candidates are HTTP-fetched.
-    #[arg(long, default_value_t = false)]
-    reuse_evidence: bool,
 
     /// Progress reporter mode.
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
@@ -224,9 +212,7 @@ fn run() -> Result<(), Analysis2Error> {
                     paper: PaperConfig::default(),
                     enrich_override: None,
                     dedup_cache_path: args.dedup_cache,
-                    reuse_dedup: args.reuse_dedup,
                     evidence_cache_path: args.evidence_cache,
-                    reuse_evidence: args.reuse_evidence,
                 },
                 progress,
             )
@@ -278,5 +264,17 @@ mod tests {
         argv.extend(["--name-threshold", "0.97"]);
         let args = RunArgs::try_parse_from(argv).unwrap();
         assert_eq!(args.name_threshold, Some(0.97));
+    }
+
+    #[test]
+    fn obsolete_reuse_flags_are_removed() {
+        for flag in ["--reuse-dedup", "--reuse-evidence"] {
+            let mut argv = required_run_args();
+            argv.push(flag);
+            assert!(
+                RunArgs::try_parse_from(argv).is_err(),
+                "{flag} must no longer be accepted"
+            );
+        }
     }
 }

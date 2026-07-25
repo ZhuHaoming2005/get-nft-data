@@ -48,7 +48,7 @@ pub(super) struct CandidateProbe {
 #[derive(Clone, Default)]
 struct CandidatePrefetch {
     evm_controllers: Option<FetchOutcome<EvmControllerEvidence>>,
-    solana_slug: Option<Option<String>>,
+    collection_slug: Option<Option<String>>,
 }
 
 pub(super) struct LegitPreflight {
@@ -302,7 +302,7 @@ async fn build_candidate_probe(
         };
         let slug_probe = async {
             if resolve_slug {
-                match prefetch.solana_slug {
+                match prefetch.collection_slug {
                     Some(slug) => slug,
                     None => resolve_collection_slug(client, limits, keys, &chain, &address).await,
                 }
@@ -329,7 +329,10 @@ async fn build_candidate_probe(
         );
         let slug_probe = async {
             if resolve_slug {
-                resolve_collection_slug(client, limits, keys, &chain, &address).await
+                match prefetch.collection_slug {
+                    Some(slug) => slug,
+                    None => resolve_collection_slug(client, limits, keys, &chain, &address).await,
+                }
             } else {
                 None
             }
@@ -599,7 +602,7 @@ pub(super) async fn prefilter_candidates(
                     slug_candidates_ref.contains(&candidate_id),
                     CandidatePrefetch {
                         evm_controllers: prefetched_evm_controllers_ref.get(&candidate_id).cloned(),
-                        solana_slug: prefetched_solana_slugs_ref.get(&candidate_id).cloned(),
+                        collection_slug: prefetched_solana_slugs_ref.get(&candidate_id).cloned(),
                     },
                 )
                 .await,

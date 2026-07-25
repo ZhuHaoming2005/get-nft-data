@@ -13,17 +13,18 @@ use analysis2_core::{
     EvidenceBundle, EvidenceCacheSink, EvidenceStatus, FailureRecord, HitGraph, HttpLimits,
     LegitSignals, LoadOptions, MetadataQueryScratch, NameQueryScratch, PaperConfig,
     PendingDedupLoad, ProgressObserver, ResidentStore, ScopeAnalysisSets, SeedDedupReport,
-    SeedFullReport, SeedRecord, UriQueryScratch, analyze_candidate, build_contract_nft_map,
-    build_dedup_cache, build_evidence_cache, build_seed_analysis_rollup, build_seed_dedup_report,
-    candidate_json_rel_path, default_dedup_cache_path, default_evidence_cache_path,
-    enrich_candidates_with_hook, evidence_cache_artifacts_present, evidence_cache_params,
-    finalize_legit_signals, load_dedup_cache, load_evidence_cache_resumable,
-    load_resident_store_uri_ready, load_seeds_json, query_metadata_for_seed_with_scratch,
-    query_name_for_seed_with_scratch, query_uri_for_seed_with_scratch, rematerialize_dedup_batch,
-    rematerialize_evidence, resolve_seed_contract, scopes_complete_for_seed,
-    serialize_candidate_json, validate_dedup_cache, validate_evidence_cache,
-    write_candidate_json_bytes, write_dedup_cache, write_dedup_outputs, write_evidence_cache,
-    write_run_outputs,
+    SeedFullReport, SeedRecord, UriQueryScratch, analyze_candidate,
+    build_contract_nft_map_for_graphs, build_dedup_cache, build_evidence_cache,
+    build_seed_analysis_rollup, build_seed_dedup_report, candidate_json_rel_path,
+    default_dedup_cache_path, default_evidence_cache_path, enrich_candidates_with_hook,
+    evidence_cache_artifacts_present, evidence_cache_params, finalize_legit_signals,
+    load_dedup_cache, load_evidence_cache_resumable, load_resident_store_uri_ready,
+    load_seeds_json, query_metadata_for_seed_with_scratch, query_name_for_seed_with_scratch,
+    query_uri_for_seed_with_scratch, refresh_cached_evm_holders, refresh_cached_prices,
+    refresh_relation_legit, rematerialize_dedup_batch, rematerialize_evidence,
+    resolve_seed_contract, scopes_complete_for_seed, serialize_candidate_json,
+    validate_dedup_cache, validate_evidence_cache, write_candidate_json_bytes, write_dedup_cache,
+    write_dedup_outputs, write_evidence_cache, write_run_outputs,
 };
 use rayon::prelude::*;
 
@@ -59,9 +60,24 @@ struct ScopeEvidenceSelector {
 }
 
 impl ScopeEvidenceSelector {
+    fn relation_signals(&self, bundle: &EvidenceBundle) -> BTreeMap<String, LegitSignals> {
+        bundle
+            .relation_legit
+            .iter()
+            .filter(|(key, _)| {
+                let normalized = parse_relation_key(key);
+                self.seed_keys
+                    .iter()
+                    .any(|wanted| parse_relation_key(wanted) == normalized)
+            })
+            .map(|(key, signals)| (key.clone(), signals.clone()))
+            .collect()
+    }
+
     /// Keep relation classifications for the whole scope. When at least one
     /// relation is suspicious, the candidate is a contract-level hit and deep
     /// analysis receives every NFT event in that contract.
+    #[cfg(test)]
     fn filtered_bundle(&self, bundle: &EvidenceBundle) -> EvidenceBundle {
         let mut suspicious_token_ids = AHashSet::new();
         for (seed_key, token_ids) in &self.token_ids_by_seed {
@@ -92,6 +108,10 @@ struct CandidateScopeSelectors {
 
 struct CandidateAnalysisBatch {
     per_seed: Vec<(String, CandidateAnalysis)>,
+    all: CandidateAnalysis,
+    intra: Option<CandidateAnalysis>,
+    cross: Option<CandidateAnalysis>,
+    matrix: Vec<((String, String), CandidateAnalysis)>,
 }
 
 fn build_scope_selectors(
@@ -177,12 +197,8 @@ pub struct RunConfig {
     pub enrich_override: Option<EnrichOverride>,
     /// Path for durable dedup cache (`intermediate/dedup_cache.json` by default).
     pub dedup_cache_path: Option<PathBuf>,
-    /// Load dedup results from cache and skip URI/Name/Metadata query stages.
-    pub reuse_dedup: bool,
     /// Path for durable evidence cache (`intermediate/evidence_cache.json` by default).
     pub evidence_cache_path: Option<PathBuf>,
-    /// Load enrich evidence from cache; only HTTP-fetch candidates missing from cache.
-    pub reuse_evidence: bool,
 }
 
 fn with_rayon_pool<T>(
@@ -504,9 +520,6 @@ fn run_dedup_inner(
     options.build_name_index = config.name_threshold.is_some();
     let seeds = load_seeds_json(&config.seeds)?;
     let (mut store, pending) = load_resident_store_uri_ready(&config.inputs, &options, progress)?;
-    // Built before dimension drops so CSR slices stay valid for reporting.
-    let contract_nfts = build_contract_nft_map(&store);
-
     let seed_batch = match pending {
         Some(pending) => query_seeds_with_pass2_overlap(
             &mut store,
@@ -524,6 +537,10 @@ fn run_dedup_inner(
             progress,
         )?,
     };
+    let contract_nfts = build_contract_nft_map_for_graphs(
+        &store,
+        seed_batch.completed.iter().map(|(_, _, graph)| graph),
+    );
     progress.set_stage("report");
     progress.begin_phase("aggregate_seeds", Some(seed_batch.completed.len() as u64));
     let reports = seed_batch
@@ -679,13 +696,15 @@ fn cached_evidence_needs_retry(bundle: &EvidenceBundle) -> bool {
     let mut statuses = vec![
         bundle.quality.transfers,
         bundle.quality.sales,
-        bundle.quality.holders,
-        bundle.quality.prices,
         bundle.quality.gas,
         bundle.quality.value_flows,
     ];
     if bundle.chain.eq_ignore_ascii_case("solana") {
-        statuses.extend([bundle.quality.assets, bundle.quality.histories]);
+        statuses.extend([
+            bundle.quality.holders,
+            bundle.quality.assets,
+            bundle.quality.histories,
+        ]);
     }
     let failed = statuses.contains(&EvidenceStatus::Failed);
     // A cap-limited Truncated result is stable for the same pagination
@@ -698,8 +717,6 @@ fn cached_evidence_needs_retry(bundle: &EvidenceBundle) -> bool {
             && (failure.contains("alchemy_transfers") || failure.contains("etherscan_transfers")))
             || (bundle.quality.sales == EvidenceStatus::Truncated
                 && (failure.contains("alchemy_sales") || failure.contains("opensea_sales")))
-            || (bundle.quality.holders == EvidenceStatus::Truncated
-                && failure.contains("alchemy_holders"))
             || (bundle.quality.gas == EvidenceStatus::Truncated
                 && (failure.contains("receipt") || failure.contains("helius")))
             || (bundle.quality.value_flows == EvidenceStatus::Truncated
@@ -710,6 +727,27 @@ fn cached_evidence_needs_retry(bundle: &EvidenceBundle) -> bool {
                 && failure.contains("helius"))
     });
     failed || transient_partial
+}
+
+fn cached_prices_need_retry(bundle: &EvidenceBundle) -> bool {
+    bundle.quality.prices == EvidenceStatus::Failed
+        || (bundle.quality.prices == EvidenceStatus::Truncated
+            && bundle
+                .quality
+                .failures
+                .iter()
+                .any(|failure| failure.to_ascii_lowercase().contains("alchemy_prices")))
+}
+
+fn cached_evm_holders_need_retry(bundle: &EvidenceBundle) -> bool {
+    !bundle.chain.eq_ignore_ascii_case("solana")
+        && (bundle.quality.holders == EvidenceStatus::Failed
+            || (bundle.quality.holders == EvidenceStatus::Truncated
+                && bundle
+                    .quality
+                    .failures
+                    .iter()
+                    .any(|failure| failure.to_ascii_lowercase().contains("alchemy_holders"))))
 }
 
 fn legacy_empty_sales_candidates(
@@ -750,41 +788,24 @@ fn load_seed_batch_from_cache(
 
 /// Try to open + validate a dedup cache before choosing load options.
 ///
-/// - Cache present + params match → `Ok(Some(cache))` (auto-reuse, same as evidence).
-/// - `--reuse-dedup` and missing/invalid → hard error.
-/// - Cache missing/invalid without flag → `Ok(None)` and fall through to full query.
+/// Cache present + params match → `Ok(Some(cache))`; otherwise log and fall
+/// through to the full query automatically.
 fn try_load_validated_dedup_cache(
     cache_path: &Path,
     expected: &DedupCacheParams,
-    require: bool,
 ) -> Result<Option<analysis2_core::DedupCacheFile>, Analysis2Error> {
     if !cache_path.is_file() {
-        if require {
-            return Err(Analysis2Error::invalid(format!(
-                "--reuse-dedup requires existing cache file {}",
-                cache_path.display()
-            )));
-        }
         return Ok(None);
     }
     match load_dedup_cache(cache_path) {
         Ok(cache) => match validate_dedup_cache(&cache, expected) {
             Ok(()) => Ok(Some(cache)),
             Err(e) => {
-                if require {
-                    return Err(e);
-                }
                 eprintln!("dedup: ignoring incompatible cache: {e}");
                 Ok(None)
             }
         },
         Err(e) => {
-            if require {
-                return Err(Analysis2Error::invalid(format!(
-                    "--reuse-dedup failed to load {}: {e}",
-                    cache_path.display()
-                )));
-            }
             eprintln!("dedup: ignoring unreadable cache ({e})");
             Ok(None)
         }
@@ -797,10 +818,9 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
     let cache_path = dedup_cache_path(config);
     let cache_params = make_dedup_cache_params(config, &seeds);
 
-    // Resolve dedup reuse *before* Parquet load so we can skip index build when
-    // a compatible cache is available (auto-resume; --reuse-dedup only hard-fails).
-    let dedup_cache =
-        try_load_validated_dedup_cache(&cache_path, &cache_params, config.reuse_dedup)?;
+    // Resolve dedup reuse before Parquet load so a compatible cache skips index
+    // build. Missing/incompatible caches automatically fall through.
+    let dedup_cache = try_load_validated_dedup_cache(&cache_path, &cache_params)?;
     if dedup_cache.is_some() {
         eprintln!(
             "dedup: will reuse {} (identity-only Parquet load)",
@@ -834,7 +854,6 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         options
     };
     let (mut store, pending) = load_resident_store_uri_ready(&config.inputs, &options, progress)?;
-    let contract_nfts = build_contract_nft_map(&store);
 
     let seed_batch = if let Some(cache) = dedup_cache {
         // Identity-only load leaves no pending pass-2 work.
@@ -858,7 +877,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 progress,
             )?,
         };
-        // Persist immediately so a later run can auto-reuse / --reuse-dedup.
+        // Persist immediately so a later run can auto-reuse it.
         progress.begin_phase("write_dedup_cache", Some(1));
         let cache = build_dedup_cache(&store, cache_params, &batch.completed, &batch.failures);
         write_dedup_cache(&cache_path, &cache)?;
@@ -873,6 +892,10 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
     };
 
     let mut failures = seed_batch.failures;
+    let contract_nfts = build_contract_nft_map_for_graphs(
+        &store,
+        seed_batch.completed.iter().map(|(_, _, graph)| graph),
+    );
 
     // Build registry while graphs are still alive, then materialize compact seed
     // dedup reports and drop HitGraphs immediately (largest post-dedup CPU structure).
@@ -914,29 +937,35 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
     );
 
     // Auto-resume from incremental jsonl/snapshot when present and params match.
-    // `--reuse-evidence` makes a missing cache fatal; otherwise a bad cache is skipped.
+    // Missing, damaged, or incompatible cache artifacts fall through to HTTP.
     let mut evidence = AHashMap::new();
     let mut forced_refresh = AHashSet::new();
+    let mut relation_refresh = AHashSet::new();
+    let mut price_refresh = AHashSet::new();
+    let mut holder_refresh = AHashSet::new();
+    let mut refresh_prices = false;
     let cache_exists = evidence_cache_artifacts_present(&evidence_path);
     eprintln!(
         "evidence: cache path {} (artifacts_present={})",
         evidence_path.display(),
         cache_exists
     );
-    if cache_exists || config.reuse_evidence {
+    if cache_exists {
         progress.begin_phase("load_evidence_cache", Some(1));
         match load_evidence_cache_resumable(&evidence_path) {
             Ok(cache) => {
                 if let Err(e) = validate_evidence_cache(&cache, &evidence_params) {
-                    if config.reuse_evidence {
-                        return Err(e);
-                    }
                     eprintln!("evidence: IGNORING incompatible cache (will re-fetch HTTP): {e}");
                 } else {
                     let legacy_sales_semantics = cache.version < EVIDENCE_CACHE_VERSION;
+                    refresh_prices =
+                        cache.params.pricing_day_utc != evidence_params.pricing_day_utc;
                     evidence = rematerialize_evidence(&store, &cache)?;
-                    forced_refresh =
+                    relation_refresh =
                         reconcile_cached_relation_legit(&mut evidence, &registry, &store);
+                    let current_candidates: AHashSet<ContractId> =
+                        registry.candidate_contracts().iter().copied().collect();
+                    evidence.retain(|candidate_id, _| current_candidates.contains(candidate_id));
                     if legacy_sales_semantics {
                         let legacy_empty_sales =
                             legacy_empty_sales_candidates(cache.version, &evidence);
@@ -954,6 +983,18 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                             .filter(|(_, bundle)| cached_evidence_needs_retry(bundle))
                             .map(|(&candidate_id, _)| candidate_id),
                     );
+                    price_refresh.extend(
+                        evidence
+                            .iter()
+                            .filter(|(_, bundle)| cached_prices_need_retry(bundle))
+                            .map(|(&candidate_id, _)| candidate_id),
+                    );
+                    holder_refresh.extend(
+                        evidence
+                            .iter()
+                            .filter(|(_, bundle)| cached_evm_holders_need_retry(bundle))
+                            .map(|(&candidate_id, _)| candidate_id),
+                    );
                     eprintln!(
                         "evidence: resumed {} in-memory bundles from {}",
                         evidence.len(),
@@ -962,12 +1003,6 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 }
             }
             Err(e) => {
-                if config.reuse_evidence {
-                    return Err(Analysis2Error::invalid(format!(
-                        "--reuse-evidence requires cache at {}: {e}",
-                        evidence_path.display()
-                    )));
-                }
                 eprintln!("evidence: no usable cache yet ({e})");
             }
         }
@@ -997,12 +1032,33 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 .copied()
                 .filter(|cid| !evidence.contains_key(cid) || forced_refresh.contains(cid))
                 .collect();
+            let relation_only: AHashSet<ContractId> =
+                relation_refresh.difference(&missing).copied().collect();
+            let mut price_only: AHashSet<ContractId> =
+                price_refresh.difference(&missing).copied().collect();
+            if refresh_prices {
+                price_only.extend(
+                    evidence
+                        .keys()
+                        .filter(|candidate_id| !missing.contains(candidate_id))
+                        .copied(),
+                );
+            }
+            let holder_only: AHashSet<ContractId> =
+                holder_refresh.difference(&missing).copied().collect();
             let cached_hits = total_cands.saturating_sub(missing.len());
             eprintln!(
-                "evidence: registry candidates={total_cands} cache_hits={cached_hits} missing={}",
-                missing.len()
+                "evidence: registry candidates={total_cands} cache_hits={cached_hits} missing={} relation_only_refresh={} price_only_refresh={} holder_only_refresh={}",
+                missing.len(),
+                relation_only.len(),
+                price_only.len(),
+                holder_only.len()
             );
-            if missing.is_empty() {
+            if missing.is_empty()
+                && relation_only.is_empty()
+                && price_only.is_empty()
+                && holder_only.is_empty()
+            {
                 eprintln!(
                     "evidence: all {total_cands} candidates covered by cache; skipping HTTP enrich (no snapshot rewrite)"
                 );
@@ -1011,8 +1067,9 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 evidence
             } else {
                 let subset = registry.filter_candidates(&missing);
+                let relation_subset = registry.filter_candidates(&relation_only);
                 eprintln!(
-                    "evidence: fetching {} / {total_cands} candidates via HTTP (batch flush every {})",
+                    "evidence: deep-fetching {} / {total_cands} candidates via HTTP (batch flush every {})",
                     subset.candidate_contract_count(),
                     DEFAULT_EVIDENCE_CACHE_BATCH
                 );
@@ -1030,18 +1087,66 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                     .enable_all()
                     .build()
                     .map_err(|e| Analysis2Error::http(format!("tokio runtime: {e}")))?;
-                let fetch_result = {
-                    let mut on_bundle = |bundle: &EvidenceBundle| -> Result<(), Analysis2Error> {
-                        sink.push(bundle)
-                    };
-                    runtime.block_on(enrich_candidates_with_hook(
-                        &subset,
+                if !price_only.is_empty() {
+                    runtime.block_on(refresh_cached_prices(
+                        &mut evidence,
+                        &price_only,
+                        &config.api_keys,
+                        &limits,
+                        progress,
+                    ))?;
+                    for candidate_id in &price_only {
+                        if let Some(bundle) = evidence.get(candidate_id) {
+                            sink.push(bundle)?;
+                        }
+                    }
+                }
+                if !holder_only.is_empty() {
+                    runtime.block_on(refresh_cached_evm_holders(
+                        &mut evidence,
+                        &holder_only,
+                        &config.api_keys,
+                        &limits,
+                        progress,
+                    ))?;
+                    for candidate_id in &holder_only {
+                        if let Some(bundle) = evidence.get(candidate_id) {
+                            sink.push(bundle)?;
+                        }
+                    }
+                }
+                if !relation_only.is_empty() {
+                    let refreshed = runtime.block_on(refresh_relation_legit(
+                        &relation_subset,
                         &store,
                         &config.api_keys,
                         &limits,
                         progress,
-                        Some(&mut on_bundle),
-                    ))
+                    ))?;
+                    for (candidate_id, refreshed_bundle) in refreshed {
+                        if let Some(bundle) = evidence.get_mut(&candidate_id) {
+                            bundle.relation_legit = refreshed_bundle.relation_legit;
+                            bundle.legit = refreshed_bundle.legit;
+                            sink.push(bundle)?;
+                        }
+                    }
+                }
+                let fetch_result = {
+                    let mut on_bundle = |bundle: &EvidenceBundle| -> Result<(), Analysis2Error> {
+                        sink.push(bundle)
+                    };
+                    if missing.is_empty() {
+                        Ok(AHashMap::new())
+                    } else {
+                        runtime.block_on(enrich_candidates_with_hook(
+                            &subset,
+                            &store,
+                            &config.api_keys,
+                            &limits,
+                            progress,
+                            Some(&mut on_bundle),
+                        ))
+                    }
                 };
                 // Drop Tokio worker stacks before the CPU-heavy analyze phase.
                 drop(runtime);
@@ -1141,12 +1246,10 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                     }
                 };
                 let selectors = all_scope_selectors.get(&cid).cloned().unwrap_or_default();
-                let all_bundle = selectors.all.filtered_bundle(bundle);
-                let mut analysis = match analyze_candidate(&store, cid, &all_bundle, &paper) {
+                let mut analysis = match analyze_candidate(&store, cid, bundle, &paper) {
                     Ok(a) => a,
                     Err(e) => return Err((chain, address, e)),
                 };
-                drop(all_bundle);
 
                 // Persist the full all-chains detail before shrinking it; scoped
                 // analyses below only need summary fields.
@@ -1161,40 +1264,40 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                     )
                 })?;
                 analysis.shrink_for_summary_memory();
+                let project_scope = |selector: &ScopeEvidenceSelector| {
+                    analysis.project_relation_signals(&selector.relation_signals(bundle))
+                };
+                let all = project_scope(&selectors.all);
                 let mut per_seed = Vec::with_capacity(selectors.all.token_ids_by_seed.len());
-                if selectors.all.token_ids_by_seed.len() == 1 {
-                    let seed_key = selectors
-                        .all
-                        .token_ids_by_seed
-                        .keys()
-                        .next()
-                        .cloned()
-                        .expect("one per-seed selector");
-                    per_seed.push((seed_key, analysis.clone()));
-                } else {
-                    for (seed_key, token_ids) in &selectors.all.token_ids_by_seed {
-                        let per_seed_selector = ScopeEvidenceSelector {
-                            token_ids: token_ids.clone(),
-                            seed_keys: AHashSet::from([seed_key.clone()]),
-                            token_ids_by_seed: AHashMap::from([(
-                                seed_key.clone(),
-                                token_ids.clone(),
-                            )]),
-                        };
-                        let scoped = per_seed_selector.filtered_bundle(bundle);
-                        let mut scoped_analysis =
-                            analyze_candidate(&store, cid, &scoped, &paper)
-                                .map_err(|e| (chain.clone(), address.clone(), e))?;
-                        scoped_analysis.shrink_for_summary_memory();
-                        per_seed.push((seed_key.clone(), scoped_analysis));
-                    }
+                for (seed_key, token_ids) in &selectors.all.token_ids_by_seed {
+                    let per_seed_selector = ScopeEvidenceSelector {
+                        token_ids: token_ids.clone(),
+                        seed_keys: AHashSet::from([seed_key.clone()]),
+                        token_ids_by_seed: AHashMap::from([(seed_key.clone(), token_ids.clone())]),
+                    };
+                    per_seed.push((seed_key.clone(), project_scope(&per_seed_selector)));
                 }
+                let intra = (!selectors.intra.token_ids_by_seed.is_empty())
+                    .then(|| project_scope(&selectors.intra));
+                let cross = (!selectors.cross.token_ids_by_seed.is_empty())
+                    .then(|| project_scope(&selectors.cross));
+                let matrix = selectors
+                    .matrix
+                    .iter()
+                    .map(|(direction, selector)| (direction.clone(), project_scope(selector)))
+                    .collect();
                 // Drop large transfer/sale/holder payloads before the next candidate
                 // is scheduled on this worker.
                 drop(bundle_owned);
 
                 progress.add_completed(1);
-                Ok(CandidateAnalysisBatch { per_seed })
+                Ok(CandidateAnalysisBatch {
+                    per_seed,
+                    all,
+                    intra,
+                    cross,
+                    matrix,
+                })
             })
             .collect();
 
@@ -1205,6 +1308,8 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         .map_err(|_| Analysis2Error::invalid("candidate writer thread panicked"))??;
 
     let mut per_seed_analyses = AHashMap::<String, AHashMap<ContractId, CandidateAnalysis>>::new();
+    let mut analyses_map: AHashMap<ContractId, CandidateAnalysis> = AHashMap::new();
+    let mut scope_analyses = ScopeAnalysisSets::default();
     for result in analyze_results {
         match result {
             Ok(batch) => {
@@ -1214,6 +1319,20 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                         .or_default()
                         .insert(analysis.contract_id, analysis);
                 }
+                if let Some(analysis) = batch.intra {
+                    scope_analyses.intra_chain.push(analysis);
+                }
+                if let Some(analysis) = batch.cross {
+                    scope_analyses.cross_chain.push(analysis);
+                }
+                for (direction, analysis) in batch.matrix {
+                    scope_analyses
+                        .chain_matrix
+                        .entry(direction)
+                        .or_default()
+                        .push(analysis);
+                }
+                analyses_map.insert(batch.all.contract_id, batch.all);
             }
             Err((_, _, Analysis2Error::Cancelled)) => return Err(Analysis2Error::Cancelled),
             Err((chain, address, e)) => {
@@ -1266,120 +1385,6 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         })
         .collect::<Vec<_>>();
 
-    // Candidate-wide funding/withdrawal evidence is deliberately present in
-    // every related seed analysis. Re-analyze the union of all relations once
-    // per candidate for run summaries. API gaps remain visible in evidence
-    // quality and the error document; they never remove seed/candidate results.
-    let summary_scope_selectors = all_scope_selectors;
-    progress.set_stage("analyze");
-    progress.begin_phase(
-        "analyze_summary_scopes",
-        Some(summary_scope_selectors.len() as u64),
-    );
-    let cache = load_evidence_cache_resumable(&evidence_path)?;
-    validate_evidence_cache(&cache, &evidence_params)?;
-    let mut summary_evidence = rematerialize_evidence(&store, &cache)?;
-    summary_evidence.retain(|candidate_id, _| summary_scope_selectors.contains_key(candidate_id));
-    for bundle in summary_evidence.values_mut() {
-        bundle.strip_for_analysis_memory();
-    }
-    type SummaryScopeBatch = (
-        CandidateAnalysis,
-        Option<CandidateAnalysis>,
-        Option<CandidateAnalysis>,
-        Vec<((String, String), CandidateAnalysis)>,
-    );
-    let summary_work: Vec<_> = summary_scope_selectors
-        .into_iter()
-        .map(|(candidate_id, selectors)| {
-            let bundle = summary_evidence.remove(&candidate_id);
-            if bundle.is_none() {
-                let contract = &store.contracts[candidate_id as usize];
-                failures.push(FailureRecord::candidate_stage(
-                    store.chain_name(contract.chain_id),
-                    &contract.address,
-                    "aggregate_candidate",
-                    "summary evidence missing from cache; continuing with empty evidence",
-                ));
-            }
-            (candidate_id, selectors, bundle)
-        })
-        .collect();
-    drop(summary_evidence);
-    let summary_results: Vec<Result<SummaryScopeBatch, (String, String, Analysis2Error)>> =
-        summary_work
-            .into_par_iter()
-            .map(|(candidate_id, selectors, bundle)| {
-                let contract = &store.contracts[candidate_id as usize];
-                let chain = store.chain_name(contract.chain_id).to_owned();
-                let address = contract.address.clone();
-                let empty;
-                let bundle = match bundle.as_ref() {
-                    Some(bundle) => bundle,
-                    None => {
-                        empty = EvidenceBundle::empty(candidate_id, chain.clone(), address.clone());
-                        &empty
-                    }
-                };
-                let analyze_scope = |selector: &ScopeEvidenceSelector| {
-                    let scoped = selector.filtered_bundle(bundle);
-                    let mut analysis = analyze_candidate(&store, candidate_id, &scoped, &paper)?;
-                    analysis.shrink_for_summary_memory();
-                    Ok::<_, Analysis2Error>(analysis)
-                };
-                let all = analyze_scope(&selectors.all)
-                    .map_err(|error| (chain.clone(), address.clone(), error))?;
-                let intra = (!selectors.intra.token_ids_by_seed.is_empty())
-                    .then(|| analyze_scope(&selectors.intra))
-                    .transpose()
-                    .map_err(|error| (chain.clone(), address.clone(), error))?;
-                let cross = (!selectors.cross.token_ids_by_seed.is_empty())
-                    .then(|| analyze_scope(&selectors.cross))
-                    .transpose()
-                    .map_err(|error| (chain.clone(), address.clone(), error))?;
-                let mut matrix = Vec::with_capacity(selectors.matrix.len());
-                for (direction, selector) in &selectors.matrix {
-                    matrix.push((
-                        direction.clone(),
-                        analyze_scope(selector)
-                            .map_err(|error| (chain.clone(), address.clone(), error))?,
-                    ));
-                }
-                progress.add_completed(1);
-                Ok((all, intra, cross, matrix))
-            })
-            .collect();
-
-    let mut analyses_map: AHashMap<ContractId, CandidateAnalysis> = AHashMap::new();
-    let mut scope_analyses = ScopeAnalysisSets::default();
-    for result in summary_results {
-        match result {
-            Ok((all, intra, cross, matrix)) => {
-                if let Some(analysis) = intra {
-                    scope_analyses.intra_chain.push(analysis);
-                }
-                if let Some(analysis) = cross {
-                    scope_analyses.cross_chain.push(analysis);
-                }
-                for (direction, analysis) in matrix {
-                    scope_analyses
-                        .chain_matrix
-                        .entry(direction)
-                        .or_default()
-                        .push(analysis);
-                }
-                analyses_map.insert(all.contract_id, all);
-            }
-            Err((chain, address, error)) => {
-                failures.push(FailureRecord::candidate_stage(
-                    &chain,
-                    &address,
-                    "aggregate_candidate",
-                    error.to_string(),
-                ));
-            }
-        }
-    }
     // Registry and per-seed analyses are no longer needed after summaries have
     // been materialized from every available result.
     drop(registry);
@@ -1464,6 +1469,20 @@ mod tests {
         let mut failed = EvidenceBundle::empty(1, "ethereum", "0xcandidate");
         failed.quality.sales = EvidenceStatus::Failed;
         assert!(cached_evidence_needs_retry(&failed));
+
+        let mut price_only = EvidenceBundle::empty(2, "ethereum", "0xprice");
+        price_only.quality.prices = EvidenceStatus::Failed;
+        assert!(!cached_evidence_needs_retry(&price_only));
+        assert!(cached_prices_need_retry(&price_only));
+
+        let mut holder_only = EvidenceBundle::empty(3, "base", "0xholder");
+        holder_only.quality.holders = EvidenceStatus::Failed;
+        assert!(!cached_evidence_needs_retry(&holder_only));
+        assert!(cached_evm_holders_need_retry(&holder_only));
+
+        holder_only.chain = "solana".into();
+        assert!(cached_evidence_needs_retry(&holder_only));
+        assert!(!cached_evm_holders_need_retry(&holder_only));
     }
 
     #[test]
@@ -1775,9 +1794,7 @@ mod tests {
                 },
                 enrich_override: Some(enrich),
                 dedup_cache_path: None,
-                reuse_dedup: false,
                 evidence_cache_path: None,
-                reuse_evidence: false,
             },
             &analysis2_core::NoopProgress,
         )
@@ -1932,9 +1949,7 @@ mod tests {
                 paper: PaperConfig::default(),
                 enrich_override: Some(enrich),
                 dedup_cache_path: None,
-                reuse_dedup: false,
                 evidence_cache_path: None,
-                reuse_evidence: false,
             },
             &CancelOnEnrich,
         )
@@ -2000,27 +2015,23 @@ mod tests {
             },
             enrich_override: Some(enrich.clone()),
             dedup_cache_path: Some(cache_path.clone()),
-            reuse_dedup: false,
             evidence_cache_path: Some(evidence_path.clone()),
-            reuse_evidence: false,
         };
 
         run(&base_config(), &analysis2_core::NoopProgress).expect("first run");
         assert!(cache_path.is_file(), "dedup cache must be written");
         assert!(evidence_path.is_file(), "evidence cache must be written");
 
-        // Explicit flags still work.
-        let mut reuse = base_config();
-        reuse.reuse_dedup = true;
-        reuse.reuse_evidence = true;
-        run(&reuse, &analysis2_core::NoopProgress).expect("reuse-dedup+evidence run");
+        // Compatible caches are always reused without control flags.
+        run(&base_config(), &analysis2_core::NoopProgress).expect("auto-reuse run");
         assert!(out.join("summary/all_chains.json").is_file());
 
-        // Auto-reuse without flags when cache files are present.
-        let auto = base_config();
-        assert!(!auto.reuse_dedup && !auto.reuse_evidence);
-        run(&auto, &analysis2_core::NoopProgress).expect("auto-reuse run");
-        assert!(out.join("summary/all_chains.json").is_file());
+        // Damaged caches are ignored; dedup recomputes and enrich falls through
+        // instead of turning cache reuse into an output-blocking requirement.
+        std::fs::write(&cache_path, b"{broken").unwrap();
+        std::fs::write(&evidence_path, b"{broken").unwrap();
+        run(&base_config(), &analysis2_core::NoopProgress)
+            .expect("invalid caches must fall back automatically");
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -2076,9 +2087,7 @@ mod tests {
                 paper: PaperConfig::default(),
                 enrich_override: Some(enrich),
                 dedup_cache_path: None,
-                reuse_dedup: false,
                 evidence_cache_path: None,
-                reuse_evidence: false,
             },
             &analysis2_core::NoopProgress,
         )

@@ -12,7 +12,7 @@ pub mod run;
 pub use aggregate::{
     AllChainsRelationRef, ChainMatrixBlock, DuplicateScaleRow, ScopeNftCounts, ScopeScaleFilter,
     SeedDuplicateScale, build_all_chains_duplicate_scale, build_contract_nft_map,
-    build_duplicate_scale_rows, build_scope_duplicate_scale,
+    build_contract_nft_map_for_graphs, build_duplicate_scale_rows, build_scope_duplicate_scale,
     build_scope_duplicate_scale_for_chains, build_seed_duplicate_scale, count_scope_nfts,
     matrix_secondary_chains,
 };

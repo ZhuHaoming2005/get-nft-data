@@ -62,7 +62,7 @@ impl LoadOptions {
         }
     }
 
-    /// Identity-only load for `--reuse-dedup` (no Name/URI/Metadata indexes).
+    /// Identity-only load for automatic dedup-cache reuse (no Name/URI/Metadata indexes).
     pub fn identity_only(
         allowed_chains: impl IntoIterator<Item = String>,
         evm_chains: impl IntoIterator<Item = String>,

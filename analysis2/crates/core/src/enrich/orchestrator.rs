@@ -56,7 +56,7 @@ pub async fn enrich_candidates_with_hook(
     let legit_detect::LegitPreflight {
         evidence,
         candidates_to_enrich: candidates,
-        candidate_probes,
+        mut candidate_probes,
     } = preflight;
     let mut out = evidence;
     let enrich_set: ahash::AHashSet<ContractId> = candidates.iter().copied().collect();
@@ -86,7 +86,11 @@ pub async fn enrich_candidates_with_hook(
     let receipt_cache = alchemy::ReceiptRequestCache::default();
     let solana_transaction_cache = helius::TransactionRequestCache::default();
 
-    let mut stream = stream::iter(candidates.iter().copied().map(|contract_id| {
+    let candidate_work: Vec<_> = candidates
+        .into_iter()
+        .map(|contract_id| (contract_id, candidate_probes.remove(&contract_id)))
+        .collect();
+    let mut stream = stream::iter(candidate_work.into_iter().map(|(contract_id, probe)| {
         let client = client.clone();
         let keys = keys.clone();
         let limits = limits.clone();
@@ -95,7 +99,6 @@ pub async fn enrich_candidates_with_hook(
             .to_owned();
         let address = store.contracts[contract_id as usize].address.clone();
         let is_evm = store.is_evm_chain(&chain);
-        let probe = candidate_probes.get(&contract_id).cloned();
         let price_cache = price_cache.clone();
         let external_transfer_cache = external_transfer_cache.clone();
         let receipt_cache = receipt_cache.clone();
@@ -151,6 +154,145 @@ pub async fn enrich_candidates_with_hook(
     Ok(out)
 }
 
+/// Refresh only seed-scoped legitimacy evidence for already enriched
+/// candidates. This stops after preflight and avoids market, receipt, price,
+/// history, and value-flow requests when only the seed list changed.
+pub async fn refresh_relation_legit(
+    registry: &CandidateRegistry,
+    store: &ResidentStore,
+    keys: &ApiKeys,
+    limits: &HttpLimits,
+    progress: &dyn ProgressObserver,
+) -> Result<AHashMap<ContractId, EvidenceBundle>, Analysis2Error> {
+    let client = HttpClient::with_retries(limits.concurrency.max(1), limits.retries)?;
+    progress.set_stage("enrich_legit");
+    let preflight =
+        legit_detect::prefilter_candidates(registry, store, &client, keys, limits, progress)
+            .await?;
+    Ok(preflight.evidence)
+}
+
+/// Refresh run-time USD quotes in cached evidence without re-fetching chain or
+/// market history. Price-dependent sale, value-flow, and mint fields are
+/// recomputed from their retained native amounts.
+pub async fn refresh_cached_prices(
+    evidence: &mut AHashMap<ContractId, EvidenceBundle>,
+    candidates: &ahash::AHashSet<ContractId>,
+    keys: &ApiKeys,
+    limits: &HttpLimits,
+    progress: &dyn ProgressObserver,
+) -> Result<(), Analysis2Error> {
+    let client = HttpClient::with_retries(limits.concurrency.max(1), limits.retries)?;
+    let price_cache = alchemy::PriceRequestCache::default();
+    progress.set_stage("enrich_prices");
+    progress.begin_phase("refresh_cached_prices", Some(candidates.len() as u64));
+    let task_slots = limits.concurrency.max(1);
+    let mut stream = stream::iter(
+        evidence
+            .iter_mut()
+            .filter(|(candidate_id, _)| candidates.contains(candidate_id))
+            .map(|(_, bundle)| {
+                let client = client.clone();
+                let keys = keys.clone();
+                let limits = limits.clone();
+                let price_cache = price_cache.clone();
+                async move {
+                    let symbols = price_symbols_for_sales(&bundle.sales);
+                    let addresses = price_addresses_for_sales(&bundle.sales, &bundle.chain);
+                    let prices = price_cache
+                        .fetch(
+                            &client,
+                            &limits.endpoints,
+                            keys.alchemy(),
+                            &bundle.chain,
+                            &symbols,
+                            &addresses,
+                        )
+                        .await;
+                    bundle
+                        .quality
+                        .failures
+                        .retain(|failure| !failure.to_ascii_lowercase().contains("alchemy_prices"));
+                    apply_outcome(
+                        &mut bundle.quality.prices,
+                        &mut bundle.provenance,
+                        &mut bundle.quality.failures,
+                        &prices,
+                    );
+                    bundle.prices = prices.value;
+                    apply_prices_to_sales(&mut bundle.sales, &bundle.prices, &bundle.chain);
+                    apply_runtime_price_to_value_flows(
+                        &mut bundle.value_flows,
+                        &bundle.prices,
+                        &bundle.chain,
+                    );
+                    mint_payment::refresh_mint_payment_usd(
+                        &mut bundle.transfers,
+                        &bundle.prices,
+                        &bundle.chain,
+                    );
+                }
+            }),
+    )
+    .buffer_unordered(task_slots);
+    while stream.next().await.is_some() {
+        progress.check_cancelled()?;
+        progress.add_completed(1);
+    }
+    Ok(())
+}
+
+/// Refresh EVM holder snapshots without repeating transfers, sales, receipts,
+/// prices, deployment, controllers, or value-flow calls.
+pub async fn refresh_cached_evm_holders(
+    evidence: &mut AHashMap<ContractId, EvidenceBundle>,
+    candidates: &ahash::AHashSet<ContractId>,
+    keys: &ApiKeys,
+    limits: &HttpLimits,
+    progress: &dyn ProgressObserver,
+) -> Result<(), Analysis2Error> {
+    let client = HttpClient::with_retries(limits.concurrency.max(1), limits.retries)?;
+    progress.set_stage("enrich_holders");
+    progress.begin_phase("refresh_cached_holders", Some(candidates.len() as u64));
+    let mut stream = stream::iter(
+        evidence
+            .iter_mut()
+            .filter(|(candidate_id, _)| candidates.contains(candidate_id))
+            .map(|(_, bundle)| {
+                let client = client.clone();
+                let keys = keys.clone();
+                let limits = limits.clone();
+                async move {
+                    let holders = alchemy::fetch_holders(
+                        &client,
+                        &limits.endpoints,
+                        keys.alchemy(),
+                        &bundle.chain,
+                        &bundle.address,
+                        limits.max_holder_pages,
+                    )
+                    .await;
+                    bundle.quality.failures.retain(|failure| {
+                        !failure.to_ascii_lowercase().contains("alchemy_holders")
+                    });
+                    apply_outcome(
+                        &mut bundle.quality.holders,
+                        &mut bundle.provenance,
+                        &mut bundle.quality.failures,
+                        &holders,
+                    );
+                    bundle.holders = holders.value;
+                }
+            }),
+    )
+    .buffer_unordered(limits.concurrency.max(1));
+    while stream.next().await.is_some() {
+        progress.check_cancelled()?;
+        progress.add_completed(1);
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn enrich_evm(
     contract_id: ContractId,
@@ -170,12 +312,10 @@ async fn enrich_evm(
 
     // These provider calls are independent. Starting them together removes
     // three full network round trips from the common EVM critical path.
-    let prefetched_controllers = prefetch
-        .as_ref()
-        .and_then(|probe| probe.evm_controllers.clone());
-    let prefetched_slug = prefetch
-        .as_ref()
-        .and_then(|probe| probe.collection_slug.as_deref());
+    let (prefetched_controllers, prefetched_slug) = match prefetch {
+        Some(probe) => (probe.evm_controllers, probe.collection_slug),
+        None => (None, None),
+    };
     let controllers = async {
         match prefetched_controllers {
             Some(outcome) => outcome,
@@ -215,7 +355,7 @@ async fn enrich_evm(
             chain,
             address,
             limits.max_sale_pages,
-            prefetched_slug,
+            prefetched_slug.as_deref(),
         ),
         controllers,
     );
@@ -579,33 +719,34 @@ async fn enrich_solana(
     // transactions and are never published as Sale evidence.
     let (mut transfers, mut helius_sales) = history.value;
 
-    let (gas, value_flows, decode_stats) = helius::decode_and_attach_transactions_cached(
-        client,
-        &limits.endpoints.helius,
-        keys.helius(),
-        helius::DecodeContext {
-            candidate: address,
-            controllers: &bundle.controllers,
-            transfer_discovery_complete,
-        },
-        &mut transfers,
-        &mut helius_sales,
-        transaction_cache,
-    )
-    .await;
-
     let payment_symbols = price_symbols_for_sales(&market_sales.value);
     let payment_addresses = price_addresses_for_sales(&market_sales.value, chain);
-    let prices = price_cache
-        .fetch(
+    // Transaction decoding and currency lookup are independent once the
+    // OpenSea page has been parsed, so overlap both network paths.
+    let (decode_result, prices) = tokio::join!(
+        helius::decode_and_attach_transactions_cached(
+            client,
+            &limits.endpoints.helius,
+            keys.helius(),
+            helius::DecodeContext {
+                candidate: address,
+                controllers: &bundle.controllers,
+                transfer_discovery_complete,
+            },
+            &mut transfers,
+            &mut helius_sales,
+            transaction_cache,
+        ),
+        price_cache.fetch(
             client,
             &limits.endpoints,
             keys.alchemy(),
             chain,
             &payment_symbols,
             &payment_addresses,
-        )
-        .await;
+        ),
+    );
+    let (gas, value_flows, decode_stats) = decode_result;
     apply_prices_to_sales(&mut market_sales.value, &prices.value, chain);
 
     apply_outcome(
@@ -1761,6 +1902,70 @@ mod tests {
         assert!(bundle.sales[0].usd_amount.is_some());
         assert_eq!(bundle.quality.transfers, EvidenceStatus::Complete);
         assert_eq!(bundle.quality.sales, EvidenceStatus::Complete);
+    }
+
+    #[tokio::test]
+    async fn cached_price_refresh_does_not_repeat_chain_or_market_requests() {
+        let server = MockServer::start_async().await;
+        let prices = server
+            .mock_async(|when, then| {
+                when.method(GET).path_contains("/tokens/by-symbol");
+                then.status(200).json_body(json!({
+                    "data": [{
+                        "symbol": "ETH",
+                        "prices": [{
+                            "currency": "usd",
+                            "value": "2000",
+                            "lastUpdatedAt": "2024-01-01T00:00:00Z"
+                        }]
+                    }]
+                }));
+            })
+            .await;
+        let limits = HttpLimits {
+            concurrency: 2,
+            retries: 0,
+            endpoints: mock_endpoints(&server),
+            ..HttpLimits::default()
+        };
+        let keys = ApiKeys {
+            alchemy: Some("key".into()),
+            ..ApiKeys::default()
+        };
+        let mut bundle = EvidenceBundle::empty(7, "ethereum", "0xcandidate");
+        bundle.quality.prices = EvidenceStatus::Failed;
+        bundle
+            .quality
+            .failures
+            .push("alchemy_prices: prior failure".into());
+        bundle.sales.push(SaleEvent {
+            native_amount: Some(2.0),
+            seller_proceeds_native: Some(2.0),
+            currency_symbol: Some("ETH".into()),
+            ..SaleEvent::default()
+        });
+        let mut evidence = AHashMap::from([(7, bundle)]);
+        refresh_cached_prices(
+            &mut evidence,
+            &AHashSet::from([7]),
+            &keys,
+            &limits,
+            &NoopProgress,
+        )
+        .await
+        .unwrap();
+
+        let refreshed = &evidence[&7];
+        assert_eq!(prices.hits_async().await, 1);
+        assert_eq!(refreshed.quality.prices, EvidenceStatus::Complete);
+        assert_eq!(refreshed.sales[0].usd_amount, Some(4_000.0));
+        assert!(
+            refreshed
+                .quality
+                .failures
+                .iter()
+                .all(|failure| !failure.contains("alchemy_prices"))
+        );
     }
 
     #[tokio::test]
