@@ -179,6 +179,30 @@ fn load_options_mixed_case_evm_chains_use_bigint_descending_anchors() {
 }
 
 #[test]
+fn identity_only_load_keeps_identity_without_dedup_strings() {
+    let path = fixture_path();
+    let options = LoadOptions::identity_only(
+        ["ethereum", "base", "solana"].map(str::to_owned),
+        ["ethereum", "base"].map(str::to_owned),
+        2,
+    );
+    let store = load_resident_store(&[path], &options, &NoopProgress).expect("identity-only load");
+
+    assert_eq!(store.contracts.len(), 3);
+    assert_eq!(store.nfts.len(), 6);
+    assert_eq!(store.rows_loaded, 6);
+    assert!(store.nfts.iter().all(|nft| {
+        nft.name_id.is_none() && nft.token_uri_id.is_none() && nft.image_uri_id.is_none()
+    }));
+    assert!(store.token_uri_csr.is_empty());
+    assert!(store.image_uri_csr.is_empty());
+    assert!(store.name_contract_csr.is_empty());
+    assert!(store.name_nft_csr.is_empty());
+    assert!(store.metadata_index.is_empty());
+    assert_eq!(store.nfts_for_contract(0).len(), 3);
+}
+
+#[test]
 fn conflicting_uri_same_logical_key_errors() {
     let dir = tempfile_dir();
     let path = dir.join("conflict.parquet");

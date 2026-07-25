@@ -19,6 +19,8 @@ pub const PASS1_COLUMNS: [&str; 6] = [
     "image_uri_norm",
 ];
 
+pub const IDENTITY_COLUMNS: [&str; 3] = ["chain", "contract_address", "token_id"];
+
 pub const PASS2_COLUMNS: [&str; 4] = ["chain", "contract_address", "token_id", "metadata_json"];
 
 pub const REQUIRED_COLUMNS: [&str; 7] = [
@@ -36,6 +38,7 @@ pub struct ValidatedInput {
     pub path: PathBuf,
     pub file_ordinal: u32,
     pub row_group_count: usize,
+    pub identity_projection: Vec<usize>,
     pub pass1_projection: Vec<usize>,
     pub pass2_projection: Vec<usize>,
     pub metadata: ArrowReaderMetadata,
@@ -89,6 +92,7 @@ pub fn validate_inputs(
                     .map(|(_, i)| *i)
                     .expect("required column present")
             };
+            let identity_projection = IDENTITY_COLUMNS.iter().map(|c| index_of(c)).collect();
             let pass1_projection = PASS1_COLUMNS.iter().map(|c| index_of(c)).collect();
             let pass2_projection = PASS2_COLUMNS.iter().map(|c| index_of(c)).collect();
             let row_count = metadata.metadata().file_metadata().num_rows().max(0) as u64;
@@ -97,6 +101,7 @@ pub fn validate_inputs(
                 path: path.clone(),
                 file_ordinal,
                 row_group_count: metadata.metadata().num_row_groups(),
+                identity_projection,
                 pass1_projection,
                 pass2_projection,
                 metadata,

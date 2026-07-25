@@ -6,6 +6,7 @@ use arrow_schema::DataType;
 use parquet::arrow::ProjectionMask;
 use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
+use std::borrow::Cow;
 use std::fs::File;
 use std::path::Path;
 
@@ -13,7 +14,7 @@ use crate::Analysis2Error;
 use crate::entity::{ResidentStore, SourceOrder};
 use crate::parquet::LoadOptions;
 use crate::parquet::merge::merge_shards_ordered;
-use crate::parquet::validate::{PASS1_COLUMNS, ValidatedInput};
+use crate::parquet::validate::{IDENTITY_COLUMNS, PASS1_COLUMNS, ValidatedInput};
 use crate::progress::ProgressObserver;
 
 pub fn scan_pass1(
@@ -64,9 +65,14 @@ fn scan_row_group_pass1(
     progress.check_cancelled()?;
     let file = File::open(&input.path)
         .map_err(|error| Analysis2Error::parquet(format!("{}: {error}", input.path.display())))?;
+    let (projection, column_names): (&[usize], &[&str]) = if options.build_dedup_indexes {
+        (&input.pass1_projection, &PASS1_COLUMNS)
+    } else {
+        (&input.identity_projection, &IDENTITY_COLUMNS)
+    };
     let mask = ProjectionMask::roots(
         input.metadata.metadata().file_metadata().schema_descr(),
-        input.pass1_projection.iter().copied(),
+        projection.iter().copied(),
     );
     let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, input.metadata.clone())
         .with_projection(mask)
@@ -80,25 +86,37 @@ fn scan_row_group_pass1(
         let batch = batch.map_err(|error| {
             Analysis2Error::parquet(format!("{}: {error}", input.path.display()))
         })?;
-        let columns = ProjectedUtf8Columns::new(&batch, &input.path, &PASS1_COLUMNS)?;
+        let columns = ProjectedUtf8Columns::new(&batch, &input.path, column_names)?;
         for row_index in 0..batch.num_rows() {
             let source_order = SourceOrder {
                 file_ordinal: input.file_ordinal,
                 file_row_number: row_start + row_offset,
             };
             row_offset += 1;
-            let chain = normalize_chain(columns.value_at(0, row_index));
-            if !options.allowed_chains.is_empty() && !options.allowed_chains.contains(&chain) {
+            let chain = normalized_chain(columns.value_at(0, row_index));
+            if !options.allowed_chains.is_empty()
+                && !options.allowed_chains.contains(chain.as_ref())
+            {
                 continue;
             }
-            // Intern directly from Arrow slices — no intermediate IdentityRow Strings.
+            // Cache replay only needs identity. Avoid decoding and interning the
+            // large Name/URI columns that dedup queries would consume.
+            let dedup_values = if options.build_dedup_indexes {
+                (
+                    columns.value_at(3, row_index),
+                    columns.value_at(4, row_index),
+                    columns.value_at(5, row_index),
+                )
+            } else {
+                ("", "", "")
+            };
             shard.ingest_identity_strs(
-                &chain,
+                chain.as_ref(),
                 columns.value_at(1, row_index).trim(),
                 columns.value_at(2, row_index).trim(),
-                columns.value_at(3, row_index),
-                columns.value_at(4, row_index),
-                columns.value_at(5, row_index),
+                dedup_values.0,
+                dedup_values.1,
+                dedup_values.2,
                 source_order,
             )?;
         }
@@ -150,5 +168,14 @@ impl ProjectedUtf8Columns {
 }
 
 pub(crate) fn normalize_chain(value: &str) -> String {
-    value.trim().to_ascii_lowercase()
+    normalized_chain(value).into_owned()
+}
+
+fn normalized_chain(value: &str) -> Cow<'_, str> {
+    let trimmed = value.trim();
+    if trimmed.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        Cow::Owned(trimmed.to_ascii_lowercase())
+    } else {
+        Cow::Borrowed(trimmed)
+    }
 }
