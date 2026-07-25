@@ -206,7 +206,9 @@ fn report_golden_duplicate_scale_fields_and_ratios() {
     )
     .unwrap();
     assert_eq!(summary["scope"], "all_chains");
-    assert_eq!(summary["analyzed_seed_count"], 1);
+    assert!(summary.get("analyzed_seed_count").is_none());
+    assert!(summary.get("incomplete_seed_count").is_none());
+    assert!(summary.get("failed_seed_count").is_none());
     assert_eq!(summary["seed_with_duplicate_count"], 1);
     let scale = summary["duplicate_scale"].as_array().unwrap();
     assert!(scale.iter().any(|r| r["category"] == "total"));

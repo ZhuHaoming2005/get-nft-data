@@ -89,6 +89,26 @@ impl FailureRecord {
         }
     }
 
+    /// Provider/API failure attached to a candidate. These rows are diagnostic:
+    /// they never remove the candidate or any related seed from result summaries.
+    pub fn candidate_api(chain: &str, address: &str, error: impl Into<String>) -> Self {
+        let error = error.into();
+        let lower = error.to_ascii_lowercase();
+        let provider = ["alchemy", "opensea", "helius", "etherscan", "magic_eden"]
+            .into_iter()
+            .find(|provider| lower.contains(provider))
+            .unwrap_or("unknown");
+        Self {
+            seed_chain: chain.to_owned(),
+            seed_address: address.to_owned(),
+            scope: "candidate".into(),
+            stage: "api_request".into(),
+            provider: provider.into(),
+            retryable: true,
+            error,
+        }
+    }
+
     pub fn is_seed_scope(&self) -> bool {
         self.scope == "seed"
     }
@@ -96,7 +116,7 @@ impl FailureRecord {
 
 /// Unique seeds that failed a seed-stage (resolve / dedup / incomplete seed path).
 /// Candidate-stage rows in `failures.jsonl` do **not** inflate this count;
-/// incomplete four-scope seeds are tracked separately via `incomplete_seed_count`.
+/// API/candidate-stage rows are diagnostic and never remove seed results.
 pub fn count_failed_seeds(failures: &[FailureRecord]) -> u64 {
     let mut keys: Vec<(&str, &str)> = failures
         .iter()
@@ -119,4 +139,22 @@ pub fn write_failures_jsonl(path: &Path, failures: &[FailureRecord]) -> Result<(
         writeln!(file, "{line}")?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn candidate_api_error_is_retryable_and_keeps_provider() {
+        let row = FailureRecord::candidate_api(
+            "solana",
+            "candidate",
+            "opensea_sales: HTTP 404 contract not found",
+        );
+        assert_eq!(row.scope, "candidate");
+        assert_eq!(row.stage, "api_request");
+        assert_eq!(row.provider, "opensea");
+        assert!(row.retryable);
+    }
 }

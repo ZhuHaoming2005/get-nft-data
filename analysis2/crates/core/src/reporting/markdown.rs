@@ -230,13 +230,11 @@ pub fn write_all_chains_md(
         .unwrap_or("all_chains");
     let mut body = format!("# NFT 论文统计汇总报告（scope = {scope}）\n\n");
 
-    // Header counts
+    // Header counts. API/data-quality problems are documented separately and
+    // never remove otherwise available seed results from this report.
     body.push_str(&format!(
-        "- selected seeds: {}\n- analyzed (formal): {}\n- incomplete: {}\n- failed: {}\n- seed_with_duplicate: {} ({})\n\n",
+        "- selected seeds: {}\n- seed_with_duplicate: {} ({})\n\n",
         summary["selected_seed_count"],
-        summary["analyzed_seed_count"],
-        summary.get("incomplete_seed_count").unwrap_or(&Value::Null),
-        summary["failed_seed_count"],
         summary["seed_with_duplicate_count"],
         f64_cell(&summary["seed_duplicate_ratio"]),
     ));
@@ -557,7 +555,7 @@ pub fn write_all_chains_md(
     let dimensions = &dq["dedup_dimensions"];
     body.push_str("\n## 数据质量\n\n");
     body.push_str(&format!(
-        "- 代表候选 NFT 数: {}\n- 候选合约数: {}\n- 疑似重复合约数: {}\n- 官方参与型重复合约数: {}\n- 疑似侵权 NFT 数: {}\n- 合法关系验证 Complete/Incomplete: {} / {}\n- gas 证据 Complete/Empty/Failed/Truncated/NotRequested: {} / {} / {} / {} / {}\n- 销售定价 Priced/Unpriced/Amountless/AssumedPeg/Total: {} / {} / {} / {} / {}\n- 操作者销售净收入 Priced/Unpriced/Unknown/Total: {} / {} / {} / {}\n- 版税接收方 Unknown: {}\n- 操作者付费 mint 收入 Priced/Unpriced/Operator/AllPaid/UnknownReceiver: {} / {} / {} / {} / {}\n- 诚实买家付费 mint 损失定价 Priced/Unpriced/Total: {} / {} / {}\n- Gas 成本定价 Priced/Unpriced/Total: {} / {} / {}\n- 操作者产出完整: {}\n- USD 估值完整: {}\n- 去重维度 token_uri/image_uri/metadata/name: {} / {} / {} / {}\n- failure_record_count: {}\n",
+        "- 代表候选 NFT 数: {}\n- 候选合约数: {}\n- 疑似重复合约数: {}\n- 官方参与型重复合约数: {}\n- 疑似侵权 NFT 数: {}\n- 合法关系验证 Complete/Incomplete: {} / {}\n- gas 证据 Complete/Empty/Failed/Truncated/NotRequested: {} / {} / {} / {} / {}\n- 销售定价 Priced/Unpriced/Amountless/AssumedPeg/Total: {} / {} / {} / {} / {}\n- 操作者销售净收入 Priced/Unpriced/Unknown/Total: {} / {} / {} / {}\n- 版税接收方 Unknown: {}\n- 操作者付费 mint 收入 Priced/Unpriced/Operator/AllPaid/UnknownReceiver: {} / {} / {} / {} / {}\n- 诚实买家付费 mint 损失定价 Priced/Unpriced/Total: {} / {} / {}\n- Gas 成本定价 Priced/Unpriced/Total: {} / {} / {}\n- 操作者产出完整: {}\n- USD 估值完整: {}\n- 去重维度 token_uri/image_uri/metadata/name: {} / {} / {} / {}\n",
         u64_cell(dq.get("representative_candidate_count").unwrap_or(&summary["representative_candidate_count"])),
         u64_cell(dq.get("candidate_contract_count").unwrap_or(&summary["candidate_contract_count"])),
         u64_cell(dq.get("suspected_duplicate_contract_count").unwrap_or(&summary["suspected_duplicate_contract_count"])),
@@ -597,7 +595,6 @@ pub fn write_all_chains_md(
         dimensions["image_uri_enabled"],
         dimensions["metadata_enabled"],
         dimensions["name_enabled"],
-        u64_cell(&dq["failure_record_count"]),
     ));
 
     write_text(path, &body)

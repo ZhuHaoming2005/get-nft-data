@@ -22,9 +22,11 @@ use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 use crate::reporting::json::SeedRecord;
 
-// v9 makes OpenSea the canonical Sale provider on every chain. Older bundles
-// may contain Alchemy/Helius sales and must not be auto-reused.
-pub const EVIDENCE_CACHE_VERSION: u32 = 9;
+// v10 stops representing OpenSea request failures as legitimate empty Sale
+// evidence. Older bundles may contain false Empty statuses and must not be
+// auto-reused.
+pub const EVIDENCE_CACHE_VERSION: u32 = 10;
+const MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION: u32 = 9;
 pub const DEFAULT_EVIDENCE_CACHE_FILE: &str = "evidence_cache.json";
 /// How many finished candidates to buffer before an append + snapshot flush.
 pub const DEFAULT_EVIDENCE_CACHE_BATCH: usize = 16;
@@ -173,9 +175,9 @@ pub fn load_evidence_cache(path: &Path) -> Result<EvidenceCacheFile, Analysis2Er
     let cache: EvidenceCacheFile = serde_json::from_str(&text).map_err(|e| {
         Analysis2Error::invalid(format!("parse evidence cache {}: {e}", path.display()))
     })?;
-    if cache.version != EVIDENCE_CACHE_VERSION {
+    if !(MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION..=EVIDENCE_CACHE_VERSION).contains(&cache.version) {
         return Err(Analysis2Error::invalid(format!(
-            "evidence cache version {} unsupported (expected {EVIDENCE_CACHE_VERSION})",
+            "evidence cache version {} unsupported (supported {MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION}..={EVIDENCE_CACHE_VERSION})",
             cache.version
         )));
     }
@@ -219,9 +221,10 @@ pub fn load_evidence_cache_resumable(path: &Path) -> Result<EvidenceCacheFile, A
         let meta: Meta = serde_json::from_str(&meta_text).map_err(|e| {
             Analysis2Error::invalid(format!("parse evidence meta {}: {e}", meta_path.display()))
         })?;
-        if meta.version != EVIDENCE_CACHE_VERSION {
+        if !(MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION..=EVIDENCE_CACHE_VERSION).contains(&meta.version)
+        {
             return Err(Analysis2Error::invalid(format!(
-                "evidence cache version {} unsupported (expected {EVIDENCE_CACHE_VERSION})",
+                "evidence cache version {} unsupported (supported {MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION}..={EVIDENCE_CACHE_VERSION})",
                 meta.version
             )));
         }
@@ -266,7 +269,7 @@ pub fn load_evidence_cache_resumable(path: &Path) -> Result<EvidenceCacheFile, A
                 .then_with(|| a.address.cmp(&b.address))
         });
         return Ok(EvidenceCacheFile {
-            version: EVIDENCE_CACHE_VERSION,
+            version: meta.version,
             params: meta.params,
             bundles,
         });
@@ -638,6 +641,24 @@ mod tests {
         let got = remapped.get(&cid).unwrap();
         assert_eq!(got.contract_id, cid);
         assert_eq!(got.controllers, vec!["0xop".to_owned()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v9_cache_remains_readable_for_targeted_sales_migration() {
+        let mut cache = build_evidence_cache(params(), &AHashMap::new());
+        cache.version = 9;
+        let dir = std::env::temp_dir().join(format!(
+            "analysis2_evidence_cache_v9_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("evidence_cache.json");
+        write_evidence_cache(&path, &cache).unwrap();
+
+        let loaded = load_evidence_cache(&path).unwrap();
+        assert_eq!(loaded.version, 9);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

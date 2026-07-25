@@ -227,7 +227,7 @@ pub fn write_dedup_outputs(
             failed: count_failed_seeds(&failures),
         },
         completeness: json!({
-            "seed_completion_ratio": if selected_seeds.is_empty() {
+            "seed_result_ratio": if selected_seeds.is_empty() {
                 None
             } else {
                 Some(ok_reports.len() as f64 / selected_seeds.len() as f64)
@@ -477,7 +477,7 @@ fn write_scope_rollups(
     store: &ResidentStore,
     selected: &[SeedRecord],
     reports: &[&SeedDedupReport],
-    failures: &[FailureRecord],
+    _failures: &[FailureRecord],
 ) -> Result<(), Analysis2Error> {
     let paper_for = |filter: ScopeScaleFilter<'_>| {
         let mut candidates = ahash::AHashSet::new();
@@ -529,10 +529,6 @@ fn write_scope_rollups(
         json!({
             "analysis_available": false,
             "selected_seed_count": selected_n,
-            "analyzed_seed_count": analyzed,
-            "incomplete_seed_count": 0,
-            "failed_seed_count": count_failed_seeds(failures),
-            "seed_completion_ratio": (selected_n > 0).then_some(analyzed as f64 / selected_n as f64),
             "seed_with_duplicate_count": with_dup,
             "seed_duplicate_ratio": (analyzed > 0).then_some(with_dup as f64 / analyzed as f64),
             "representative_candidate_count": representative_nfts,
@@ -543,8 +539,6 @@ fn write_scope_rollups(
             "infringing_nft_count": Value::Null,
             "data_quality": {
                 "analysis_available": false,
-                "failure_record_count": failures.len() as u64,
-                "failure_record_count_scope": "global_run",
             },
         })
     };

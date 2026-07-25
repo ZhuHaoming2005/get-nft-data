@@ -25,8 +25,8 @@ use super::manifest::{
 };
 use super::markdown;
 
-/// Candidate analyses rebuilt from the same cached evidence for every formal
-/// reporting scope. Matrix entries are keyed by `(primary, secondary)`.
+/// Candidate analyses rebuilt from the same cached evidence for every reporting
+/// scope. Matrix entries are keyed by `(primary, secondary)`.
 #[derive(Clone, Debug, Default)]
 pub struct ScopeAnalysisSets {
     pub intra_chain: Vec<CandidateAnalysis>,
@@ -165,13 +165,6 @@ pub struct SeedFullReport {
     pub analysis_complete: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub analysis: Option<SeedAnalysisRollup>,
-}
-
-impl SeedFullReport {
-    /// Formal summary denominators only include seeds with complete scopes + analysis.
-    pub fn is_formal(&self) -> bool {
-        self.scopes_complete && self.analysis_complete
-    }
 }
 
 /// Whether this seed's chain-matrix covers every non-primary chain in the store.
@@ -675,12 +668,14 @@ fn status_json(counts: [u64; 5]) -> Value {
     })
 }
 
-/// Aggregate one independently analyzed reporting scope over formal seeds only.
+/// Aggregate one independently analyzed reporting scope over every available
+/// seed report. Additional reports are kept for API compatibility and are
+/// included identically.
 pub fn build_run_summary_for_scope(
     selected: &[SeedRecord],
-    formal: &[&SeedFullReport],
-    incomplete: &[&SeedFullReport],
-    failures: &[FailureRecord],
+    reports: &[&SeedFullReport],
+    additional_reports: &[&SeedFullReport],
+    _failures: &[FailureRecord],
     analyses: &[&CandidateAnalysis],
     scope: RunSummaryScope<'_>,
 ) -> Value {
@@ -688,22 +683,13 @@ pub fn build_run_summary_for_scope(
         .iter()
         .filter(|seed| scope.seed_matches(&seed.chain))
         .count() as u64;
-    let scoped_formal: Vec<_> = formal
+    let scoped_reports: Vec<_> = reports
         .iter()
+        .chain(additional_reports.iter())
         .copied()
         .filter(|report| scope.seed_matches(&report.dedup.seed.chain))
         .collect();
-    let formal_n = scoped_formal.len() as u64;
-    let incomplete_n = incomplete
-        .iter()
-        .filter(|report| scope.seed_matches(&report.dedup.seed.chain))
-        .count() as u64;
-    let scoped_seed_failures: Vec<_> = failures
-        .iter()
-        .filter(|failure| scope.seed_matches(&failure.seed_chain))
-        .cloned()
-        .collect();
-    let failed_seed_count = count_failed_seeds(&scoped_seed_failures);
+    let included_n = scoped_reports.len() as u64;
 
     let analysis_by_key: AHashMap<String, &CandidateAnalysis> = analyses
         .iter()
@@ -720,7 +706,7 @@ pub fn build_run_summary_for_scope(
     let mut legit_relation_complete = 0u64;
     let mut legit_relation_incomplete = 0u64;
 
-    for report in &scoped_formal {
+    for report in &scoped_reports {
         let seed_chain = report.dedup.seed.chain.as_str();
         let mut seed_has_duplicate = false;
         for rel in &report.dedup.relations {
@@ -822,12 +808,14 @@ pub fn build_run_summary_for_scope(
     .into_iter()
     .map(|name| (name, [0; 5]))
     .collect();
+    let mut analyzed_suspected_count = 0u64;
 
     for analysis in analyses {
         let key = format!("{}:{}", analysis.chain, analysis.address);
         if !suspected.contains(&key) {
             continue;
         }
+        analyzed_suspected_count += 1;
         let econ = economics_usd_from(&analysis.economics);
         merge_usd(&mut economics, &econ);
         collect_economic_events(&mut economic_usd_by_event, analysis);
@@ -1104,6 +1092,21 @@ pub fn build_run_summary_for_scope(
         }),
     );
 
+    let evidence_complete = |name: &str| {
+        let counts = evidence_statuses.get(name).copied().unwrap_or_default();
+        counts[0] + counts[1] == suspected_n
+    };
+    let required_evidence_complete = analyzed_suspected_count == suspected_n
+        && [
+            "transfers",
+            "sales",
+            "holders",
+            "prices",
+            "gas",
+            "value_flows",
+        ]
+        .into_iter()
+        .all(evidence_complete);
     let evidence_quality: serde_json::Map<String, Value> = evidence_statuses
         .into_iter()
         .map(|(name, counts)| (name.to_owned(), status_json(counts)))
@@ -1114,7 +1117,8 @@ pub fn build_run_summary_for_scope(
             .filter(|state| state.all_nfts.is_empty())
             .map(|state| state.fallback_nft_count)
             .sum::<u64>();
-    let operator_output_complete = economics.unpriced_operator_sale_proceeds_count == 0
+    let operator_output_complete = required_evidence_complete
+        && economics.unpriced_operator_sale_proceeds_count == 0
         && economics.unknown_operator_sale_proceeds_count == 0
         && economics.unknown_royalty_recipient_count == 0
         && economics.unpriced_operator_paid_mint_payment_count == 0
@@ -1196,6 +1200,7 @@ pub fn build_run_summary_for_scope(
         "representative_candidate_count": representative_candidate_count,
         "representative_candidate_nft_count": representative_candidate_count,
         "candidate_contract_count": candidates.len() as u64,
+        "candidate_analysis_missing_count": suspected_n.saturating_sub(analyzed_suspected_count),
         "suspected_duplicate_contract_count": suspected_n,
         "legit_duplicate_contract_count": legit_contract_count,
         "infringing_nft_count": infringing_nfts,
@@ -1203,10 +1208,8 @@ pub fn build_run_summary_for_scope(
         "legit_relation_verification_incomplete": legit_relation_incomplete,
         "pricing": pricing_quality,
         "evidence": evidence_quality,
-        "failure_record_count": failures.len() as u64,
-        "failure_record_count_scope": "global_run",
     });
-    let seed_rows = scoped_formal
+    let seed_rows = scoped_reports
         .iter()
         .map(|report| {
             json!({
@@ -1225,12 +1228,8 @@ pub fn build_run_summary_for_scope(
     json!({
         "analysis_available": true,
         "selected_seed_count": selected_n,
-        "analyzed_seed_count": formal_n,
-        "incomplete_seed_count": incomplete_n,
-        "failed_seed_count": failed_seed_count,
-        "seed_completion_ratio": (selected_n > 0).then_some(formal_n as f64 / selected_n as f64),
         "seed_with_duplicate_count": with_dup,
-        "seed_duplicate_ratio": (formal_n > 0).then_some(with_dup as f64 / formal_n as f64),
+        "seed_duplicate_ratio": (included_n > 0).then_some(with_dup as f64 / included_n as f64),
         "representative_candidate_count": representative_candidate_count,
         "representative_candidate_nft_count": representative_candidate_count,
         "candidate_contract_count": candidates.len() as u64,
@@ -1249,7 +1248,7 @@ pub fn build_run_summary_for_scope(
         "economics": economics_json,
         "data_quality": data_quality,
         "scope_summary": {
-            "formal_seed_count": formal_n,
+            "seed_count": included_n,
             "candidate_contract_count": candidates.len() as u64,
             "economics_usd": economics,
         },
@@ -1260,15 +1259,15 @@ pub fn build_run_summary_for_scope(
 /// Backward-compatible all-chains summary builder.
 pub fn build_run_summary(
     selected: &[SeedRecord],
-    formal: &[&SeedFullReport],
-    incomplete: &[&SeedFullReport],
+    reports: &[&SeedFullReport],
+    additional_reports: &[&SeedFullReport],
     failures: &[FailureRecord],
     analyses: &[&CandidateAnalysis],
 ) -> Value {
     build_run_summary_for_scope(
         selected,
-        formal,
-        incomplete,
+        reports,
+        additional_reports,
         failures,
         analyses,
         RunSummaryScope::All,
@@ -1310,30 +1309,20 @@ pub fn write_run_outputs(
         }
     }
 
-    let formal: Vec<&SeedFullReport> = ok_reports
-        .iter()
-        .copied()
-        .filter(|r| r.is_formal())
-        .collect();
-    let incomplete: Vec<&SeedFullReport> = ok_reports
-        .iter()
-        .copied()
-        .filter(|r| !r.is_formal())
-        .collect();
-
     for report in &ok_reports {
         let dir = seed_report_dir(output_dir, &seed_dir_name(&report.dedup.seed));
         write_json(&dir.join("report.json"), report)?;
         markdown::write_seed_full_report_md(&dir.join("report.md"), report)?;
     }
 
-    // Formal reports alone define every paper numerator and denominator.
-    let dedup_refs: Vec<&SeedDedupReport> = formal.iter().map(|r| &r.dedup).collect();
+    // Every available seed report contributes. Evidence problems stay attached
+    // to candidate quality/error records instead of deleting the whole seed.
+    let dedup_refs: Vec<&SeedDedupReport> = ok_reports.iter().map(|r| &r.dedup).collect();
     let analysis_refs: Vec<&CandidateAnalysis> = analyses.iter().collect();
     let mut all_summary = build_run_summary_for_scope(
         selected_seeds,
-        &formal,
-        &incomplete,
+        &ok_reports,
+        &[],
         &failures,
         &analysis_refs,
         RunSummaryScope::All,
@@ -1341,8 +1330,8 @@ pub fn write_run_outputs(
     let intra_refs: Vec<&CandidateAnalysis> = scope_analyses.intra_chain.iter().collect();
     let mut intra_summary = build_run_summary_for_scope(
         selected_seeds,
-        &formal,
-        &incomplete,
+        &ok_reports,
+        &[],
         &failures,
         &intra_refs,
         RunSummaryScope::Intra,
@@ -1350,14 +1339,14 @@ pub fn write_run_outputs(
     let cross_refs: Vec<&CandidateAnalysis> = scope_analyses.cross_chain.iter().collect();
     let mut cross_summary = build_run_summary_for_scope(
         selected_seeds,
-        &formal,
-        &incomplete,
+        &ok_reports,
+        &[],
         &failures,
         &cross_refs,
         RunSummaryScope::Cross,
     );
     let mut matrix_summaries = BTreeMap::new();
-    let mut matrix_primaries: Vec<String> = formal
+    let mut matrix_primaries: Vec<String> = ok_reports
         .iter()
         .map(|report| report.dedup.seed.chain.to_ascii_lowercase())
         .collect::<AHashSet<_>>()
@@ -1380,8 +1369,8 @@ pub fn write_run_outputs(
                 direction,
                 build_run_summary_for_scope(
                     selected_seeds,
-                    &formal,
-                    &incomplete,
+                    &ok_reports,
+                    &[],
                     &failures,
                     &refs,
                     RunSummaryScope::Matrix {
@@ -1426,7 +1415,7 @@ pub fn write_run_outputs(
     )?;
 
     let manifest = RunManifest {
-        status: if failures.is_empty() && incomplete.is_empty() {
+        status: if failures.is_empty() {
             "complete".into()
         } else {
             "complete_with_failures".into()
@@ -1442,17 +1431,16 @@ pub fn write_run_outputs(
         }),
         seeds: RunManifestSeeds {
             selected: selected_seeds.len() as u64,
-            analyzed: formal.len() as u64,
+            analyzed: ok_reports.len() as u64,
             failed: count_failed_seeds(&failures),
         },
         completeness: json!({
-            "seed_completion_ratio": if selected_seeds.is_empty() {
+            "seed_result_ratio": if selected_seeds.is_empty() {
                 None
             } else {
-                Some(formal.len() as f64 / selected_seeds.len() as f64)
+                Some(ok_reports.len() as f64 / selected_seeds.len() as f64)
             },
-            "incomplete_seed_count": incomplete.len() as u64,
-            "formal_denominator_excludes_incomplete": true,
+            "api_failures_do_not_exclude_results": true,
         }),
         pricing_policy: "alchemy_spot_runtime_usd_only_cross_chain".into(),
         stage_timings: json!([]),
@@ -1570,10 +1558,6 @@ mod tests {
         let summary = build_run_summary(&[seed], &[&report], &[], &[], &[&analysis]);
         for key in [
             "selected_seed_count",
-            "analyzed_seed_count",
-            "incomplete_seed_count",
-            "failed_seed_count",
-            "seed_completion_ratio",
             "seed_with_duplicate_count",
             "seed_duplicate_ratio",
             "representative_candidate_count",
@@ -1590,6 +1574,14 @@ mod tests {
             "scope_summary",
         ] {
             assert!(summary.get(key).is_some(), "missing summary key {key}");
+        }
+        for removed in [
+            "analyzed_seed_count",
+            "incomplete_seed_count",
+            "failed_seed_count",
+            "seed_completion_ratio",
+        ] {
+            assert!(summary.get(removed).is_none(), "obsolete key {removed}");
         }
         let econ = &summary["economics"];
         assert!(econ.get("operator_output_usd").is_some());
@@ -2147,7 +2139,7 @@ mod tests {
             vec!["token_uri".into()],
             false,
         );
-        let cross = formal_seed_sharing_candidate(
+        let mut cross = formal_seed_sharing_candidate(
             "ethereum",
             "0xcross",
             "base",
@@ -2158,18 +2150,18 @@ mod tests {
             vec!["token_uri".into()],
             false,
         );
+        cross.analysis_complete = false;
         let intra_analysis = empty_analysis("ethereum", "0xcand_intra", 1);
         let cross_analysis = empty_analysis("base", "0xcand_cross", 2);
         let selected = vec![intra.dedup.seed.clone(), cross.dedup.seed.clone()];
         let summary = build_run_summary_for_scope(
             &selected,
-            &[&intra, &cross],
-            &[],
+            &[&intra],
+            &[&cross],
             &[],
             &[&cross_analysis, &intra_analysis],
             RunSummaryScope::Cross,
         );
-        assert_eq!(summary["analyzed_seed_count"], 2);
         assert_eq!(summary["seed_with_duplicate_count"], 1);
         assert_eq!(summary["candidate_contract_count"], 1);
         assert_eq!(summary["representative_candidate_count"], 1);
@@ -2199,7 +2191,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_seed_count_counts_unique_seed_scope_not_candidate_rows() {
+    fn error_document_count_keeps_seed_and_candidate_rows() {
         let failures = vec![
             FailureRecord::seed_stage("ethereum", "0xfail", "resolve_seed", "missing"),
             FailureRecord::candidate_stage("base", "0xc1", "analyze_candidate", "boom"),
@@ -2240,7 +2232,11 @@ mod tests {
             &failures,
             &[&analysis],
         );
-        assert_eq!(summary["failed_seed_count"], 1);
-        assert_eq!(summary["data_quality"]["failure_record_count"], 4);
+        assert!(summary.get("failed_seed_count").is_none());
+        assert!(
+            summary["data_quality"]
+                .get("failure_record_count")
+                .is_none()
+        );
     }
 }

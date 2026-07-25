@@ -9,12 +9,12 @@ use std::thread;
 use ahash::{AHashMap, AHashSet};
 use analysis2_core::{
     Analysis2Error, ApiKeys, CandidateAnalysis, CandidateRegistry, ContractId,
-    DEFAULT_EVIDENCE_CACHE_BATCH, DedupCacheParams, DedupRunParams, EvidenceBundle,
-    EvidenceCacheSink, EvidenceStatus, FailureRecord, HitGraph, HttpLimits, LegitSignals,
-    LoadOptions, MetadataQueryScratch, NameQueryScratch, PaperConfig, PendingDedupLoad,
-    ProgressObserver, ResidentStore, ScopeAnalysisSets, SeedDedupReport, SeedFullReport,
-    SeedRecord, UriQueryScratch, analyze_candidate, build_contract_nft_map, build_dedup_cache,
-    build_evidence_cache, build_seed_analysis_rollup, build_seed_dedup_report,
+    DEFAULT_EVIDENCE_CACHE_BATCH, DedupCacheParams, DedupRunParams, EVIDENCE_CACHE_VERSION,
+    EvidenceBundle, EvidenceCacheSink, EvidenceStatus, FailureRecord, HitGraph, HttpLimits,
+    LegitSignals, LoadOptions, MetadataQueryScratch, NameQueryScratch, PaperConfig,
+    PendingDedupLoad, ProgressObserver, ResidentStore, ScopeAnalysisSets, SeedDedupReport,
+    SeedFullReport, SeedRecord, UriQueryScratch, analyze_candidate, build_contract_nft_map,
+    build_dedup_cache, build_evidence_cache, build_seed_analysis_rollup, build_seed_dedup_report,
     candidate_json_rel_path, default_dedup_cache_path, default_evidence_cache_path,
     enrich_candidates_with_hook, evidence_cache_artifacts_present, evidence_cache_params,
     finalize_legit_signals, load_dedup_cache, load_evidence_cache_resumable,
@@ -157,63 +157,6 @@ fn build_scope_selectors(
         }
     }
     selectors
-}
-
-fn retain_formal_seed_selectors(
-    selectors: &AHashMap<ContractId, CandidateScopeSelectors>,
-    formal_seed_keys: &AHashSet<String>,
-) -> AHashMap<ContractId, CandidateScopeSelectors> {
-    fn filtered(
-        source: &ScopeEvidenceSelector,
-        formal_seed_keys: &AHashSet<String>,
-    ) -> ScopeEvidenceSelector {
-        let token_ids_by_seed: AHashMap<String, AHashSet<String>> = source
-            .token_ids_by_seed
-            .iter()
-            .filter(|(seed_key, _)| formal_seed_keys.contains(*seed_key))
-            .map(|(seed_key, token_ids)| (seed_key.clone(), token_ids.clone()))
-            .collect();
-        let token_ids = token_ids_by_seed
-            .values()
-            .flat_map(|ids| ids.iter().cloned())
-            .collect();
-        let seed_keys = token_ids_by_seed.keys().cloned().collect();
-        ScopeEvidenceSelector {
-            token_ids,
-            seed_keys,
-            token_ids_by_seed,
-        }
-    }
-
-    selectors
-        .iter()
-        .filter_map(|(&candidate_id, source)| {
-            let all = filtered(&source.all, formal_seed_keys);
-            if all.token_ids_by_seed.is_empty() {
-                return None;
-            }
-            let intra = filtered(&source.intra, formal_seed_keys);
-            let cross = filtered(&source.cross, formal_seed_keys);
-            let matrix = source
-                .matrix
-                .iter()
-                .filter_map(|(direction, selector)| {
-                    let selector = filtered(selector, formal_seed_keys);
-                    (!selector.token_ids_by_seed.is_empty())
-                        .then_some((direction.clone(), selector))
-                })
-                .collect();
-            Some((
-                candidate_id,
-                CandidateScopeSelectors {
-                    all,
-                    intra,
-                    cross,
-                    matrix,
-                },
-            ))
-        })
-        .collect()
 }
 
 /// Configuration for the full end-to-end `run` pipeline.
@@ -769,6 +712,20 @@ fn cached_evidence_needs_retry(bundle: &EvidenceBundle) -> bool {
     failed || transient_partial
 }
 
+fn legacy_empty_sales_candidates(
+    cache_version: u32,
+    evidence: &AHashMap<ContractId, EvidenceBundle>,
+) -> AHashSet<ContractId> {
+    if cache_version >= EVIDENCE_CACHE_VERSION {
+        return AHashSet::new();
+    }
+    evidence
+        .iter()
+        .filter(|(_, bundle)| bundle.quality.sales == EvidenceStatus::Empty)
+        .map(|(&candidate_id, _)| candidate_id)
+        .collect()
+}
+
 fn load_seed_batch_from_cache(
     store: &ResidentStore,
     cache: &analysis2_core::DedupCacheFile,
@@ -976,9 +933,21 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                     }
                     eprintln!("evidence: IGNORING incompatible cache (will re-fetch HTTP): {e}");
                 } else {
+                    let legacy_sales_semantics = cache.version < EVIDENCE_CACHE_VERSION;
                     evidence = rematerialize_evidence(&store, &cache)?;
                     forced_refresh =
                         reconcile_cached_relation_legit(&mut evidence, &registry, &store);
+                    if legacy_sales_semantics {
+                        let legacy_empty_sales =
+                            legacy_empty_sales_candidates(cache.version, &evidence);
+                        if !legacy_empty_sales.is_empty() {
+                            eprintln!(
+                                "evidence: refreshing {} legacy Empty Sale bundle(s); all other cached evidence remains reusable",
+                                legacy_empty_sales.len()
+                            );
+                        }
+                        forced_refresh.extend(legacy_empty_sales);
+                    }
                     forced_refresh.extend(
                         evidence
                             .iter()
@@ -1093,6 +1062,18 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
             }
         }
     };
+
+    // Persist every provider failure as a structured error row. Result
+    // aggregation still consumes all available evidence and dedup relations.
+    let mut documented_api_failures = AHashSet::new();
+    for bundle in evidence.values() {
+        for error in &bundle.quality.failures {
+            let key = (bundle.chain.clone(), bundle.address.clone(), error.clone());
+            if documented_api_failures.insert(key.clone()) {
+                failures.push(FailureRecord::candidate_api(&key.0, &key.1, key.2));
+            }
+        }
+    }
 
     // P0: provenance is on disk; strip before analyze to shrink RSS.
     for bundle in evidence.values_mut() {
@@ -1270,7 +1251,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 && registry.relations_for_seed(seed_id).iter().all(|rel| {
                     seed_analyses
                         .get(&rel.candidate_contract)
-                        .is_some_and(CandidateAnalysis::is_formal_complete)
+                        .is_some_and(CandidateAnalysis::has_complete_evidence)
                 });
             progress.add_completed(1);
             (
@@ -1285,80 +1266,69 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         })
         .collect::<Vec<_>>();
 
-    // A seed becomes formal only after every one of its candidate analyses has
-    // passed the evidence-quality gates. Build summary selectors from that exact
-    // final set. This prevents an incomplete seed's token-specific sales from
-    // leaking into another formal seed that happens to share the candidate.
-    let formal_seed_keys: AHashSet<String> = reports
-        .iter()
-        .filter(|(_, report)| report.is_formal())
-        .map(|(seed, _)| canonical_relation_key(&seed.chain, &seed.address))
-        .collect();
-    let formal_scope_selectors =
-        retain_formal_seed_selectors(&all_scope_selectors, &formal_seed_keys);
-
     // Candidate-wide funding/withdrawal evidence is deliberately present in
-    // every related seed analysis. Re-analyze the union of *formal* relations
-    // once per candidate for run summaries, which de-duplicates those amounts
-    // while retaining the exact formal token scope. Reloading the durable cache
-    // avoids retaining all raw HTTP evidence across the first analysis barrier.
+    // every related seed analysis. Re-analyze the union of all relations once
+    // per candidate for run summaries. API gaps remain visible in evidence
+    // quality and the error document; they never remove seed/candidate results.
+    let summary_scope_selectors = all_scope_selectors;
     progress.set_stage("analyze");
     progress.begin_phase(
-        "analyze_formal_scopes",
-        Some(formal_scope_selectors.len() as u64),
+        "analyze_summary_scopes",
+        Some(summary_scope_selectors.len() as u64),
     );
     let cache = load_evidence_cache_resumable(&evidence_path)?;
     validate_evidence_cache(&cache, &evidence_params)?;
     let mut summary_evidence = rematerialize_evidence(&store, &cache)?;
-    summary_evidence.retain(|candidate_id, _| formal_scope_selectors.contains_key(candidate_id));
+    summary_evidence.retain(|candidate_id, _| summary_scope_selectors.contains_key(candidate_id));
     for bundle in summary_evidence.values_mut() {
         bundle.strip_for_analysis_memory();
     }
-    type FormalScopeBatch = (
+    type SummaryScopeBatch = (
         CandidateAnalysis,
         Option<CandidateAnalysis>,
         Option<CandidateAnalysis>,
         Vec<((String, String), CandidateAnalysis)>,
     );
-    let formal_work: Vec<_> = formal_scope_selectors
+    let summary_work: Vec<_> = summary_scope_selectors
         .into_iter()
         .map(|(candidate_id, selectors)| {
             let bundle = summary_evidence.remove(&candidate_id);
+            if bundle.is_none() {
+                let contract = &store.contracts[candidate_id as usize];
+                failures.push(FailureRecord::candidate_stage(
+                    store.chain_name(contract.chain_id),
+                    &contract.address,
+                    "aggregate_candidate",
+                    "summary evidence missing from cache; continuing with empty evidence",
+                ));
+            }
             (candidate_id, selectors, bundle)
         })
         .collect();
     drop(summary_evidence);
-    let formal_results: Vec<Result<FormalScopeBatch, (String, String, Analysis2Error)>> =
-        formal_work
+    let summary_results: Vec<Result<SummaryScopeBatch, (String, String, Analysis2Error)>> =
+        summary_work
             .into_par_iter()
             .map(|(candidate_id, selectors, bundle)| {
                 let contract = &store.contracts[candidate_id as usize];
                 let chain = store.chain_name(contract.chain_id).to_owned();
                 let address = contract.address.clone();
-                let bundle = bundle.ok_or_else(|| {
-                    (
-                        chain.clone(),
-                        address.clone(),
-                        Analysis2Error::invalid("formal summary evidence missing from cache"),
-                    )
-                })?;
+                let empty;
+                let bundle = match bundle.as_ref() {
+                    Some(bundle) => bundle,
+                    None => {
+                        empty = EvidenceBundle::empty(candidate_id, chain.clone(), address.clone());
+                        &empty
+                    }
+                };
                 let analyze_scope = |selector: &ScopeEvidenceSelector| {
-                    let scoped = selector.filtered_bundle(&bundle);
+                    let scoped = selector.filtered_bundle(bundle);
                     let mut analysis = analyze_candidate(&store, candidate_id, &scoped, &paper)?;
                     analysis.shrink_for_summary_memory();
                     Ok::<_, Analysis2Error>(analysis)
                 };
                 let all = analyze_scope(&selectors.all)
                     .map_err(|error| (chain.clone(), address.clone(), error))?;
-                if !all.is_formal_complete() {
-                    return Err((
-                        chain,
-                        address,
-                        Analysis2Error::invalid(
-                            "formal seed union failed candidate completeness invariant",
-                        ),
-                    ));
-                }
                 let intra = (!selectors.intra.token_ids_by_seed.is_empty())
                     .then(|| analyze_scope(&selectors.intra))
                     .transpose()
@@ -1382,7 +1352,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
 
     let mut analyses_map: AHashMap<ContractId, CandidateAnalysis> = AHashMap::new();
     let mut scope_analyses = ScopeAnalysisSets::default();
-    for result in formal_results {
+    for result in summary_results {
         match result {
             Ok((all, intra, cross, matrix)) => {
                 if let Some(analysis) = intra {
@@ -1401,14 +1371,17 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 analyses_map.insert(all.contract_id, all);
             }
             Err((chain, address, error)) => {
-                return Err(Analysis2Error::invalid(format!(
-                    "formal summary analysis failed for {chain}:{address}: {error}"
-                )));
+                failures.push(FailureRecord::candidate_stage(
+                    &chain,
+                    &address,
+                    "aggregate_candidate",
+                    error.to_string(),
+                ));
             }
         }
     }
-    // Registry and per-seed analyses are no longer needed after exact formal
-    // summaries have been materialized.
+    // Registry and per-seed analyses are no longer needed after summaries have
+    // been materialized from every available result.
     drop(registry);
     drop(per_seed_analyses);
 
@@ -1494,6 +1467,21 @@ mod tests {
     }
 
     #[test]
+    fn legacy_cache_refreshes_only_empty_sales_candidates() {
+        let mut empty_sales = EvidenceBundle::empty(1, "solana", "candidate-empty");
+        empty_sales.quality.sales = EvidenceStatus::Empty;
+        let mut complete_sales = EvidenceBundle::empty(2, "base", "0xcandidate-complete");
+        complete_sales.quality.sales = EvidenceStatus::Complete;
+        let evidence = AHashMap::from([(1, empty_sales), (2, complete_sales)]);
+
+        assert_eq!(
+            legacy_empty_sales_candidates(EVIDENCE_CACHE_VERSION - 1, &evidence),
+            AHashSet::from([1])
+        );
+        assert!(legacy_empty_sales_candidates(EVIDENCE_CACHE_VERSION, &evidence).is_empty());
+    }
+
+    #[test]
     fn explicit_rayon_threads_use_a_run_local_pool() {
         let _ = rayon::current_num_threads();
         let workers = with_rayon_pool(Some(3), || {
@@ -1571,30 +1559,6 @@ mod tests {
         assert_eq!(filtered.relation_legit.len(), 2);
         assert!(filtered.relation_legit[&legit_seed].is_legit_duplicate());
         assert!(!filtered.relation_legit[&suspicious_seed].is_legit_duplicate());
-    }
-
-    #[test]
-    fn formal_selector_filter_removes_incomplete_seed_tokens() {
-        let mut source = CandidateScopeSelectors::default();
-        source.all.token_ids_by_seed.insert(
-            "ethereum:0xformal".into(),
-            AHashSet::from(["formal-token".into()]),
-        );
-        source.all.token_ids_by_seed.insert(
-            "ethereum:0xincomplete".into(),
-            AHashSet::from(["incomplete-token".into()]),
-        );
-        source.all.token_ids = AHashSet::from(["formal-token".into(), "incomplete-token".into()]);
-        source.all.seed_keys =
-            AHashSet::from(["ethereum:0xformal".into(), "ethereum:0xincomplete".into()]);
-        let filtered = retain_formal_seed_selectors(
-            &AHashMap::from([(7, source)]),
-            &AHashSet::from(["ethereum:0xformal".into()]),
-        );
-        let all = &filtered[&7].all;
-        assert_eq!(all.token_ids, AHashSet::from(["formal-token".into()]));
-        assert_eq!(all.seed_keys, AHashSet::from(["ethereum:0xformal".into()]));
-        assert!(!all.token_ids_by_seed.contains_key("ethereum:0xincomplete"));
     }
 
     #[test]
@@ -1777,14 +1741,14 @@ mod tests {
                 bundle.controllers.push("0xop".into());
                 bundle.quality = analysis2_core::EvidenceQuality {
                     transfers: EvidenceStatus::Empty,
-                    sales: EvidenceStatus::Complete,
+                    sales: EvidenceStatus::Truncated,
                     holders: EvidenceStatus::Empty,
                     prices: EvidenceStatus::Complete,
                     assets: EvidenceStatus::Empty,
                     histories: EvidenceStatus::Empty,
                     gas: EvidenceStatus::Empty,
                     value_flows: EvidenceStatus::Empty,
-                    failures: Vec::new(),
+                    failures: vec!["opensea_sales: partial page failure".into()],
                 };
                 map.insert(cid, bundle);
                 progress.add_completed(1);
@@ -1838,10 +1802,6 @@ mod tests {
             "scope",
             "duplicate_scale",
             "selected_seed_count",
-            "analyzed_seed_count",
-            "incomplete_seed_count",
-            "failed_seed_count",
-            "seed_completion_ratio",
             "seed_with_duplicate_count",
             "seed_duplicate_ratio",
             "representative_candidate_count",
@@ -1857,6 +1817,14 @@ mod tests {
         ] {
             assert!(summary.get(key).is_some(), "missing summary key {key}");
         }
+        for removed in [
+            "analyzed_seed_count",
+            "incomplete_seed_count",
+            "failed_seed_count",
+            "seed_completion_ratio",
+        ] {
+            assert!(summary.get(removed).is_none(), "obsolete key {removed}");
+        }
         assert_eq!(summary["scope"], "all_chains");
         assert!(summary["economics"].get("operator_output_usd").is_some());
         assert!(
@@ -1866,6 +1834,12 @@ mod tests {
         );
         assert!(summary["economics"].get("operator_output_native").is_none());
         assert!(!serde_json::to_string(&summary).unwrap().contains("_native"));
+        assert_eq!(summary["economics"]["gross_sales_volume_usd"], 84.0);
+        assert_eq!(summary["economics"]["usd_valuation_complete"], false);
+        let errors = std::fs::read_to_string(out.join("intermediate/failures.jsonl")).unwrap();
+        assert!(errors.contains("\"stage\":\"api_request\""));
+        assert!(errors.contains("\"provider\":\"opensea\""));
+        assert!(errors.contains("opensea_sales: partial page failure"));
 
         let matrix: Value = serde_json::from_str(
             &std::fs::read_to_string(out.join("summary/chain_matrix.json")).unwrap(),

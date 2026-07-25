@@ -77,10 +77,10 @@ pub struct CandidateAnalysis {
 }
 
 impl CandidateAnalysis {
-    /// Whether this analysis is complete enough for formal USD/behavior
-    /// numerators. Partial provider data remains available in candidate detail
-    /// but must not silently contribute zeroes to formal summaries.
-    pub fn is_formal_complete(&self) -> bool {
+    /// Whether every required evidence family is complete enough to interpret
+    /// the observed USD/behavior values as complete. Partial analyses still
+    /// contribute their available results; this flag is quality metadata only.
+    pub fn has_complete_evidence(&self) -> bool {
         if !self.legit_by_seed.is_empty()
             && self
                 .legit_by_seed

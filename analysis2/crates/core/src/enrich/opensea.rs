@@ -296,7 +296,6 @@ pub async fn fetch_contract_sales_with_slug(
     known_slug: Option<&str>,
 ) -> crate::enrich::alchemy::FetchOutcome<Vec<crate::enrich::types::SaleEvent>> {
     use crate::enrich::alchemy::FetchOutcome;
-    use crate::enrich::types::{EvidenceObservation, EvidenceStatus, now_unix};
 
     let Some(api_key) = api_key else {
         return FetchOutcome::skipped("opensea_sales");
@@ -338,21 +337,6 @@ pub async fn fetch_contract_sales_with_slug(
         {
             Ok(v) => v,
             Err(e) => {
-                // Unknown / unlisted contracts return 404 — treat as Empty, not Failed.
-                if sales.is_empty() && crate::enrich::http::is_http_not_found(&e) {
-                    return FetchOutcome {
-                        value: Vec::new(),
-                        status: EvidenceStatus::Empty,
-                        observation: Some(EvidenceObservation {
-                            source: "opensea".into(),
-                            request_key: "opensea_sales".into(),
-                            observed_at: now_unix(),
-                            status: EvidenceStatus::Empty,
-                        }),
-                        failure: None,
-                        truncated: false,
-                    };
-                }
                 if sales.is_empty() {
                     return FetchOutcome::failed("opensea", "opensea_sales", e);
                 }
@@ -778,5 +762,44 @@ mod tests {
         assert_eq!(contract.hits(), 1);
         assert_eq!(first.hits(), 1);
         assert_eq!(second.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn opensea_sale_endpoint_not_found_is_failed_market_evidence() {
+        let server = MockServer::start_async().await;
+        let contract_address = "8PeqS3MJoVHy2bwMhYNLYeoZfT6rxKdhxNmnKRmVc9DB";
+        let contract = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path(format!("/api/v2/chain/solana/contract/{contract_address}"));
+                then.status(200).json_body(json!({
+                    "collection": "test-solana-collection"
+                }));
+            })
+            .await;
+        let sales = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/api/v2/events/collection/test-solana-collection");
+                then.status(404)
+                    .json_body(json!({"errors": ["collection events not found"]}));
+            })
+            .await;
+        let client = HttpClient::with_retries(1, 0).unwrap();
+
+        let outcome = fetch_contract_sales(
+            &client,
+            &server.base_url(),
+            Some("key"),
+            "solana",
+            contract_address,
+            5,
+        )
+        .await;
+        assert_eq!(outcome.status, EvidenceStatus::Failed);
+        assert!(outcome.value.is_empty());
+        assert!(outcome.failure.is_some());
+        assert_eq!(contract.hits(), 1);
+        assert_eq!(sales.hits(), 1);
     }
 }

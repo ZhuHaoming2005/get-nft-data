@@ -18,9 +18,6 @@ const MAX_RESPONSE_BYTES: u64 = 64 * 1024 * 1024;
 
 pub const OPENSEA_RATE_LIMIT_BURST: usize = 4;
 pub const OPENSEA_RATE_LIMIT_REFILL_MS: u64 = 300;
-/// Helius sustained cap: 5 req/s (one token every 200 ms, burst 5).
-pub const HELIUS_RATE_LIMIT_BURST: usize = 5;
-pub const HELIUS_RATE_LIMIT_REFILL_MS: u64 = 200;
 /// Shared cool-down applied to a provider bucket after HTTP 429 / rate-limit.
 pub const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(1);
 
@@ -70,14 +67,6 @@ impl TokenBucketRateLimiter {
         Self::new(
             OPENSEA_RATE_LIMIT_BURST,
             Duration::from_millis(OPENSEA_RATE_LIMIT_REFILL_MS),
-        )
-    }
-
-    /// Helius default: 5 req/s (burst 5, 200 ms per token).
-    pub fn helius_default() -> Self {
-        Self::new(
-            HELIUS_RATE_LIMIT_BURST,
-            Duration::from_millis(HELIUS_RATE_LIMIT_REFILL_MS),
         )
     }
 
@@ -194,7 +183,7 @@ impl HttpClient {
         // Each provider gets its own pool of size `n` (Alchemy uses the CLI
         // --http-concurrency value; others are independent and not shared).
         let opensea_n = n.max(OPENSEA_RATE_LIMIT_BURST);
-        let helius_n = n.max(HELIUS_RATE_LIMIT_BURST);
+        let helius_n = n;
         let etherscan_n = n;
         let other_n = n;
         let pool_idle = n
@@ -222,7 +211,11 @@ impl HttpClient {
                 opensea_n,
                 TokenBucketRateLimiter::opensea_default(),
             ),
-            helius: ProviderLane::new("helius", helius_n, TokenBucketRateLimiter::helius_default()),
+            helius: ProviderLane::new(
+                "helius",
+                helius_n,
+                TokenBucketRateLimiter::concurrency_only(),
+            ),
             etherscan: ProviderLane::new(
                 "etherscan",
                 etherscan_n,
@@ -288,7 +281,7 @@ impl HttpClient {
             .await
     }
 
-    /// POST on the Helius lane (5 req/s + provider-local 429 cool-down).
+    /// POST on the Helius lane (`--http-concurrency` + provider-local 429 cool-down).
     pub async fn post_json_helius(
         &self,
         url: &str,
@@ -890,21 +883,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn helius_and_opensea_buckets_are_independent() {
-        // Same knobs as production defaults, short refill for the test.
-        let opensea = TokenBucketRateLimiter::new(1, Duration::from_millis(200));
-        let helius = TokenBucketRateLimiter::new(1, Duration::from_millis(200));
-        opensea.acquire().await.unwrap();
-        // OpenSea is empty, but Helius still has its own starting token.
-        let start = std::time::Instant::now();
-        helius.acquire().await.unwrap();
-        assert!(
-            start.elapsed() < Duration::from_millis(50),
-            "helius must not wait on the opensea bucket"
-        );
-    }
-
-    #[tokio::test]
     async fn provider_lanes_have_independent_concurrency_and_cooldown() {
         let client = HttpClient::with_retries(1, 0).unwrap();
         // Saturate Alchemy concurrency (1 slot) by holding the permit without
@@ -945,12 +923,18 @@ mod tests {
     }
 
     #[test]
-    fn helius_defaults_target_five_rps() {
-        assert_eq!(HELIUS_RATE_LIMIT_BURST, 5);
-        assert_eq!(HELIUS_RATE_LIMIT_REFILL_MS, 200);
-        let rps = 1000.0 / HELIUS_RATE_LIMIT_REFILL_MS as f64;
-        assert!((rps - 5.0).abs() < 1e-9);
-        assert_eq!(RATE_LIMIT_COOLDOWN, Duration::from_secs(1));
+    fn helius_uses_the_same_configured_concurrency_as_alchemy() {
+        let client = HttpClient::with_retries(7, 0).unwrap();
+        assert_eq!(client.alchemy.in_flight.available_permits(), 7);
+        assert_eq!(client.helius.in_flight.available_permits(), 7);
+        assert_eq!(
+            client.helius.limiter.max_burst,
+            client.alchemy.limiter.max_burst
+        );
+        assert_eq!(
+            client.helius.limiter.refill_interval,
+            client.alchemy.limiter.refill_interval
+        );
     }
 
     #[test]
