@@ -13,7 +13,7 @@ use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 
 use super::alchemy::{self, FetchOutcome, NativeTransfer};
 use super::http::HttpClient;
-use super::roles::victim_addresses;
+use super::roles::{HolderSnapshot, victim_addresses};
 use super::types::{
     DeploymentEvent, EvidenceObservation, EvidenceStatus, ProviderEndpoints, SaleEvent,
     TransferEvent, ValueFlowEdge, ValueFlowKind, normalize_chain_address, now_unix,
@@ -105,21 +105,20 @@ pub fn collect_operator_seeds(addresses: &[String]) -> (Vec<String>, bool) {
     (set.into_iter().take(MAX_OPERATORS).collect(), truncated)
 }
 
-/// Derive the value-flow query set from the same binary role rule used by
-/// attribution: only a paid mint/secondary buyer with complete transfer
-/// history and no outbound NFT transfer is a victim; every other participant
-/// is an operator.
-pub fn derive_operator_seeds(
+/// Derive the value-flow query set from the same role rule used by attribution:
+/// paid buyers that still hold the purchased NFT are victims; every other
+/// participant remains eligible as an operator seed.
+pub(crate) fn derive_operator_seeds(
     chain: &str,
     candidate: &str,
     controllers: &[String],
     deployment: Option<&DeploymentEvent>,
     transfers: &[TransferEvent],
     sales: &[SaleEvent],
-    transfer_status: EvidenceStatus,
+    holders: HolderSnapshot<'_>,
 ) -> Vec<String> {
     let mut all = BTreeSet::new();
-    let victims = victim_addresses(chain, transfers, sales, transfer_status);
+    let victims = victim_addresses(chain, transfers, sales, holders);
     let mut insert = |raw: &str| {
         let address = normalize_chain_address(chain, raw);
         if !address.is_empty() && address != ZERO {
@@ -538,6 +537,8 @@ mod tests {
     use httpmock::{Method::POST, MockServer};
     use serde_json::json;
 
+    use crate::enrich::HolderRecord;
+
     #[tokio::test]
     async fn external_transfer_cache_singleflights_identical_requests() {
         let server = MockServer::start_async().await;
@@ -628,7 +629,14 @@ mod tests {
             None,
             &[paid],
             &[],
-            EvidenceStatus::Complete,
+            HolderSnapshot {
+                records: &[HolderRecord {
+                    token_id: "1".into(),
+                    owner: "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".into(),
+                    balance: Some(1),
+                }],
+                status: EvidenceStatus::Complete,
+            },
         );
         assert!(!seeds.contains(&"0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned()));
         assert!(seeds.contains(&"0xcccccccccccccccccccccccccccccccccccccccc".to_owned()));

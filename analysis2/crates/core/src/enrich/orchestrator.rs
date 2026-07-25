@@ -16,6 +16,7 @@ use super::http::HttpClient;
 use super::legit_detect;
 use super::mint_payment;
 use super::opensea;
+use super::roles::HolderSnapshot;
 use super::types::{
     ApiKeys, EvidenceBundle, EvidenceStatus, HttpLimits, SaleEvent, TransferEvent,
     finalize_legit_signals,
@@ -293,6 +294,65 @@ pub async fn refresh_cached_evm_holders(
     Ok(())
 }
 
+async fn fetch_evm_sales(
+    client: &HttpClient,
+    keys: &ApiKeys,
+    limits: &HttpLimits,
+    chain: &str,
+    address: &str,
+    prefetched_slug: Option<&str>,
+) -> FetchOutcome<Vec<SaleEvent>> {
+    if matches!(
+        chain.trim().to_ascii_lowercase().as_str(),
+        "ethereum" | "polygon" | "matic"
+    ) {
+        let mut alchemy = alchemy::fetch_sales(
+            client,
+            &limits.endpoints,
+            keys.alchemy(),
+            chain,
+            address,
+            limits.max_sale_pages,
+        )
+        .await;
+        if matches!(
+            alchemy.status,
+            EvidenceStatus::Complete | EvidenceStatus::Empty | EvidenceStatus::Truncated
+        ) {
+            return alchemy;
+        }
+        let alchemy_failure = alchemy.failure.take();
+        let mut fallback = opensea::fetch_contract_sales_with_slug(
+            client,
+            &limits.endpoints.opensea,
+            keys.opensea(),
+            chain,
+            address,
+            limits.max_sale_pages,
+            prefetched_slug,
+        )
+        .await;
+        if let Some(failure) = alchemy_failure {
+            fallback.failure = Some(match fallback.failure.take() {
+                Some(other) => format!("{failure}; {other}"),
+                None => failure,
+            });
+        }
+        return fallback;
+    }
+
+    opensea::fetch_contract_sales_with_slug(
+        client,
+        &limits.endpoints.opensea,
+        keys.opensea(),
+        chain,
+        address,
+        limits.max_sale_pages,
+        prefetched_slug,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn enrich_evm(
     contract_id: ContractId,
@@ -348,13 +408,12 @@ async fn enrich_evm(
             address,
             limits.max_holder_pages,
         ),
-        opensea::fetch_contract_sales_with_slug(
+        fetch_evm_sales(
             client,
-            &limits.endpoints.opensea,
-            keys.opensea(),
+            keys,
+            limits,
             chain,
             address,
-            limits.max_sale_pages,
             prefetched_slug.as_deref(),
         ),
         controllers,
@@ -554,7 +613,10 @@ async fn enrich_evm(
         bundle.deployment.as_ref(),
         &bundle.transfers,
         &bundle.sales,
-        bundle.quality.transfers,
+        HolderSnapshot {
+            records: &bundle.holders,
+            status: bundle.quality.holders,
+        },
     );
     let (initial_seeds, _) = value_flow::collect_operator_seeds(&preliminary_operator_seeds);
     let (final_seeds, _) = value_flow::collect_operator_seeds(&operator_seeds);
@@ -689,24 +751,15 @@ async fn enrich_solana(
         });
     }
 
-    let (history, mut market_sales) = tokio::join!(
-        helius::fetch_asset_histories(
-            client,
-            &limits.endpoints.helius,
-            keys.helius(),
-            &snapshot.value.assets,
-            limits.max_history_assets,
-            limits.max_signatures_per_asset,
-        ),
-        opensea::fetch_contract_sales(
-            client,
-            &limits.endpoints.opensea,
-            keys.opensea(),
-            chain,
-            address,
-            limits.max_sale_pages,
-        ),
-    );
+    let history = helius::fetch_asset_histories(
+        client,
+        &limits.endpoints.helius,
+        keys.helius(),
+        &snapshot.value.assets,
+        limits.max_history_assets,
+        limits.max_signatures_per_asset,
+    )
+    .await;
 
     let transfer_discovery_complete = matches!(
         history.status,
@@ -714,15 +767,11 @@ async fn enrich_solana(
     ) && !history.truncated
         && !snapshot.truncated
         && snapshot.value.assets.len() <= limits.max_history_assets;
-    // Helius histories remain chain evidence for transfers, gas, and value
-    // flows. Their marketplace labels are decoded only to discover related
-    // transactions and are never published as Sale evidence.
     let (mut transfers, mut helius_sales) = history.value;
 
-    let payment_symbols = price_symbols_for_sales(&market_sales.value);
-    let payment_addresses = price_addresses_for_sales(&market_sales.value, chain);
-    // Transaction decoding and currency lookup are independent once the
-    // OpenSea page has been parsed, so overlap both network paths.
+    // Helius is the authoritative Solana sale source. Its history stubs are
+    // decoded into buyer/seller/payment rows while the native SOL quote is
+    // fetched independently.
     let (decode_result, prices) = tokio::join!(
         helius::decode_and_attach_transactions_cached(
             client,
@@ -731,23 +780,20 @@ async fn enrich_solana(
             helius::DecodeContext {
                 candidate: address,
                 controllers: &bundle.controllers,
+                holders: HolderSnapshot {
+                    records: &bundle.holders,
+                    status: holder_status,
+                },
                 transfer_discovery_complete,
             },
             &mut transfers,
             &mut helius_sales,
             transaction_cache,
         ),
-        price_cache.fetch(
-            client,
-            &limits.endpoints,
-            keys.alchemy(),
-            chain,
-            &payment_symbols,
-            &payment_addresses,
-        ),
+        price_cache.fetch(client, &limits.endpoints, keys.alchemy(), chain, &[], &[],),
     );
     let (gas, value_flows, decode_stats) = decode_result;
-    apply_prices_to_sales(&mut market_sales.value, &prices.value, chain);
+    apply_prices_to_sales(&mut helius_sales, &prices.value, chain);
 
     apply_outcome(
         &mut bundle.quality.assets,
@@ -768,10 +814,12 @@ async fn enrich_solana(
         EvidenceStatus::NotRequested => {
             bundle.quality.histories = EvidenceStatus::NotRequested;
             bundle.quality.transfers = EvidenceStatus::NotRequested;
+            bundle.quality.sales = EvidenceStatus::NotRequested;
         }
         EvidenceStatus::Failed => {
             bundle.quality.histories = EvidenceStatus::Failed;
             bundle.quality.transfers = EvidenceStatus::Failed;
+            bundle.quality.sales = EvidenceStatus::Failed;
             if let Some(failure) = history.failure {
                 bundle.quality.failures.push(failure);
             }
@@ -795,6 +843,12 @@ async fn enrich_solana(
                 page_trunc,
                 &decode_stats,
             );
+            bundle.quality.sales = helius::field_status_after_decode(
+                helius_sales.is_empty(),
+                page_trunc,
+                decode_stats.sales_all_complete(),
+                &decode_stats,
+            );
         }
     }
     if let Some(mut obs) = history.observation {
@@ -808,13 +862,17 @@ async fn enrich_solana(
         bundle.provenance.push(obs);
     }
     bundle.transfers = std::mem::take(&mut transfers);
-    apply_outcome(
-        &mut bundle.quality.sales,
-        &mut bundle.provenance,
-        &mut bundle.quality.failures,
-        &market_sales,
-    );
-    bundle.sales = std::mem::take(&mut market_sales.value);
+    if let Some(mut observation) = bundle
+        .provenance
+        .iter()
+        .find(|observation| observation.request_key == "helius_histories")
+        .cloned()
+    {
+        observation.request_key = "helius_sales".into();
+        observation.status = bundle.quality.sales;
+        bundle.provenance.push(observation);
+    }
+    bundle.sales = std::mem::take(&mut helius_sales);
 
     apply_outcome(
         &mut bundle.quality.gas,
@@ -1510,6 +1568,75 @@ mod tests {
         assert_eq!(bundle.quality.gas, EvidenceStatus::NotRequested);
         assert_eq!(bundle.quality.value_flows, EvidenceStatus::NotRequested);
         assert!(bundle.quality.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn sale_provider_policy_uses_alchemy_for_ethereum_and_opensea_for_base() {
+        let server = MockServer::start_async().await;
+        let alchemy_sales = server
+            .mock_async(|when, then| {
+                when.method(GET).path("/nft/eth-mainnet/ak/getNFTSales");
+                then.status(200).json_body(json!({
+                    "nftSales": [{
+                        "transactionHash": "0xethsale",
+                        "tokenId": "1",
+                        "sellerAddress": "0x1111111111111111111111111111111111111111",
+                        "buyerAddress": "0x2222222222222222222222222222222222222222",
+                        "sellerFee": {
+                            "amount": "1000000000000000000",
+                            "decimals": 18,
+                            "symbol": "ETH"
+                        }
+                    }]
+                }));
+            })
+            .await;
+        let base_sales = server
+            .mock_async(|when, then| {
+                when.method(GET)
+                    .path("/opensea/api/v2/events/collection/base-slug");
+                then.status(200)
+                    .json_body(json!({ "asset_events": [], "next": null }));
+            })
+            .await;
+        let limits = HttpLimits {
+            retries: 0,
+            endpoints: mock_endpoints(&server),
+            ..HttpLimits::default()
+        };
+        let keys = ApiKeys {
+            alchemy: Some("ak".into()),
+            opensea: Some("ok".into()),
+            ..ApiKeys::default()
+        };
+        let client = HttpClient::with_retries(2, 0).unwrap();
+
+        let ethereum = fetch_evm_sales(
+            &client,
+            &keys,
+            &limits,
+            "ethereum",
+            "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            None,
+        )
+        .await;
+        assert_eq!(ethereum.status, EvidenceStatus::Complete);
+        assert_eq!(ethereum.value.len(), 1);
+        assert_eq!(alchemy_sales.hits(), 1);
+        assert_eq!(base_sales.hits(), 0);
+
+        let base = fetch_evm_sales(
+            &client,
+            &keys,
+            &limits,
+            "base",
+            "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            Some("base-slug"),
+        )
+        .await;
+        assert_eq!(base.status, EvidenceStatus::Empty);
+        assert_eq!(alchemy_sales.hits(), 1);
+        assert_eq!(base_sales.hits(), 1);
     }
 
     #[tokio::test]

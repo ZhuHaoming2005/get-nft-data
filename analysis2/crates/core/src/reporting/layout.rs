@@ -6,11 +6,14 @@
 //!   detail/                # per-seed + per-candidate full objects
 //!     seeds/<chain>__<addr>/
 //!     candidates/
-//!   summary/               # four-scope rollups
-//!     intra_chain.*
-//!     chain_matrix.*
-//!     cross_chain.*        # cross_chain_summary
-//!     all_chains.*         # batch-level fourth scope
+//!   summary/
+//!     intra_chain/<chain>.*
+//!     intra_chain.*                 # all same-chain relations
+//!     chain_pairs/<primary>_to_<secondary>.*
+//!     chain_matrix.*                # all directional pairs
+//!     cross_chain_by_source/<chain>.*
+//!     cross_chain.*                 # all cross-chain relations
+//!     all_chains.*                  # all relations
 //! ```
 
 use std::path::{Path, PathBuf};

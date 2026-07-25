@@ -1320,12 +1320,22 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                         .insert(analysis.contract_id, analysis);
                 }
                 if let Some(analysis) = batch.intra {
+                    scope_analyses
+                        .intra_chain_by_chain
+                        .entry(analysis.chain.to_ascii_lowercase())
+                        .or_default()
+                        .push(analysis.clone());
                     scope_analyses.intra_chain.push(analysis);
                 }
                 if let Some(analysis) = batch.cross {
                     scope_analyses.cross_chain.push(analysis);
                 }
                 for (direction, analysis) in batch.matrix {
+                    scope_analyses
+                        .cross_chain_by_primary
+                        .entry(direction.0.clone())
+                        .or_default()
+                        .push(analysis.clone());
                     scope_analyses
                         .chain_matrix
                         .entry(direction)
@@ -1805,6 +1815,46 @@ mod tests {
         assert!(out.join("summary/intra_chain.json").is_file());
         assert!(out.join("summary/chain_matrix.json").is_file());
         assert!(out.join("summary/cross_chain.json").is_file());
+        for chain in ["ethereum", "base", "solana"] {
+            assert!(
+                out.join(format!("summary/intra_chain/{chain}.json"))
+                    .is_file()
+            );
+            assert!(
+                out.join(format!("summary/cross_chain_by_source/{chain}.json"))
+                    .is_file()
+            );
+        }
+        for pair in [
+            "ethereum_to_base",
+            "ethereum_to_solana",
+            "base_to_ethereum",
+            "base_to_solana",
+            "solana_to_ethereum",
+            "solana_to_base",
+        ] {
+            assert!(
+                out.join(format!("summary/chain_pairs/{pair}.json"))
+                    .is_file()
+            );
+        }
+        for (path, expected_scope) in [
+            ("summary/intra_chain/ethereum.json", "intra_chain:ethereum"),
+            (
+                "summary/chain_pairs/ethereum_to_base.json",
+                "chain_pair:ethereum_to_base",
+            ),
+            (
+                "summary/cross_chain_by_source/ethereum.json",
+                "cross_chain_summary:ethereum",
+            ),
+            ("summary/cross_chain.json", "cross_chain_summary"),
+            ("summary/all_chains.json", "all_chains"),
+        ] {
+            let document: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(out.join(path)).unwrap()).unwrap();
+            assert_eq!(document["scope"], expected_scope);
+        }
         assert!(out.join("intermediate/failures.jsonl").is_file());
         assert!(
             out.join("detail/seeds/ethereum__0xseed/report.json")
@@ -1863,9 +1913,9 @@ mod tests {
         )
         .unwrap();
         let blocks = matrix["matrix_blocks"].as_array().unwrap();
-        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks.len(), 6);
         assert!(blocks.iter().all(|block| {
-            block["primary_chain"] == "ethereum"
+            block.get("primary_chain").is_some()
                 && block.get("secondary_chain").is_some()
                 && block["summary"].is_object()
         }));

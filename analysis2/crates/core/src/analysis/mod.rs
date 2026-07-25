@@ -658,7 +658,7 @@ mod tests {
     }
 
     #[test]
-    fn paid_buyer_without_outbound_transfer_is_a_victim_even_when_not_a_current_holder() {
+    fn paid_buyer_is_not_a_victim_when_only_a_different_token_is_still_held() {
         let (store, contract) = store_with_contract("ethereum", "0xattr_same");
         let mut evidence = EvidenceBundle::empty(contract, "ethereum", "0xattr_same");
         evidence.sales = vec![sale("tx", "9", "0xop", "0xv", 5, 3.0)];
@@ -685,8 +685,8 @@ mod tests {
             .iter()
             .find(|(addr, _)| addr == "0xv")
             .unwrap();
-        assert_eq!(buyer.1.role, AddressRole::LikelyVictim);
-        assert_eq!(analysis.economics.honest_loss_usd, 3.0);
+        assert_eq!(buyer.1.role, AddressRole::SuspectedOperator);
+        assert_eq!(analysis.economics.honest_loss_usd, 0.0);
     }
 
     #[test]
@@ -788,8 +788,14 @@ mod tests {
             transfer("buy", "1", "0xfirst_seller", "0xbuyer", 10, false),
             transfer("sell", "1", "0xbuyer", "0xnext_buyer", 20, false),
         ];
+        evidence.holders = vec![HolderRecord {
+            token_id: "1".into(),
+            owner: "0xnext_buyer".into(),
+            balance: Some(1),
+        }];
         evidence.quality.sales = EvidenceStatus::Complete;
         evidence.quality.transfers = EvidenceStatus::Complete;
+        evidence.quality.holders = EvidenceStatus::Complete;
 
         let analysis =
             analyze_candidate(&store, contract, &evidence, &PaperConfig::default()).unwrap();
@@ -799,6 +805,8 @@ mod tests {
             .find(|(address, _)| address == "0xbuyer")
             .unwrap();
         assert_eq!(buyer.1.role, AddressRole::SuspectedOperator);
+        // The reseller is excluded, while the next paid buyer is the current
+        // holder of token 1 and therefore contributes the 120 USD exposure.
         assert_eq!(analysis.economics.honest_loss_usd, 120.0);
         assert_eq!(analysis.economics.secondary_sale_loss_usd, 120.0);
     }

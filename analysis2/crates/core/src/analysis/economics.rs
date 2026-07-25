@@ -378,7 +378,10 @@ pub fn compute_economics(
                 facts.unknown_royalty_recipient_count += 1;
             }
         }
-        if honest_buyers.contains(&buyer) && (native > 0.0 || usd > 0.0) {
+        if honest_buyers.contains(&buyer)
+            && honest_holders.contains(&(sale.token_id.clone(), buyer.clone()))
+            && (native > 0.0 || usd > 0.0)
+        {
             facts.secondary_sale_loss_native += native;
             facts.secondary_sale_loss_usd += usd;
             facts.honest_loss_native += native;
@@ -393,9 +396,7 @@ pub fn compute_economics(
                     usd,
                 });
             }
-            if honest_holders.contains(&(sale.token_id.clone(), buyer.clone())) {
-                stuck_nfts.insert(sale.token_id.clone());
-            }
+            stuck_nfts.insert(sale.token_id.clone());
         }
         if gas_usable(evidence.quality.gas)
             && let (Some(gas), Some(payer)) = (
@@ -464,7 +465,9 @@ pub fn compute_economics(
                         facts.unpriced_operator_paid_mint_payment_count += 1;
                     }
                 }
-                if honest_buyers.contains(&recipient) {
+                if honest_buyers.contains(&recipient)
+                    && honest_holders.contains(&(transfer.token_id.clone(), recipient.clone()))
+                {
                     facts.honest_paid_mint_loss_count += 1;
                     if transfer.mint_payment_usd.is_some() {
                         facts.priced_honest_paid_mint_loss_count += 1;
@@ -489,9 +492,7 @@ pub fn compute_economics(
                             usd,
                         });
                     }
-                    if honest_holders.contains(&(transfer.token_id.clone(), recipient.clone())) {
-                        stuck_nfts.insert(transfer.token_id.clone());
-                    }
+                    stuck_nfts.insert(transfer.token_id.clone());
                 }
             }
         }

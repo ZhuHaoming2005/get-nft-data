@@ -1,6 +1,7 @@
 //! Alchemy NFT / transfers / prices / receipt-gas / native EXTERNAL clients.
 
 use ahash::{AHashMap, AHashSet};
+use num_bigint::BigUint;
 use serde_json::{Value, json};
 use std::sync::Arc;
 use tokio::sync::{Mutex as AsyncMutex, Notify, OnceCell};
@@ -529,6 +530,88 @@ async fn fetch_holders_pages(
     outcome
 }
 
+/// Fetch contract-scoped NFT sales through Alchemy `getNFTSales`.
+///
+/// The caller uses this only on networks where Alchemy exposes the endpoint.
+pub async fn fetch_sales(
+    client: &HttpClient,
+    endpoints: &ProviderEndpoints,
+    api_key: Option<&str>,
+    chain: &str,
+    contract: &str,
+    max_pages: usize,
+) -> FetchOutcome<Vec<SaleEvent>> {
+    let Some(api_key) = api_key else {
+        return FetchOutcome::skipped("alchemy_sales");
+    };
+    let Some(base) = endpoints.alchemy_nft(chain, api_key, "getNFTSales") else {
+        return FetchOutcome::failed(
+            "alchemy",
+            "alchemy_sales",
+            format!("unsupported alchemy network for {chain}"),
+        );
+    };
+
+    let mut sales = Vec::new();
+    let mut page_key = None;
+    let mut seen_page_keys = std::collections::BTreeSet::new();
+    let mut truncated = false;
+    let mut partial_failure = None;
+    let pages = max_pages.max(1);
+    for page in 0..pages {
+        let mut url = format!(
+            "{base}?fromBlock=0&toBlock=latest&order=asc&contractAddress={}",
+            urlencoding_minimal(contract)
+        );
+        if let Some(key) = page_key.as_deref() {
+            url.push_str("&pageKey=");
+            url.push_str(&urlencoding_minimal(key));
+        }
+        let payload = match client.get_json_alchemy(&url, &[]).await {
+            Ok(value) => value,
+            Err(error) => {
+                if sales.is_empty() {
+                    return FetchOutcome::failed("alchemy", "alchemy_sales", error);
+                }
+                truncated = true;
+                partial_failure = Some(format!("alchemy_sales: partial page failure: {error}"));
+                break;
+            }
+        };
+        if let Some(error) = payload.get("error") {
+            if sales.is_empty() {
+                return FetchOutcome::failed("alchemy", "alchemy_sales", error);
+            }
+            truncated = true;
+            partial_failure = Some(format!("alchemy_sales: partial JSON-RPC failure: {error}"));
+            break;
+        }
+        sales.extend(parse_nft_sales(&payload, chain));
+        let next = payload
+            .get("pageKey")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|key| !key.is_empty())
+            .map(str::to_owned);
+        let Some(next) = next else {
+            break;
+        };
+        if !seen_page_keys.insert(next.clone()) {
+            truncated = true;
+            partial_failure = Some("alchemy_sales: repeated pagination cursor".into());
+            break;
+        }
+        page_key = Some(next);
+        if page + 1 == pages {
+            truncated = true;
+        }
+    }
+    let count = sales.len();
+    let mut outcome = FetchOutcome::ok(sales, count, truncated, "alchemy", "alchemy_sales");
+    outcome.failure = partial_failure;
+    outcome
+}
+
 /// Fetch **current** (run-time) USD prices for the chain native token and
 /// requested common payment symbols.
 ///
@@ -836,6 +919,166 @@ pub fn parse_holders(payload: &Value) -> Vec<HolderRecord> {
         }
     }
     out
+}
+
+#[derive(Clone, Debug)]
+struct SaleFee {
+    raw: BigUint,
+    decimals: u32,
+    amount: f64,
+    symbol: Option<String>,
+    address: Option<String>,
+}
+
+fn parse_sale_fee(value: Option<&Value>, chain: &str) -> Option<SaleFee> {
+    let value = value?;
+    let raw_text = value
+        .get("amount")
+        .or_else(|| value.get("quantity"))
+        .and_then(|amount| {
+            amount
+                .as_str()
+                .map(str::to_owned)
+                .or_else(|| amount.as_u64().map(|number| number.to_string()))
+        })?;
+    let raw = raw_text.parse::<BigUint>().ok()?;
+    let decimals = value.get("decimals").and_then(Value::as_u64).unwrap_or(18) as u32;
+    let amount = raw_text.parse::<f64>().ok()? / 10f64.powi(decimals as i32);
+    let symbol = value
+        .get("symbol")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    let address = value
+        .get("contractAddress")
+        .or_else(|| value.get("contract_address"))
+        .or_else(|| value.get("tokenAddress"))
+        .and_then(Value::as_str)
+        .map(|address| super::types::normalize_chain_address(chain, address));
+    Some(SaleFee {
+        raw,
+        decimals,
+        amount,
+        symbol,
+        address,
+    })
+}
+
+fn same_sale_currency(left: &SaleFee, right: &SaleFee) -> bool {
+    left.decimals == right.decimals
+        && match (left.address.as_deref(), right.address.as_deref()) {
+            (Some(left), Some(right)) => left == right,
+            (None, None) => left
+                .symbol
+                .as_deref()
+                .zip(right.symbol.as_deref())
+                .is_none_or(|(left, right)| left.eq_ignore_ascii_case(right)),
+            _ => false,
+        }
+}
+
+/// Parse Alchemy `getNFTSales` rows into the common sale model.
+pub fn parse_nft_sales(payload: &Value, chain: &str) -> Vec<SaleEvent> {
+    payload
+        .get("nftSales")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|item| {
+            let seller_fee = parse_sale_fee(item.get("sellerFee"), chain);
+            let protocol_fee = parse_sale_fee(item.get("protocolFee"), chain);
+            let royalty_fee = parse_sale_fee(item.get("royaltyFee"), chain);
+            let components = [
+                seller_fee.as_ref(),
+                protocol_fee.as_ref(),
+                royalty_fee.as_ref(),
+            ]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>();
+            let currency = components.first().copied();
+            let comparable = currency.is_some_and(|first| {
+                components
+                    .iter()
+                    .all(|component| same_sale_currency(first, component))
+            });
+            let native_amount =
+                comparable.then(|| components.iter().map(|fee| fee.amount).sum::<f64>());
+            let sale_price_raw = comparable.then(|| {
+                components
+                    .iter()
+                    .fold(BigUint::default(), |sum, fee| sum + &fee.raw)
+                    .to_string()
+            });
+            let seller = item
+                .get("sellerAddress")
+                .and_then(Value::as_str)
+                .map(|address| super::types::normalize_chain_address(chain, address))
+                .unwrap_or_default();
+            let buyer = item
+                .get("buyerAddress")
+                .and_then(Value::as_str)
+                .map(|address| super::types::normalize_chain_address(chain, address))
+                .unwrap_or_default();
+            let token_id = normalize_token_id(item.get("tokenId"));
+            if seller.is_empty() || buyer.is_empty() || token_id.is_empty() {
+                return None;
+            }
+            Some(SaleEvent {
+                tx_hash: item
+                    .get("transactionHash")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_owned(),
+                token_id,
+                seller,
+                buyer,
+                timestamp: item
+                    .get("blockTimestamp")
+                    .or_else(|| item.get("timestamp"))
+                    .and_then(parse_timestamp),
+                block_number: item
+                    .get("blockNumber")
+                    .or_else(|| item.get("blockNum"))
+                    .and_then(parse_block_number),
+                marketplace: item
+                    .get("marketplace")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                native_amount,
+                usd_amount: None,
+                currency_symbol: currency
+                    .and_then(|fee| fee.symbol.clone())
+                    .or_else(|| Some(native_symbol(chain).to_owned())),
+                currency_address: currency.and_then(|fee| fee.address.clone()),
+                sale_price_raw,
+                seller_proceeds_native: seller_fee.as_ref().map(|fee| fee.amount),
+                seller_proceeds_usd: None,
+                marketplace_fee_native: protocol_fee.as_ref().map(|fee| fee.amount),
+                marketplace_fee_usd: None,
+                marketplace_fee_currency_symbol: protocol_fee
+                    .as_ref()
+                    .and_then(|fee| fee.symbol.clone()),
+                marketplace_fee_currency_address: protocol_fee
+                    .as_ref()
+                    .and_then(|fee| fee.address.clone()),
+                royalty_fee_native: royalty_fee.as_ref().map(|fee| fee.amount),
+                royalty_fee_usd: None,
+                royalty_fee_currency_symbol: royalty_fee
+                    .as_ref()
+                    .and_then(|fee| fee.symbol.clone()),
+                royalty_fee_currency_address: royalty_fee
+                    .as_ref()
+                    .and_then(|fee| fee.address.clone()),
+                royalty_recipient: item
+                    .get("royaltyFee")
+                    .and_then(|fee| fee.get("recipient").or_else(|| fee.get("recipientAddress")))
+                    .and_then(Value::as_str)
+                    .map(|address| super::types::normalize_chain_address(chain, address)),
+                gas_native: None,
+                fee_payer: None,
+            })
+        })
+        .collect()
 }
 
 fn transfer_token_ids(item: &Value) -> Vec<String> {
@@ -2078,6 +2321,55 @@ mod receipt_gas_tests {
             "42"
         );
         assert_eq!(normalize_token_id(Some(&Value::String("0x0".into()))), "0");
+    }
+
+    #[test]
+    fn nft_sales_parser_sums_fee_components_and_preserves_breakdown() {
+        let payload = json!({
+            "nftSales": [{
+                "transactionHash": "0xsale",
+                "tokenId": "0x2a",
+                "sellerAddress": "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "buyerAddress": "0xBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                "blockTimestamp": "1700000000",
+                "blockNumber": "0x64",
+                "marketplace": "seaport",
+                "sellerFee": {
+                    "amount": "1250000000000000000",
+                    "decimals": 18,
+                    "symbol": "ETH"
+                },
+                "protocolFee": {
+                    "amount": "50000000000000000",
+                    "decimals": 18,
+                    "symbol": "ETH"
+                },
+                "royaltyFee": {
+                    "amount": "50000000000000000",
+                    "decimals": 18,
+                    "symbol": "ETH",
+                    "recipientAddress": "0xCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC"
+                }
+            }]
+        });
+
+        let sales = parse_nft_sales(&payload, "ethereum");
+        assert_eq!(sales.len(), 1);
+        let sale = &sales[0];
+        assert_eq!(sale.token_id, "42");
+        assert_eq!(sale.seller, "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+        assert_eq!(sale.buyer, "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+        assert_eq!(sale.block_number, Some(100));
+        assert_eq!(sale.timestamp, Some(1_700_000_000));
+        assert_eq!(sale.sale_price_raw.as_deref(), Some("1350000000000000000"));
+        assert!((sale.native_amount.unwrap() - 1.35).abs() < 1e-12);
+        assert!((sale.seller_proceeds_native.unwrap() - 1.25).abs() < 1e-12);
+        assert!((sale.marketplace_fee_native.unwrap() - 0.05).abs() < 1e-12);
+        assert!((sale.royalty_fee_native.unwrap() - 0.05).abs() < 1e-12);
+        assert_eq!(
+            sale.royalty_recipient.as_deref(),
+            Some("0xcccccccccccccccccccccccccccccccccccccccc")
+        );
     }
 
     #[tokio::test]

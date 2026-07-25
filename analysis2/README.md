@@ -80,10 +80,13 @@ Writes under `--output-dir` in three roots:
 intermediate/          # run_manifest.json, failures.jsonl, caches
 detail/seeds/…         # per-seed report.json|.md
 summary/
-  intra_chain.*        # 单链
-  chain_matrix.*       # 跨链矩阵
-  cross_chain.*        # 跨链总结 (scope: cross_chain_summary)
-  all_chains.*         # 全链汇总 (scope: all_chains) + batch metrics
+  intra_chain/<chain>.*                 # 各单链结果
+  intra_chain.*                         # 单链汇总
+  chain_pairs/<primary>_to_<secondary>.* # 各有向链对结果
+  chain_matrix.*                        # 全部有向链对矩阵
+  cross_chain_by_source/<primary>.*     # 各来源链跨链汇总
+  cross_chain.*                         # 全链跨链汇总
+  all_chains.*                          # 全部汇总 + batch metrics
 ```
 
 ## Phase C — full `run`
@@ -115,8 +118,9 @@ cargo run --manifest-path analysis2/Cargo.toml --release -- run `
 ```
 
 API keys are optional per provider: missing keys mark dependent evidence `not_requested`
-and the run continues. OpenSea is the canonical Sale provider on every chain; Alchemy
-and Helius remain chain-evidence providers. Cancel / OOM paths do **not** write
+and the run continues. Ethereum/Polygon sales use Alchemy `getNFTSales` with OpenSea
+fallback, Base sales use OpenSea, and Solana sales are decoded from Helius histories.
+Cancel / OOM paths do **not** write
 `status: complete` into
 `intermediate/run_manifest.json`. Incomplete four-scope seeds are excluded from formal
 summary denominators. Cross-chain economics in `summary/all_chains.json` sum **USD only**.
@@ -173,11 +177,12 @@ dedup stages run normally.
 
 ### Evidence depth (enrich → economics)
 
-- **Sales:** OpenSea is the only Sale provider for EVM and Solana. The pipeline
-  resolves `contract → collection slug`, reads paginated collection Sale events,
-  and filters multi-contract collections back to the candidate contract.
-  Evidence caches older than v9 are invalidated so Alchemy/Helius Sale rows
-  cannot be reused.
+- **Sales:** Ethereum/Polygon use paginated Alchemy `getNFTSales` as the primary
+  source and fall back to OpenSea only when Alchemy is unavailable or fails.
+  Base uses OpenSea collection Sale events filtered back to the candidate
+  contract. Solana uses Helius asset histories plus decoded `getTransaction`
+  buyer/seller/payment evidence. Evidence caches older than v11 are invalidated
+  so rows produced under the previous provider contract cannot be reused.
 - **EVM gas:** Alchemy/ETH `eth_getTransactionReceipt` → `TransferEvent.gas_native` /
   `fee_payer`; `quality.gas` Complete/Truncated/Empty/Failed/NotRequested.
 - **EVM value flows:** full-history native EXTERNAL transfers around addresses
@@ -188,8 +193,9 @@ dedup stages run normally.
   token addresses are preferred over symbols; unpriced or peg-assumed amounts
   remain in detail quality metadata but do not enter formal summaries.
 - **Exposure semantics:** buyer payments are reported as `paid_exposure`, not
-  realized loss. A paid mint/secondary buyer is a victim only when that address
-  has never appeared as a seller; every other observed participant is an operator.
+  realized loss. A paid mint/secondary buyer is a victim only when the current,
+  complete holder snapshot proves that the same address still holds the same
+  purchased NFT; incomplete holder evidence never establishes victim status.
 - **Shared candidates:** candidate-wide funding/withdrawal amounts appear in
   every related per-seed report; all run summaries re-union formal relations and
   count each candidate once.

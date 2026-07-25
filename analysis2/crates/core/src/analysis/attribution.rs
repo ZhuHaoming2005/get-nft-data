@@ -6,7 +6,7 @@ use ahash::{AHashMap, AHashSet};
 use serde::{Deserialize, Serialize};
 
 use super::graph::AddressGraph;
-use crate::enrich::roles::victim_addresses;
+use crate::enrich::roles::{HolderSnapshot, victim_addresses};
 use crate::enrich::{EvidenceBundle, ValueFlowKind, normalize_chain_address};
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
@@ -169,7 +169,10 @@ pub fn attribute_addresses(
         &evidence.chain,
         &evidence.transfers,
         &evidence.sales,
-        evidence.quality.transfers,
+        HolderSnapshot {
+            records: &evidence.holders,
+            status: evidence.quality.holders,
+        },
     );
 
     let mut all = BTreeSet::new();

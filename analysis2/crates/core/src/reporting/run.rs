@@ -30,7 +30,9 @@ use super::markdown;
 #[derive(Clone, Debug, Default)]
 pub struct ScopeAnalysisSets {
     pub intra_chain: Vec<CandidateAnalysis>,
+    pub intra_chain_by_chain: BTreeMap<String, Vec<CandidateAnalysis>>,
     pub cross_chain: Vec<CandidateAnalysis>,
+    pub cross_chain_by_primary: BTreeMap<String, Vec<CandidateAnalysis>>,
     pub chain_matrix: BTreeMap<(String, String), Vec<CandidateAnalysis>>,
 }
 
@@ -38,7 +40,13 @@ pub struct ScopeAnalysisSets {
 pub enum RunSummaryScope<'a> {
     All,
     Intra,
+    IntraChain {
+        chain: &'a str,
+    },
     Cross,
+    CrossPrimary {
+        primary_chain: &'a str,
+    },
     Matrix {
         primary_chain: &'a str,
         secondary_chain: &'a str,
@@ -48,7 +56,10 @@ pub enum RunSummaryScope<'a> {
 impl RunSummaryScope<'_> {
     fn seed_matches(self, seed_chain: &str) -> bool {
         match self {
-            Self::Matrix { primary_chain, .. } => seed_chain.eq_ignore_ascii_case(primary_chain),
+            Self::IntraChain { chain } => seed_chain.eq_ignore_ascii_case(chain),
+            Self::CrossPrimary { primary_chain } | Self::Matrix { primary_chain, .. } => {
+                seed_chain.eq_ignore_ascii_case(primary_chain)
+            }
             _ => true,
         }
     }
@@ -58,7 +69,14 @@ impl RunSummaryScope<'_> {
         match self {
             Self::All => true,
             Self::Intra => same,
+            Self::IntraChain { chain } => {
+                same && seed_chain.eq_ignore_ascii_case(chain)
+                    && candidate_chain.eq_ignore_ascii_case(chain)
+            }
             Self::Cross => !same,
+            Self::CrossPrimary { primary_chain } => {
+                !same && seed_chain.eq_ignore_ascii_case(primary_chain)
+            }
             Self::Matrix {
                 primary_chain,
                 secondary_chain,
@@ -1345,12 +1363,52 @@ pub fn write_run_outputs(
         &cross_refs,
         RunSummaryScope::Cross,
     );
+    let mut intra_chain_summaries = BTreeMap::new();
+    let mut cross_primary_summaries = BTreeMap::new();
+    for chain in &store.chains {
+        let chain_key = chain.to_ascii_lowercase();
+        let intra_refs: Vec<&CandidateAnalysis> = scope_analyses
+            .intra_chain_by_chain
+            .get(&chain_key)
+            .into_iter()
+            .flatten()
+            .collect();
+        intra_chain_summaries.insert(
+            chain_key.clone(),
+            build_run_summary_for_scope(
+                selected_seeds,
+                &ok_reports,
+                &[],
+                &failures,
+                &intra_refs,
+                RunSummaryScope::IntraChain { chain },
+            ),
+        );
+        let cross_refs: Vec<&CandidateAnalysis> = scope_analyses
+            .cross_chain_by_primary
+            .get(&chain_key)
+            .into_iter()
+            .flatten()
+            .collect();
+        cross_primary_summaries.insert(
+            chain_key,
+            build_run_summary_for_scope(
+                selected_seeds,
+                &ok_reports,
+                &[],
+                &failures,
+                &cross_refs,
+                RunSummaryScope::CrossPrimary {
+                    primary_chain: chain,
+                },
+            ),
+        );
+    }
     let mut matrix_summaries = BTreeMap::new();
-    let mut matrix_primaries: Vec<String> = ok_reports
+    let mut matrix_primaries: Vec<String> = store
+        .chains
         .iter()
-        .map(|report| report.dedup.seed.chain.to_ascii_lowercase())
-        .collect::<AHashSet<_>>()
-        .into_iter()
+        .map(|chain| chain.to_ascii_lowercase())
         .collect();
     matrix_primaries.sort();
     for primary in matrix_primaries {
@@ -1404,14 +1462,29 @@ pub fn write_run_outputs(
             quality.insert("dedup_dimensions".into(), dimensions.clone());
         }
     }
+    for summary in intra_chain_summaries
+        .values_mut()
+        .chain(cross_primary_summaries.values_mut())
+    {
+        if let Some(quality) = summary
+            .get_mut("data_quality")
+            .and_then(Value::as_object_mut)
+        {
+            quality.insert("dedup_dimensions".into(), dimensions.clone());
+        }
+    }
     super::json::write_four_scope_paper_summaries_public(
         output_dir,
         store,
         &dedup_refs,
-        &all_summary,
-        &intra_summary,
-        &cross_summary,
-        &matrix_summaries,
+        super::json::ScopePaperSummaries {
+            all: &all_summary,
+            intra: &intra_summary,
+            cross: &cross_summary,
+            intra_by_chain: &intra_chain_summaries,
+            cross_by_primary: &cross_primary_summaries,
+            matrix: &matrix_summaries,
+        },
     )?;
 
     let manifest = RunManifest {
@@ -1449,8 +1522,11 @@ pub fn write_run_outputs(
             "detail": super::layout::DETAIL_DIR,
             "summary": super::layout::SUMMARY_DIR,
             "scopes": [
+                "intra_chain/<chain>",
                 SCOPE_INTRA_CHAIN,
+                "chain_pairs/<primary>_to_<secondary>",
                 SCOPE_CHAIN_MATRIX,
+                "cross_chain_by_source/<primary>",
                 SCOPE_LABEL_CROSS_CHAIN,
                 SCOPE_LABEL_ALL_CHAINS,
             ],

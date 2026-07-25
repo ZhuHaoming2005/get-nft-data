@@ -248,24 +248,22 @@ pub fn write_dedup_outputs(
     Ok(())
 }
 
+pub(crate) struct ScopePaperSummaries<'a> {
+    pub all: &'a Value,
+    pub intra: &'a Value,
+    pub cross: &'a Value,
+    pub intra_by_chain: &'a BTreeMap<String, Value>,
+    pub cross_by_primary: &'a BTreeMap<String, Value>,
+    pub matrix: &'a BTreeMap<(String, String), Value>,
+}
+
 pub(crate) fn write_four_scope_paper_summaries_public(
     output_dir: &Path,
     store: &ResidentStore,
     reports: &[&SeedDedupReport],
-    all_summary: &serde_json::Value,
-    intra_summary: &serde_json::Value,
-    cross_summary: &serde_json::Value,
-    matrix_summaries: &BTreeMap<(String, String), serde_json::Value>,
+    summaries: ScopePaperSummaries<'_>,
 ) -> Result<(), Analysis2Error> {
-    write_four_scope_paper_summaries(
-        output_dir,
-        store,
-        reports,
-        all_summary,
-        intra_summary,
-        cross_summary,
-        matrix_summaries,
-    )
+    write_four_scope_paper_summaries(output_dir, store, reports, summaries)
 }
 
 fn output_layout_manifest() -> serde_json::Value {
@@ -274,8 +272,11 @@ fn output_layout_manifest() -> serde_json::Value {
         "detail": super::layout::DETAIL_DIR,
         "summary": super::layout::SUMMARY_DIR,
         "scopes": [
+            "intra_chain/<chain>",
             SCOPE_INTRA_CHAIN,
+            "chain_pairs/<primary>_to_<secondary>",
             SCOPE_CHAIN_MATRIX,
+            "cross_chain_by_source/<primary>",
             SCOPE_LABEL_CROSS_CHAIN,
             SCOPE_LABEL_ALL_CHAINS,
         ],
@@ -344,14 +345,11 @@ fn per_seed_scale_detail(reports: &[&SeedDedupReport]) -> (Vec<Value>, Vec<Value
 ///
 /// `paper_summary` is the batch analysis rollup (may be a thin dedup-only body).
 /// Each scope gets its own aggregated `duplicate_scale` plus optional per-seed detail.
-pub fn write_four_scope_paper_summaries(
+pub(crate) fn write_four_scope_paper_summaries(
     output_dir: &Path,
     store: &ResidentStore,
     reports: &[&SeedDedupReport],
-    all_summary: &Value,
-    intra_summary: &Value,
-    cross_summary: &Value,
-    matrix_summaries: &BTreeMap<(String, String), Value>,
+    summaries: ScopePaperSummaries<'_>,
 ) -> Result<(), Analysis2Error> {
     let rels = scope_relations(reports);
     let (intra_detail, matrix_detail, cross_detail) = per_seed_scale_detail(reports);
@@ -380,7 +378,11 @@ pub fn write_four_scope_paper_summaries(
     );
 
     let mut matrix_blocks = Vec::new();
-    let mut primaries: Vec<_> = primary_chains.iter().cloned().collect();
+    let mut primaries: Vec<_> = store
+        .chains
+        .iter()
+        .map(|chain| chain.to_ascii_lowercase())
+        .collect();
     primaries.sort();
     for primary in &primaries {
         for secondary in &store.chains {
@@ -396,12 +398,109 @@ pub fn write_four_scope_paper_summaries(
                 },
                 &primary_chains,
             );
+            let direction_key = (primary.clone(), secondary.to_ascii_lowercase());
+            if let Some(summary) = summaries.matrix.get(&direction_key) {
+                let detail = matrix_detail
+                    .iter()
+                    .filter(|row| {
+                        row["seed_chain"]
+                            .as_str()
+                            .is_some_and(|chain| chain.eq_ignore_ascii_case(primary))
+                            && row["secondary_chain"]
+                                .as_str()
+                                .is_some_and(|chain| chain.eq_ignore_ascii_case(secondary))
+                    })
+                    .cloned()
+                    .collect::<Vec<_>>();
+                write_nested_scope_paper(
+                    output_dir,
+                    "chain_pairs",
+                    &format!("{primary}_to_{}", secondary.to_ascii_lowercase()),
+                    &format!("chain_pair:{primary}_to_{}", secondary.to_ascii_lowercase()),
+                    summary,
+                    &rows,
+                    json!({ "seed_scale_detail": detail }),
+                )?;
+            }
             matrix_blocks.push(json!({
                 "primary_chain": primary,
                 "secondary_chain": secondary,
                 "rows": rows,
-                "summary": matrix_summaries.get(&(primary.clone(), secondary.to_ascii_lowercase())),
+                "summary": summaries.matrix.get(&direction_key),
             }));
+        }
+    }
+    for chain in &store.chains {
+        let chain_key = chain.to_ascii_lowercase();
+        let chain_relations = rels
+            .iter()
+            .copied()
+            .filter(|relation| {
+                relation.seed_chain.eq_ignore_ascii_case(chain)
+                    && relation.candidate_chain.eq_ignore_ascii_case(chain)
+            })
+            .collect::<Vec<_>>();
+        let chain_universe = ahash::AHashSet::from_iter([chain_key.clone()]);
+        let rows = build_scope_duplicate_scale_for_chains(
+            store,
+            chain_relations,
+            ScopeScaleFilter::Intra,
+            &chain_universe,
+        );
+        if let Some(summary) = summaries.intra_by_chain.get(&chain_key) {
+            let detail = intra_detail
+                .iter()
+                .filter(|row| {
+                    row["seed_chain"]
+                        .as_str()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(chain))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            write_nested_scope_paper(
+                output_dir,
+                "intra_chain",
+                &chain_key,
+                &format!("intra_chain:{chain_key}"),
+                summary,
+                &rows,
+                json!({ "seed_scale_detail": detail }),
+            )?;
+        }
+
+        let cross_relations = rels
+            .iter()
+            .copied()
+            .filter(|relation| {
+                relation.seed_chain.eq_ignore_ascii_case(chain)
+                    && !relation.candidate_chain.eq_ignore_ascii_case(chain)
+            })
+            .collect::<Vec<_>>();
+        let rows = build_scope_duplicate_scale_for_chains(
+            store,
+            cross_relations,
+            ScopeScaleFilter::Cross,
+            &chain_universe,
+        );
+        if let Some(summary) = summaries.cross_by_primary.get(&chain_key) {
+            let detail = cross_detail
+                .iter()
+                .filter(|row| {
+                    row["seed_chain"]
+                        .as_str()
+                        .is_some_and(|value| value.eq_ignore_ascii_case(chain))
+                })
+                .cloned()
+                .collect::<Vec<_>>();
+            write_nested_scope_paper(
+                output_dir,
+                "cross_chain_by_source",
+                &chain_key,
+                &format!("cross_chain_summary:{chain_key}"),
+                summary,
+                &rows,
+                json!({ "seed_scale_detail": detail }),
+            )?;
         }
     }
     // Overall matrix scale = all cross-chain relations (same numerators as cross).
@@ -411,7 +510,7 @@ pub fn write_four_scope_paper_summaries(
         output_dir,
         SCOPE_INTRA_CHAIN,
         SCOPE_INTRA_CHAIN,
-        intra_summary,
+        summaries.intra,
         &intra_scale,
         json!({ "seed_scale_detail": intra_detail }),
     )?;
@@ -419,7 +518,7 @@ pub fn write_four_scope_paper_summaries(
         output_dir,
         SCOPE_CHAIN_MATRIX,
         SCOPE_CHAIN_MATRIX,
-        cross_summary,
+        summaries.cross,
         &matrix_scale,
         json!({
             "matrix_blocks": matrix_blocks,
@@ -430,7 +529,7 @@ pub fn write_four_scope_paper_summaries(
         output_dir,
         SCOPE_CROSS_CHAIN,
         SCOPE_LABEL_CROSS_CHAIN,
-        cross_summary,
+        summaries.cross,
         &cross_scale,
         json!({ "seed_scale_detail": cross_detail }),
     )?;
@@ -438,7 +537,7 @@ pub fn write_four_scope_paper_summaries(
         output_dir,
         SCOPE_ALL_CHAINS,
         SCOPE_LABEL_ALL_CHAINS,
-        all_summary,
+        summaries.all,
         &all_scale,
         json!({ "seed_index": seed_index_json(reports) }),
     )?;
@@ -472,6 +571,31 @@ fn write_one_scope_paper(
     Ok(())
 }
 
+fn write_nested_scope_paper(
+    output_dir: &Path,
+    directory: &str,
+    file_stem: &str,
+    scope_label: &str,
+    paper_summary: &Value,
+    scale: &[DuplicateScaleRow],
+    extra: Value,
+) -> Result<(), Analysis2Error> {
+    let directory = super::layout::summary_dir(output_dir).join(directory);
+    fs::create_dir_all(&directory)?;
+    let mut body = paper_summary.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.insert("scope".into(), json!(scope_label));
+        object.insert("duplicate_scale".into(), json!(scale));
+        if let Some(extra) = extra.as_object() {
+            for (key, value) in extra {
+                object.insert(key.clone(), value.clone());
+            }
+        }
+    }
+    write_json(&directory.join(format!("{file_stem}.json")), &body)?;
+    super::markdown::write_all_chains_md(&directory.join(format!("{file_stem}.md")), &body, scale)
+}
+
 fn write_scope_rollups(
     output_dir: &Path,
     store: &ResidentStore,
@@ -479,13 +603,16 @@ fn write_scope_rollups(
     reports: &[&SeedDedupReport],
     _failures: &[FailureRecord],
 ) -> Result<(), Analysis2Error> {
-    let paper_for = |filter: ScopeScaleFilter<'_>| {
+    let paper_for = |filter: ScopeScaleFilter<'_>, primary_filter: Option<&str>| {
         let mut candidates = ahash::AHashSet::new();
         let mut candidates_with_ids = ahash::AHashSet::new();
         let mut nft_ids = ahash::AHashSet::new();
         let mut fallback_by_candidate = ahash::AHashMap::<String, u64>::new();
         let mut with_dup = 0u64;
         for report in reports {
+            if primary_filter.is_some_and(|chain| !report.seed.chain.eq_ignore_ascii_case(chain)) {
+                continue;
+            }
             let mut seed_has_duplicate = false;
             for relation in &report.relations {
                 let same = report
@@ -496,7 +623,16 @@ fn write_scope_rollups(
                     ScopeScaleFilter::All => true,
                     ScopeScaleFilter::Intra => same,
                     ScopeScaleFilter::Cross => !same,
-                    ScopeScaleFilter::Matrix { .. } => false,
+                    ScopeScaleFilter::Matrix {
+                        primary_chain,
+                        secondary_chain,
+                    } => {
+                        !same
+                            && report.seed.chain.eq_ignore_ascii_case(primary_chain)
+                            && relation
+                                .candidate_chain
+                                .eq_ignore_ascii_case(secondary_chain)
+                    }
                 };
                 if !matches {
                     continue;
@@ -523,8 +659,18 @@ fn write_scope_rollups(
             .filter(|(candidate, _)| !candidates_with_ids.contains(*candidate))
             .map(|(_, count)| *count)
             .sum();
-        let analyzed = reports.len() as u64;
-        let selected_n = selected.len() as u64;
+        let analyzed = reports
+            .iter()
+            .filter(|report| {
+                primary_filter.is_none_or(|chain| report.seed.chain.eq_ignore_ascii_case(chain))
+            })
+            .count() as u64;
+        let selected_n = selected
+            .iter()
+            .filter(|seed| {
+                primary_filter.is_none_or(|chain| seed.chain.eq_ignore_ascii_case(chain))
+            })
+            .count() as u64;
         let representative_nfts = nft_ids.len() as u64 + missing_id_nfts;
         json!({
             "analysis_available": false,
@@ -542,16 +688,49 @@ fn write_scope_rollups(
             },
         })
     };
-    let all_paper = paper_for(ScopeScaleFilter::All);
-    let intra_paper = paper_for(ScopeScaleFilter::Intra);
-    let cross_paper = paper_for(ScopeScaleFilter::Cross);
+    let all_paper = paper_for(ScopeScaleFilter::All, None);
+    let intra_paper = paper_for(ScopeScaleFilter::Intra, None);
+    let cross_paper = paper_for(ScopeScaleFilter::Cross, None);
+    let mut intra_chain_summaries = BTreeMap::new();
+    let mut cross_primary_summaries = BTreeMap::new();
+    let mut matrix_summaries = BTreeMap::new();
+    for primary in &store.chains {
+        let primary_key = primary.to_ascii_lowercase();
+        intra_chain_summaries.insert(
+            primary_key.clone(),
+            paper_for(ScopeScaleFilter::Intra, Some(primary)),
+        );
+        cross_primary_summaries.insert(
+            primary_key.clone(),
+            paper_for(ScopeScaleFilter::Cross, Some(primary)),
+        );
+        for secondary in &store.chains {
+            if primary.eq_ignore_ascii_case(secondary) {
+                continue;
+            }
+            matrix_summaries.insert(
+                (primary_key.clone(), secondary.to_ascii_lowercase()),
+                paper_for(
+                    ScopeScaleFilter::Matrix {
+                        primary_chain: primary,
+                        secondary_chain: secondary,
+                    },
+                    Some(primary),
+                ),
+            );
+        }
+    }
     write_four_scope_paper_summaries(
         output_dir,
         store,
         reports,
-        &all_paper,
-        &intra_paper,
-        &cross_paper,
-        &BTreeMap::new(),
+        ScopePaperSummaries {
+            all: &all_paper,
+            intra: &intra_paper,
+            cross: &cross_paper,
+            intra_by_chain: &intra_chain_summaries,
+            cross_by_primary: &cross_primary_summaries,
+            matrix: &matrix_summaries,
+        },
     )
 }

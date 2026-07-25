@@ -16,6 +16,7 @@ use crate::error::Analysis2Error;
 use super::alchemy::{FetchOutcome, is_open_license_payload};
 use super::controllers::solana_authorities_from_asset;
 use super::http::HttpClient;
+use super::roles::HolderSnapshot;
 use super::types::{
     EvidenceStatus, HolderRecord, SaleEvent, TransferEvent, ValueFlowEdge, ValueFlowKind,
 };
@@ -746,6 +747,7 @@ impl DecodeStats {
 pub struct DecodeContext<'a> {
     pub candidate: &'a str,
     pub controllers: &'a [String],
+    pub holders: HolderSnapshot<'a>,
     pub transfer_discovery_complete: bool,
 }
 
@@ -928,23 +930,12 @@ async fn decode_and_attach_transactions_impl(
         })
         .count();
     stats.sales_complete = sales.iter().filter(|s| sale_fields_complete(s)).count();
-    let transfer_status = if context.transfer_discovery_complete
-        && (transfers.is_empty() || stats.transfers_all_complete())
-    {
-        if transfers.is_empty() {
-            EvidenceStatus::Empty
-        } else {
-            EvidenceStatus::Complete
-        }
-    } else {
-        EvidenceStatus::Truncated
-    };
-
     // A decoded Solana mint transaction with one buyer-funded SOL receiver is
     // direct payment evidence even when the receiver is a Candy Machine or
     // treasury account that differs from the collection/update authority.
-    // Then derive the same binary operator set used by attribution and rebuild
-    // the value-flow edges against that final set.
+    // Current-holder evidence is attached by the outer bundle after decode, so
+    // this preliminary value-flow query conservatively treats no address as a
+    // confirmed still-holding buyer.
     let preliminary_flows = sol_value_flows(&decoded, &preliminary_operators);
     super::mint_payment::attach_mint_payments(
         transfers,
@@ -960,7 +951,7 @@ async fn decode_and_attach_transactions_impl(
         None,
         transfers,
         sales,
-        transfer_status,
+        context.holders,
     );
     let mut operators = BTreeSet::new();
     for operator in operator_seeds {
@@ -1872,6 +1863,46 @@ mod tests {
 
         assert_eq!(transfer.mint_payment_native, Some(1.25));
         assert_eq!(transfer.mint_payment_receiver.as_deref(), Some(treasury));
+    }
+
+    #[test]
+    fn solana_sale_decode_uses_owner_change_and_buyer_to_seller_payment() {
+        let mint = "MintSale111111111111111111111111111111111";
+        let seller = "Seller1111111111111111111111111111111111";
+        let buyer = "BuyerSale11111111111111111111111111111111";
+        let tx = DecodedTx {
+            signature: "SigSale1111111111111111111111111111111111".into(),
+            timestamp: Some(1_700_000_000),
+            slot: Some(42),
+            owner_changes: HashMap::from([(
+                mint.into(),
+                (Some(seller.into()), buyer.into(), false),
+            )]),
+            native_moves: vec![NativeSolMove {
+                event_id: "instruction:0".into(),
+                from: buyer.into(),
+                to: seller.into(),
+                amount_sol: 2.5,
+            }],
+            ..DecodedTx::default()
+        };
+        let mut sale = SaleEvent {
+            tx_hash: tx.signature.clone(),
+            token_id: mint.into(),
+            marketplace: Some("helius".into()),
+            currency_symbol: Some("SOL".into()),
+            ..SaleEvent::default()
+        };
+
+        apply_sale_decode(&mut sale, &tx);
+
+        assert_eq!(sale.seller, seller);
+        assert_eq!(sale.buyer, buyer);
+        assert_eq!(sale.native_amount, Some(2.5));
+        assert_eq!(sale.seller_proceeds_native, Some(2.5));
+        assert_eq!(sale.timestamp, Some(1_700_000_000));
+        assert_eq!(sale.block_number, Some(42));
+        assert!(sale_fields_complete(&sale));
     }
 
     #[test]

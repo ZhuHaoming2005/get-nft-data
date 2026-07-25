@@ -23,11 +23,11 @@ use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 use crate::reporting::json::SeedRecord;
 
-// v10 stops representing OpenSea request failures as legitimate empty Sale
-// evidence. Older bundles may contain false Empty statuses and must not be
-// auto-reused.
-pub const EVIDENCE_CACHE_VERSION: u32 = 10;
-const MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION: u32 = 9;
+// v11 changes authoritative Sale providers: Alchemy for Ethereum/Polygon,
+// OpenSea for Base, and decoded Helius history for Solana. Older bundles must
+// not reuse OpenSea-only Empty/Failed Sale evidence.
+pub const EVIDENCE_CACHE_VERSION: u32 = 11;
+const MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION: u32 = 11;
 pub const DEFAULT_EVIDENCE_CACHE_FILE: &str = "evidence_cache.json";
 /// How many finished candidates to buffer before an append + snapshot flush.
 pub const DEFAULT_EVIDENCE_CACHE_BATCH: usize = 16;
@@ -670,11 +670,11 @@ mod tests {
     }
 
     #[test]
-    fn v9_cache_remains_readable_for_targeted_sales_migration() {
+    fn old_cache_is_rejected_after_authoritative_sale_provider_migration() {
         let mut cache = build_evidence_cache(params(), &AHashMap::new());
-        cache.version = 9;
+        cache.version = EVIDENCE_CACHE_VERSION - 1;
         let dir = std::env::temp_dir().join(format!(
-            "analysis2_evidence_cache_v9_{}",
+            "analysis2_evidence_cache_old_provider_{}",
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&dir);
@@ -682,8 +682,8 @@ mod tests {
         let path = dir.join("evidence_cache.json");
         write_evidence_cache(&path, &cache).unwrap();
 
-        let loaded = load_evidence_cache(&path).unwrap();
-        assert_eq!(loaded.version, 9);
+        let error = load_evidence_cache(&path).unwrap_err().to_string();
+        assert!(error.contains("unsupported"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
