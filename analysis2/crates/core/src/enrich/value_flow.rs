@@ -9,6 +9,7 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
+use futures_util::{StreamExt, stream};
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 
 use super::alchemy::{self, FetchOutcome, NativeTransfer};
@@ -20,8 +21,8 @@ use super::types::{
 };
 
 const ZERO: &str = "0x0000000000000000000000000000000000000000";
-/// Cap operator seeds so enrich stays bounded.
-const MAX_OPERATORS: usize = 16;
+/// Bound concurrent value-flow requests without dropping operator seeds.
+const VALUE_FLOW_REQUEST_CONCURRENCY: usize = 64;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ExternalTransferKey {
@@ -95,14 +96,13 @@ impl ExternalTransferCache {
     }
 }
 
-/// Normalize, sort, and cap a previously classified operator seed set.
-pub fn collect_operator_seeds(addresses: &[String]) -> (Vec<String>, bool) {
+/// Normalize and sort a previously classified operator seed set.
+pub fn collect_operator_seeds(addresses: &[String]) -> Vec<String> {
     let mut set = BTreeSet::new();
     for address in addresses {
         insert_addr(&mut set, address);
     }
-    let truncated = set.len() > MAX_OPERATORS;
-    (set.into_iter().take(MAX_OPERATORS).collect(), truncated)
+    set.into_iter().collect()
 }
 
 /// Derive the value-flow query set from the same role rule used by attribution:
@@ -153,13 +153,8 @@ fn insert_addr(set: &mut BTreeSet<String>, raw: &str) {
     set.insert(addr);
 }
 
-fn value_flow_request_key(operators_truncated: bool, association_incomplete: bool) -> String {
-    let mut notes = Vec::new();
-    if operators_truncated {
-        notes.push(format!(
-            "operator seeds truncated at MAX_OPERATORS={MAX_OPERATORS}"
-        ));
-    }
+fn value_flow_request_key(association_incomplete: bool) -> String {
+    let mut notes: Vec<String> = Vec::new();
     if association_incomplete {
         notes.push("candidate activity window or value-flow block number unavailable".into());
     }
@@ -299,8 +294,8 @@ pub fn classify_native_edge(
 /// Fetch and classify EVM value-flow edges for operator seeds.
 ///
 /// Status: NotRequested (no key) / Empty (no operators or no edges) /
-/// Complete (all queries ok, window known, no page/operator truncation) /
-/// Truncated (partial success, pageKey left, operator cap, or unbounded window) /
+/// Complete (all queries ok, window known, no page truncation) /
+/// Truncated (partial success, pageKey left, or unbounded window) /
 /// Failed (all requests fail).
 pub async fn fetch_evm_value_flows(
     client: &HttpClient,
@@ -363,7 +358,7 @@ async fn fetch_evm_value_flows_impl(
         return FetchOutcome::skipped("alchemy_value_flows");
     };
 
-    let (operators, operators_truncated) = collect_operator_seeds(operator_seeds);
+    let operators = collect_operator_seeds(operator_seeds);
     if operators.is_empty() {
         return FetchOutcome::ok(Vec::new(), 0, false, "alchemy", "alchemy_value_flows");
     }
@@ -376,36 +371,28 @@ async fn fetch_evm_value_flows_impl(
     let (from_block, to_block) = (0, u64::MAX);
 
     let operator_set: AHashSet<String> = operators.iter().cloned().collect();
-    let mut handles = Vec::new();
-
-    for (idx, address) in operators.iter().cloned().enumerate() {
-        for direction in ["from", "to"] {
-            let client = client.clone();
-            let endpoints = endpoints.clone();
-            let api_key = api_key.to_owned();
-            let chain = chain.to_owned();
-            let address = address.clone();
-            let dir = direction.to_owned();
-            let cache = cache.clone();
-            handles.push(tokio::spawn(async move {
-                match cache {
-                    Some(cache) => {
-                        cache
-                            .fetch(
-                                &client,
-                                &endpoints,
-                                Some(&api_key),
-                                &chain,
-                                &address,
-                                &dir,
-                                from_block,
-                                to_block,
-                                idx,
-                            )
-                            .await
-                    }
-                    None => {
-                        alchemy::fetch_external_transfers(
+    let requests = operators
+        .iter()
+        .cloned()
+        .flat_map(|address| {
+            ["from", "to"]
+                .into_iter()
+                .map(move |direction| (address.clone(), direction))
+        })
+        .enumerate()
+        .collect::<Vec<_>>();
+    let mut outcomes = stream::iter(requests.into_iter().map(|(idx, (address, direction))| {
+        let client = client.clone();
+        let endpoints = endpoints.clone();
+        let api_key = api_key.to_owned();
+        let chain = chain.to_owned();
+        let dir = direction.to_owned();
+        let cache = cache.clone();
+        async move {
+            match cache {
+                Some(cache) => {
+                    cache
+                        .fetch(
                             &client,
                             &endpoints,
                             Some(&api_key),
@@ -417,11 +404,25 @@ async fn fetch_evm_value_flows_impl(
                             idx,
                         )
                         .await
-                    }
                 }
-            }));
+                None => {
+                    alchemy::fetch_external_transfers(
+                        &client,
+                        &endpoints,
+                        Some(&api_key),
+                        &chain,
+                        &address,
+                        &dir,
+                        from_block,
+                        to_block,
+                        idx,
+                    )
+                    .await
+                }
+            }
         }
-    }
+    }))
+    .buffer_unordered(VALUE_FLOW_REQUEST_CONCURRENCY);
 
     let mut raw = Vec::new();
     let mut any_ok = false;
@@ -429,27 +430,21 @@ async fn fetch_evm_value_flows_impl(
     let mut page_truncated = false;
     let mut failures = Vec::new();
 
-    for handle in handles {
-        match handle.await {
-            Ok(outcome) => match outcome.status {
-                EvidenceStatus::NotRequested => {}
-                EvidenceStatus::Failed => {
-                    any_fail = true;
-                    if let Some(f) = outcome.failure {
-                        failures.push(f);
-                    }
-                }
-                EvidenceStatus::Empty | EvidenceStatus::Complete | EvidenceStatus::Truncated => {
-                    any_ok = true;
-                    if outcome.truncated || outcome.status == EvidenceStatus::Truncated {
-                        page_truncated = true;
-                    }
-                    raw.extend(outcome.value);
-                }
-            },
-            Err(e) => {
+    while let Some(outcome) = outcomes.next().await {
+        match outcome.status {
+            EvidenceStatus::NotRequested => {}
+            EvidenceStatus::Failed => {
                 any_fail = true;
-                failures.push(format!("value_flow task join failed: {e}"));
+                if let Some(f) = outcome.failure {
+                    failures.push(f);
+                }
+            }
+            EvidenceStatus::Empty | EvidenceStatus::Complete | EvidenceStatus::Truncated => {
+                any_ok = true;
+                if outcome.truncated || outcome.status == EvidenceStatus::Truncated {
+                    page_truncated = true;
+                }
+                raw.extend(outcome.value);
             }
         }
     }
@@ -486,14 +481,13 @@ async fn fetch_evm_value_flows_impl(
         }
     }
 
-    let truncated = page_truncated || any_fail || operators_truncated || association_incomplete;
+    let truncated = page_truncated || any_fail || association_incomplete;
     let count = edges.len();
-    let request_key = value_flow_request_key(operators_truncated, association_incomplete);
+    let request_key = value_flow_request_key(association_incomplete);
     let mut outcome = FetchOutcome::ok(edges, count, truncated, "alchemy", &request_key);
-    // A full-history query with no edges is conclusively Empty when every page
-    // completed. Operator-seed truncation must never report Complete.
-    if count == 0 && !page_truncated && !any_fail && !operators_truncated && !association_incomplete
-    {
+    // A full-history query with no edges is conclusively Empty when every
+    // operator and every page completed.
+    if count == 0 && !page_truncated && !any_fail && !association_incomplete {
         outcome.status = EvidenceStatus::Empty;
         if let Some(obs) = outcome.observation.as_mut() {
             obs.status = EvidenceStatus::Empty;
@@ -605,8 +599,7 @@ mod tests {
 
     #[test]
     fn operator_seed_normalization_uses_only_the_classified_input_set() {
-        let (seeds, truncated) = collect_operator_seeds(&["0xAAA".into()]);
-        assert!(!truncated);
+        let seeds = collect_operator_seeds(&["0xAAA".into()]);
         assert!(seeds.contains(&"0xaaa".to_owned()));
         assert!(!seeds.contains(&"0xfeepayer".to_owned()));
     }
@@ -643,20 +636,17 @@ mod tests {
     }
 
     #[test]
-    fn operator_seeds_truncated_past_max_operators() {
-        let controllers: Vec<String> = (1..=(MAX_OPERATORS + 3))
-            .map(|i| format!("0x{i:040x}"))
-            .collect();
-        let (seeds, truncated) = collect_operator_seeds(&controllers);
-        assert!(truncated);
-        assert_eq!(seeds.len(), MAX_OPERATORS);
+    fn operator_seeds_are_never_truncated() {
+        let controllers: Vec<String> = (1..=35).map(|i| format!("0x{i:040x}")).collect();
+        let seeds = collect_operator_seeds(&controllers);
+        assert_eq!(seeds.len(), controllers.len());
     }
 
     #[test]
-    fn request_key_carries_operator_truncation_note() {
-        let key = value_flow_request_key(true, false);
-        assert!(key.contains("MAX_OPERATORS"));
-        assert_eq!(value_flow_request_key(false, false), "alchemy_value_flows");
+    fn request_key_carries_association_incomplete_note() {
+        let key = value_flow_request_key(true);
+        assert!(key.contains("candidate activity window"));
+        assert_eq!(value_flow_request_key(false), "alchemy_value_flows");
     }
 
     #[test]

@@ -272,6 +272,31 @@ pub async fn fetch_collection_assets(
     collection: &str,
     max_assets: usize,
 ) -> FetchOutcome<SolanaAssetSnapshot> {
+    fetch_collection_assets_with_visibility(client, rpc_url, api_key, collection, max_assets, false)
+        .await
+}
+
+/// Retry collection discovery with unverified collection memberships visible.
+/// This is used only when the verified collection query contradicts resident NFTs.
+pub async fn fetch_collection_assets_including_unverified(
+    client: &HttpClient,
+    rpc_url: &str,
+    api_key: Option<&str>,
+    collection: &str,
+    max_assets: usize,
+) -> FetchOutcome<SolanaAssetSnapshot> {
+    fetch_collection_assets_with_visibility(client, rpc_url, api_key, collection, max_assets, true)
+        .await
+}
+
+async fn fetch_collection_assets_with_visibility(
+    client: &HttpClient,
+    rpc_url: &str,
+    api_key: Option<&str>,
+    collection: &str,
+    max_assets: usize,
+    show_unverified_collections: bool,
+) -> FetchOutcome<SolanaAssetSnapshot> {
     let Some(api_key) = api_key else {
         return FetchOutcome::skipped("helius_assets");
     };
@@ -299,7 +324,7 @@ pub async fn fetch_collection_assets(
                 "page": page,
                 "limit": limit,
                 "options": {
-                    "showUnverifiedCollections": false,
+                    "showUnverifiedCollections": show_unverified_collections,
                     "showCollectionMetadata": true,
                     "showGrandTotal": true
                 }
@@ -380,7 +405,12 @@ pub async fn fetch_collection_assets(
             .total
             .is_some_and(|total| total > snapshot.assets.len());
     snapshot.truncated = truncated;
-    FetchOutcome::ok(snapshot, count, truncated, "helius", "helius_assets")
+    let request_key = if show_unverified_collections {
+        "helius_assets_unverified"
+    } else {
+        "helius_assets"
+    };
+    FetchOutcome::ok(snapshot, count, truncated, "helius", request_key)
 }
 
 /// Bounded history via `getSignaturesForAsset` → transfer/sale stubs.
@@ -1700,6 +1730,44 @@ mod tests {
 
     use crate::enrich::types::{EvidenceStatus, status_from_count};
     use std::collections::BTreeSet;
+
+    #[tokio::test]
+    async fn unverified_collection_retry_can_recover_resident_asset() {
+        let server = MockServer::start_async().await;
+        let assets = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .body_contains("getAssetsByGroup")
+                    .body_contains("\"showUnverifiedCollections\":true");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": "assets-1",
+                    "result": {
+                        "total": 1,
+                        "items": [{
+                            "id": "resident-mint",
+                            "ownership": {"owner": "holder"},
+                            "compression": {"compressed": false}
+                        }]
+                    }
+                }));
+            })
+            .await;
+        let client = HttpClient::with_retries(2, 0).unwrap();
+        let outcome = fetch_collection_assets_including_unverified(
+            &client,
+            &server.base_url(),
+            Some("key"),
+            "collection",
+            10,
+        )
+        .await;
+
+        assert_eq!(assets.hits(), 1);
+        assert_eq!(outcome.status, EvidenceStatus::Complete);
+        assert_eq!(outcome.value.assets.len(), 1);
+        assert_eq!(outcome.value.assets[0].mint, "resident-mint");
+    }
 
     #[tokio::test]
     async fn asset_histories_batch_ten_assets_into_one_http_request() {

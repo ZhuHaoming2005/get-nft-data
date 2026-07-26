@@ -100,6 +100,15 @@ pub async fn enrich_candidates_with_hook(
             .to_owned();
         let address = store.contracts[contract_id as usize].address.clone();
         let is_evm = store.is_evm_chain(&chain);
+        let known_mints = if is_evm {
+            Vec::new()
+        } else {
+            store
+                .nfts_for_contract(contract_id)
+                .iter()
+                .map(|&nft_id| store.nfts[nft_id as usize].token_id.clone())
+                .collect::<Vec<_>>()
+        };
         let price_cache = price_cache.clone();
         let external_transfer_cache = external_transfer_cache.clone();
         let receipt_cache = receipt_cache.clone();
@@ -128,6 +137,7 @@ pub async fn enrich_candidates_with_hook(
                     &keys,
                     &limits,
                     probe,
+                    &known_mints,
                     &price_cache,
                     &solana_transaction_cache,
                 )
@@ -618,8 +628,8 @@ async fn enrich_evm(
             status: bundle.quality.holders,
         },
     );
-    let (initial_seeds, _) = value_flow::collect_operator_seeds(&preliminary_operator_seeds);
-    let (final_seeds, _) = value_flow::collect_operator_seeds(&operator_seeds);
+    let initial_seeds = value_flow::collect_operator_seeds(&preliminary_operator_seeds);
+    let final_seeds = value_flow::collect_operator_seeds(&operator_seeds);
     let value_flows = if initial_seeds == final_seeds {
         preliminary_flows
     } else {
@@ -703,14 +713,16 @@ async fn enrich_solana(
     keys: &ApiKeys,
     limits: &HttpLimits,
     prefetch: Option<legit_detect::CandidateProbe>,
+    known_mints: &[String],
     price_cache: &alchemy::PriceRequestCache,
     transaction_cache: &helius::TransactionRequestCache,
 ) -> EvidenceBundle {
     let mut bundle = EvidenceBundle::empty(contract_id, chain, address);
     bundle.quality.gas = EvidenceStatus::NotRequested;
     bundle.quality.value_flows = EvidenceStatus::NotRequested;
+    let mut evidence_collection_address = address.to_owned();
 
-    let snapshot = match prefetch.and_then(|probe| probe.solana_snapshot) {
+    let mut snapshot = match prefetch.and_then(|probe| probe.solana_snapshot) {
         Some(snapshot) => snapshot,
         None => {
             helius::fetch_collection_assets(
@@ -723,6 +735,82 @@ async fn enrich_solana(
             .await
         }
     };
+
+    // A resident candidate with known NFT mints cannot truthfully have an
+    // authoritative Empty collection snapshot. Resolve the collection identity
+    // from the known mints, then retry verified and finally unverified grouping.
+    if snapshot.status == EvidenceStatus::Empty && !known_mints.is_empty() {
+        let mut resolved_collection = None;
+        let mut resolution_errors = Vec::new();
+        if let Some(api_key) = keys.helius() {
+            for mint in known_mints {
+                match helius::resolve_collection_address(
+                    client,
+                    &limits.endpoints.helius,
+                    api_key,
+                    mint,
+                )
+                .await
+                {
+                    Ok(Some(collection)) => {
+                        resolved_collection = Some(collection);
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(error) => resolution_errors.push(error.to_string()),
+                }
+            }
+        }
+
+        let collection = resolved_collection.as_deref().unwrap_or(address);
+        evidence_collection_address = collection.to_owned();
+        if !collection.eq_ignore_ascii_case(address) {
+            snapshot = helius::fetch_collection_assets(
+                client,
+                &limits.endpoints.helius,
+                keys.helius(),
+                collection,
+                limits.max_solana_assets,
+            )
+            .await;
+        }
+        if snapshot.status == EvidenceStatus::Empty {
+            snapshot = helius::fetch_collection_assets_including_unverified(
+                client,
+                &limits.endpoints.helius,
+                keys.helius(),
+                collection,
+                limits.max_solana_assets,
+            )
+            .await;
+            if matches!(
+                snapshot.status,
+                EvidenceStatus::Complete | EvidenceStatus::Truncated
+            ) && !snapshot.value.assets.is_empty()
+            {
+                snapshot.status = EvidenceStatus::Truncated;
+                snapshot.truncated = true;
+                snapshot.failure = Some(
+                    "helius_assets_unverified: collection recovered only by including unverified memberships"
+                        .into(),
+                );
+                if let Some(observation) = snapshot.observation.as_mut() {
+                    observation.status = EvidenceStatus::Truncated;
+                }
+            }
+        }
+        if snapshot.status == EvidenceStatus::Empty {
+            let mut detail = format!(
+                "resident collection has {} NFT mint(s), but Helius returned no assets for candidate {address} or resolved collection {collection}",
+                known_mints.len()
+            );
+            if !resolution_errors.is_empty() {
+                detail.push_str("; collection resolution errors: ");
+                detail.push_str(&resolution_errors.join("; "));
+            }
+            snapshot = FetchOutcome::failed("helius", "helius_assets_identity", detail);
+        }
+    }
 
     let holders = holders_from_assets(&snapshot.value.assets);
     let holder_status = match snapshot.status {
@@ -778,7 +866,7 @@ async fn enrich_solana(
             &limits.endpoints.helius,
             keys.helius(),
             helius::DecodeContext {
-                candidate: address,
+                candidate: &evidence_collection_address,
                 controllers: &bundle.controllers,
                 holders: HolderSnapshot {
                     records: &bundle.holders,

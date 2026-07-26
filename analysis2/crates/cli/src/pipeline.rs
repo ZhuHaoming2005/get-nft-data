@@ -750,7 +750,7 @@ fn cached_evm_holders_need_retry(bundle: &EvidenceBundle) -> bool {
                     .any(|failure| failure.to_ascii_lowercase().contains("alchemy_holders"))))
 }
 
-fn legacy_empty_sales_candidates(
+fn legacy_empty_solana_asset_candidates(
     cache_version: u32,
     evidence: &AHashMap<ContractId, EvidenceBundle>,
 ) -> AHashSet<ContractId> {
@@ -759,7 +759,10 @@ fn legacy_empty_sales_candidates(
     }
     evidence
         .iter()
-        .filter(|(_, bundle)| bundle.quality.sales == EvidenceStatus::Empty)
+        .filter(|(_, bundle)| {
+            bundle.chain.eq_ignore_ascii_case("solana")
+                && bundle.quality.assets == EvidenceStatus::Empty
+        })
         .map(|(&candidate_id, _)| candidate_id)
         .collect()
 }
@@ -957,7 +960,6 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 if let Err(e) = validate_evidence_cache(&cache, &evidence_params) {
                     eprintln!("evidence: IGNORING incompatible cache (will re-fetch HTTP): {e}");
                 } else {
-                    let legacy_sales_semantics = cache.version < EVIDENCE_CACHE_VERSION;
                     refresh_prices =
                         cache.params.pricing_day_utc != evidence_params.pricing_day_utc;
                     evidence = rematerialize_evidence(&store, &cache)?;
@@ -966,17 +968,15 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                     let current_candidates: AHashSet<ContractId> =
                         registry.candidate_contracts().iter().copied().collect();
                     evidence.retain(|candidate_id, _| current_candidates.contains(candidate_id));
-                    if legacy_sales_semantics {
-                        let legacy_empty_sales =
-                            legacy_empty_sales_candidates(cache.version, &evidence);
-                        if !legacy_empty_sales.is_empty() {
-                            eprintln!(
-                                "evidence: refreshing {} legacy Empty Sale bundle(s); all other cached evidence remains reusable",
-                                legacy_empty_sales.len()
-                            );
-                        }
-                        forced_refresh.extend(legacy_empty_sales);
+                    let legacy_empty_solana_assets =
+                        legacy_empty_solana_asset_candidates(cache.version, &evidence);
+                    if !legacy_empty_solana_assets.is_empty() {
+                        eprintln!(
+                            "evidence: refreshing {} legacy Solana Empty Asset bundle(s); all other cached evidence remains reusable",
+                            legacy_empty_solana_assets.len()
+                        );
                     }
+                    forced_refresh.extend(legacy_empty_solana_assets);
                     forced_refresh.extend(
                         evidence
                             .iter()
@@ -1496,18 +1496,17 @@ mod tests {
     }
 
     #[test]
-    fn legacy_cache_refreshes_only_empty_sales_candidates() {
-        let mut empty_sales = EvidenceBundle::empty(1, "solana", "candidate-empty");
-        empty_sales.quality.sales = EvidenceStatus::Empty;
-        let mut complete_sales = EvidenceBundle::empty(2, "base", "0xcandidate-complete");
-        complete_sales.quality.sales = EvidenceStatus::Complete;
-        let evidence = AHashMap::from([(1, empty_sales), (2, complete_sales)]);
-
+    fn legacy_cache_refreshes_only_affected_empty_candidates() {
+        let mut empty_assets = EvidenceBundle::empty(3, "solana", "candidate-assets-empty");
+        empty_assets.quality.assets = EvidenceStatus::Empty;
+        let mut evm_empty_assets = EvidenceBundle::empty(4, "base", "0xcandidate-assets-empty");
+        evm_empty_assets.quality.assets = EvidenceStatus::Empty;
+        let evidence = AHashMap::from([(3, empty_assets), (4, evm_empty_assets)]);
         assert_eq!(
-            legacy_empty_sales_candidates(EVIDENCE_CACHE_VERSION - 1, &evidence),
-            AHashSet::from([1])
+            legacy_empty_solana_asset_candidates(EVIDENCE_CACHE_VERSION - 1, &evidence),
+            AHashSet::from([3])
         );
-        assert!(legacy_empty_sales_candidates(EVIDENCE_CACHE_VERSION, &evidence).is_empty());
+        assert!(legacy_empty_solana_asset_candidates(EVIDENCE_CACHE_VERSION, &evidence).is_empty());
     }
 
     #[test]

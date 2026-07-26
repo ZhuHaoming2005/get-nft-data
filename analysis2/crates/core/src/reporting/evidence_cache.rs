@@ -23,10 +23,10 @@ use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 use crate::reporting::json::SeedRecord;
 
-// v11 changes authoritative Sale providers: Alchemy for Ethereum/Polygon,
-// OpenSea for Base, and decoded Helius history for Solana. Older bundles must
-// not reuse OpenSea-only Empty/Failed Sale evidence.
-pub const EVIDENCE_CACHE_VERSION: u32 = 11;
+// v12 rejects cached Solana Empty collection snapshots when resident NFT mints
+// exist, resolving the collection identity and retrying unverified membership.
+// v11 remains readable so only affected Solana candidates need HTTP refresh.
+pub const EVIDENCE_CACHE_VERSION: u32 = 12;
 const MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION: u32 = 11;
 pub const DEFAULT_EVIDENCE_CACHE_FILE: &str = "evidence_cache.json";
 /// How many finished candidates to buffer before an append + snapshot flush.
@@ -672,7 +672,7 @@ mod tests {
     #[test]
     fn old_cache_is_rejected_after_authoritative_sale_provider_migration() {
         let mut cache = build_evidence_cache(params(), &AHashMap::new());
-        cache.version = EVIDENCE_CACHE_VERSION - 1;
+        cache.version = MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION - 1;
         let dir = std::env::temp_dir().join(format!(
             "analysis2_evidence_cache_old_provider_{}",
             std::process::id()
@@ -684,6 +684,25 @@ mod tests {
 
         let error = load_evidence_cache(&path).unwrap_err().to_string();
         assert!(error.contains("unsupported"), "{error}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn v11_cache_remains_readable_for_selective_solana_refresh() {
+        let mut cache = build_evidence_cache(params(), &AHashMap::new());
+        cache.version = EVIDENCE_CACHE_VERSION - 1;
+        let dir = std::env::temp_dir().join(format!(
+            "analysis2_evidence_cache_previous_{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("evidence_cache.json");
+        write_evidence_cache(&path, &cache).unwrap();
+
+        let loaded = load_evidence_cache(&path).unwrap();
+        validate_evidence_cache(&loaded, &params()).unwrap();
+        assert_eq!(loaded.version, EVIDENCE_CACHE_VERSION - 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

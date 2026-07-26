@@ -22,7 +22,13 @@ fn f64_cell(v: &Value) -> String {
     match v {
         Value::Number(n) => n
             .as_f64()
-            .map(|x| format!("{x:.6}"))
+            .map(|x| {
+                if x == 0.0 {
+                    "0.000000".into()
+                } else {
+                    format!("{x:.6}")
+                }
+            })
             .unwrap_or_else(|| n.to_string()),
         Value::Null => "null".into(),
         other => other.to_string(),
@@ -233,9 +239,12 @@ pub fn write_all_chains_md(
     // Header counts. API/data-quality problems are documented separately and
     // never remove otherwise available seed results from this report.
     body.push_str(&format!(
-        "- selected seeds: {}\n- seed_with_duplicate: {} ({})\n\n",
+        "- selected seeds: {}\n- included seed reports: {}\n- excluded seeds: {}\n- seed_with_duplicate: {} / {} ({})\n\n",
         summary["selected_seed_count"],
+        summary["included_seed_report_count"],
+        summary["excluded_seed_count"],
         summary["seed_with_duplicate_count"],
+        summary["seed_duplicate_ratio_denominator"],
         f64_cell(&summary["seed_duplicate_ratio"]),
     ));
 
@@ -387,9 +396,19 @@ pub fn write_all_chains_md(
     body.push_str(
         "\n> 说明：所有金额均按程序执行时取得的现价换算为 USD；无法定价的支付不会按 0 USD 计入。\n",
     );
-    if econ["usd_valuation_complete"].as_bool() == Some(false) {
+    if econ["evidence_coverage_complete"].as_bool() == Some(false) {
         body.push_str(
-            "\n> 警告：本范围存在无法取得执行日价格的交易或 Gas；USD 金额是已定价子集，不应解释为完整总额。\n",
+            "\n> 警告：本范围的链上证据覆盖不完整；金额仅代表已取得证据，不应解释为完整总体。\n",
+        );
+    }
+    if econ["observed_usd_pricing_complete"].as_bool() == Some(false) {
+        body.push_str(
+            "\n> 警告：已取得的交易、资金流、mint 支付或 Gas 中存在无法可靠换算 USD 的记录；金额仅代表已定价子集。\n",
+        );
+    }
+    if econ["operator_output_attribution_complete"].as_bool() == Some(false) {
+        body.push_str(
+            "\n> 警告：部分销售、版税或 mint 收款方无法完成操作者归因；操作者产出不是完整总体。\n",
         );
     }
 
@@ -409,7 +428,7 @@ pub fn write_all_chains_md(
     // ## 产出投入比 (USD/USD only; contracts without priced gas excluded from counts)
     body.push_str("\n## 产出投入比\n\n");
     body.push_str(
-        "| scope | 产出 USD | 投入 USD (gas×spot) | 产出/投入 | >=1 数量占比 | <1 数量占比 |\n| --- | ---: | ---: | ---: | ---: | ---: |\n",
+        "| scope | 可比样本产出 USD | 可比样本投入 USD (gas×spot) | 产出/投入 | >=1 数量占比 | <1 数量占比 |\n| --- | ---: | ---: | ---: | ---: | ---: |\n",
     );
     let ratio_s = match econ["output_input_ratio"].as_f64() {
         Some(r) => format!("{r:.5}x"),
@@ -435,11 +454,23 @@ pub fn write_all_chains_md(
     };
     body.push_str(&format!(
         "| total | {} | {} | {} | {} | {} |\n",
-        f64_cell(&econ["ratio_operator_output_usd"]),
-        f64_cell(&econ["attacker_input_usd"]),
+        f64_cell(
+            econ.get("ratio_eligible_operator_output_usd")
+                .unwrap_or(&econ["ratio_operator_output_usd"])
+        ),
+        f64_cell(
+            econ.get("ratio_eligible_attacker_input_usd")
+                .unwrap_or(&econ["attacker_input_usd"])
+        ),
         ratio_s,
         ge1,
         lt1,
+    ));
+    body.push_str(&format!(
+        "\n> 口径：总比值与 >=1/<1 分布均只使用同一批 {} 个可比合约；样本覆盖全部疑似合约：{}。全部已观察操作者产出为 {} USD。\n",
+        u64_cell(econ.get("ratio_eligible_contract_count").unwrap_or(&econ["output_input_ratio_count"])),
+        econ["ratio_sample_complete"],
+        f64_cell(econ.get("all_observed_operator_output_usd").unwrap_or(&econ["operator_output_usd"])),
     ));
     body.push_str(&format!(
         "\n- candidate/operator funding_usd: {}\n- operator_internal_backflow_usd: {}\n- candidate/operator withdrawal_usd: {}\n",
@@ -449,11 +480,11 @@ pub fn write_all_chains_md(
     ));
 
     // ## 诚实买家付费暴露
-    let infringing = u64_cell(&summary["infringing_nft_count"]);
+    let hit_contract_nfts = u64_cell(&econ["hit_contract_nft_count"]);
     let stuck = u64_cell(&econ["stuck_nft_count"]);
     let stuck_ratio = match econ["stuck_nft_ratio"].as_f64() {
-        Some(r) => format!("{} ({stuck}/{infringing})", percent_value(r)),
-        None => format!("n/a ({stuck}/{infringing})"),
+        Some(r) => format!("{} ({stuck}/{hit_contract_nfts})", percent_value(r)),
+        None => format!("n/a ({stuck}/{hit_contract_nfts})"),
     };
     body.push_str("\n## 诚实买家付费暴露\n\n");
     body.push_str(
@@ -555,8 +586,10 @@ pub fn write_all_chains_md(
     let dimensions = &dq["dedup_dimensions"];
     body.push_str("\n## 数据质量\n\n");
     body.push_str(&format!(
-        "- 代表候选 NFT 数: {}\n- 候选合约数: {}\n- 疑似重复合约数: {}\n- 官方参与型重复合约数: {}\n- 疑似侵权 NFT 数: {}\n- 合法关系验证 Complete/Incomplete: {} / {}\n- gas 证据 Complete/Empty/Failed/Truncated/NotRequested: {} / {} / {} / {} / {}\n- 销售定价 Priced/Unpriced/Amountless/AssumedPeg/Total: {} / {} / {} / {} / {}\n- 操作者销售净收入 Priced/Unpriced/Unknown/Total: {} / {} / {} / {}\n- 版税接收方 Unknown: {}\n- 操作者付费 mint 收入 Priced/Unpriced/Operator/AllPaid/UnknownReceiver: {} / {} / {} / {} / {}\n- 诚实买家付费 mint 损失定价 Priced/Unpriced/Total: {} / {} / {}\n- Gas 成本定价 Priced/Unpriced/Total: {} / {} / {}\n- 操作者产出完整: {}\n- USD 估值完整: {}\n- 去重维度 token_uri/image_uri/metadata/name: {} / {} / {} / {}\n",
-        u64_cell(dq.get("representative_candidate_count").unwrap_or(&summary["representative_candidate_count"])),
+        "- 代表候选 NFT 数: {}\n- 命中合约全部 NFT 数: {}（完整: {}）\n- 候选合约数: {}\n- 疑似重复合约数: {}\n- 官方参与型重复合约数: {}\n- 疑似侵权 NFT 数: {}\n- 合法关系验证 Complete/Incomplete: {} / {}\n- gas 证据 Complete/Empty/Failed/Truncated/NotRequested: {} / {} / {} / {} / {}\n- 销售定价 Priced/Unpriced/Amountless/AssumedPeg/Total: {} / {} / {} / {} / {}\n- 操作者销售净收入 Priced/Unpriced/Unknown/Total: {} / {} / {} / {}\n- 版税接收方 Unknown: {}\n- 操作者付费 mint 收入 Priced/Unpriced/Operator/AllPaid/UnknownReceiver: {} / {} / {} / {} / {}\n- 诚实买家付费 mint 损失定价 Priced/Unpriced/Total: {} / {} / {}\n- Gas 成本定价 Priced/Unpriced/Total: {} / {} / {}\n- 证据覆盖完整: {}\n- 已观察金额 USD 定价完整: {}\n- 操作者归因完整: {}\n- 操作者产出完整: {}\n- USD 估值完整: {}\n- 产出/投入可比样本完整: {}\n- 去重维度 token_uri/image_uri/metadata/name: {} / {} / {} / {}\n",
+        u64_cell(dq.get("representative_candidate_nft_count").unwrap_or(&summary["representative_candidate_nft_count"])),
+        u64_cell(&dq["hit_contract_nft_count"]),
+        dq["hit_contract_nft_count_complete"],
         u64_cell(dq.get("candidate_contract_count").unwrap_or(&summary["candidate_contract_count"])),
         u64_cell(dq.get("suspected_duplicate_contract_count").unwrap_or(&summary["suspected_duplicate_contract_count"])),
         u64_cell(dq.get("legit_duplicate_contract_count").unwrap_or(&summary["legit_duplicate_contract_count"])),
@@ -589,8 +622,12 @@ pub fn write_all_chains_md(
         u64_cell(&pricing["priced_gas_cost_contract_count"]),
         u64_cell(&pricing["unpriced_gas_cost_contract_count"]),
         u64_cell(&pricing["gas_cost_contract_count"]),
+        pricing["evidence_coverage_complete"],
+        pricing["observed_usd_pricing_complete"],
+        pricing["operator_output_attribution_complete"],
         pricing["operator_output_complete"],
         pricing["usd_valuation_complete"],
+        econ["ratio_sample_complete"],
         dimensions["token_uri_enabled"],
         dimensions["image_uri_enabled"],
         dimensions["metadata_enabled"],

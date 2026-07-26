@@ -135,6 +135,8 @@ pub struct EconomicsUsdRollup {
     pub output_input_ratio_lt1_count: u64,
     /// Sum of observed attacker gas input for contracts with a priced USD denominator.
     pub attacker_input_usd: f64,
+    /// Attacker gas input for the same contracts included in the ratio numerator.
+    pub ratio_attacker_input_usd: f64,
     pub sale_count: u64,
     pub priced_sale_count: u64,
     pub unpriced_sale_count: u64,
@@ -268,7 +270,11 @@ fn economics_usd_from(facts: &EconomicFacts) -> EconomicsUsdRollup {
         output_input_ratio_count: 0,
         output_input_ratio_ge1_count: 0,
         output_input_ratio_lt1_count: 0,
-        attacker_input_usd: 0.0,
+        attacker_input_usd: facts
+            .attacker_input_usd
+            .filter(|value| value.is_finite() && *value > 0.0)
+            .unwrap_or(0.0),
+        ratio_attacker_input_usd: 0.0,
         sale_count: facts.sale_count,
         priced_sale_count: facts.priced_sale_count,
         unpriced_sale_count: facts.unpriced_sale_count,
@@ -310,7 +316,7 @@ fn economics_usd_from(facts: &EconomicFacts) -> EconomicsUsdRollup {
             .attacker_input_usd
             .filter(|v| v.is_finite() && *v > 0.0)
         {
-            roll.attacker_input_usd = input_usd;
+            roll.ratio_attacker_input_usd = input_usd;
         }
     }
     roll
@@ -338,6 +344,7 @@ fn merge_usd(dst: &mut EconomicsUsdRollup, src: &EconomicsUsdRollup) {
     dst.output_input_ratio_ge1_count += src.output_input_ratio_ge1_count;
     dst.output_input_ratio_lt1_count += src.output_input_ratio_lt1_count;
     dst.attacker_input_usd += src.attacker_input_usd;
+    dst.ratio_attacker_input_usd += src.ratio_attacker_input_usd;
     dst.sale_count += src.sale_count;
     dst.priced_sale_count += src.priced_sale_count;
     dst.unpriced_sale_count += src.unpriced_sale_count;
@@ -441,8 +448,6 @@ fn apply_deduped_economic_events(
             }
         }
     }
-    // The overall ratio numerator must use the same transaction-union amount.
-    economics.ratio_operator_output_usd = economics.operator_output_usd;
 }
 
 fn role_is_malicious(role: AddressRole) -> bool {
@@ -686,6 +691,22 @@ fn status_json(counts: [u64; 5]) -> Value {
     })
 }
 
+fn normalize_negative_zero(value: &mut Value) {
+    match value {
+        Value::Number(number)
+            if number.is_f64()
+                && number
+                    .as_f64()
+                    .is_some_and(|value| value == 0.0 && value.is_sign_negative()) =>
+        {
+            *value = json!(0.0);
+        }
+        Value::Array(values) => values.iter_mut().for_each(normalize_negative_zero),
+        Value::Object(values) => values.values_mut().for_each(normalize_negative_zero),
+        _ => {}
+    }
+}
+
 /// Aggregate one independently analyzed reporting scope over every available
 /// seed report. Additional reports are kept for API compatibility and are
 /// included identically.
@@ -695,6 +716,26 @@ pub fn build_run_summary_for_scope(
     additional_reports: &[&SeedFullReport],
     _failures: &[FailureRecord],
     analyses: &[&CandidateAnalysis],
+    scope: RunSummaryScope<'_>,
+) -> Value {
+    build_run_summary_for_scope_with_store(
+        selected,
+        reports,
+        additional_reports,
+        _failures,
+        analyses,
+        None,
+        scope,
+    )
+}
+
+fn build_run_summary_for_scope_with_store(
+    selected: &[SeedRecord],
+    reports: &[&SeedFullReport],
+    additional_reports: &[&SeedFullReport],
+    _failures: &[FailureRecord],
+    analyses: &[&CandidateAnalysis],
+    store: Option<&ResidentStore>,
     scope: RunSummaryScope<'_>,
 ) -> Value {
     let selected_n = selected
@@ -783,6 +824,27 @@ pub fn build_run_summary_for_scope(
         .map(|state| state.fallback_nft_count)
         .sum();
     let infringing_nfts = infringing_nft_ids.len() as u64 + infringing_fallback;
+    let mut hit_contract_nft_count = 0u64;
+    let mut hit_contract_nft_count_complete = store.is_some();
+    for key in &suspected {
+        let state = &candidates[key];
+        let fallback = (state.all_nfts.len() as u64).max(state.fallback_nft_count);
+        let resident_count = store.and_then(|resident| {
+            let analysis = analysis_by_key.get(key)?;
+            resident
+                .contracts
+                .get(analysis.contract_id as usize)
+                .map(|contract| contract.nft_count)
+        });
+        let count = resident_count.unwrap_or_else(|| {
+            hit_contract_nft_count_complete = false;
+            fallback
+        });
+        if count < fallback {
+            hit_contract_nft_count_complete = false;
+        }
+        hit_contract_nft_count += count.max(fallback);
+    }
 
     let mut behavior_map: AHashMap<&'static str, BehaviorAgg> = [
         "wash_trading",
@@ -1135,20 +1197,28 @@ pub fn build_run_summary_for_scope(
             .filter(|state| state.all_nfts.is_empty())
             .map(|state| state.fallback_nft_count)
             .sum::<u64>();
-    let operator_output_complete = required_evidence_complete
-        && economics.unpriced_operator_sale_proceeds_count == 0
-        && economics.unknown_operator_sale_proceeds_count == 0
-        && economics.unknown_royalty_recipient_count == 0
-        && economics.unpriced_operator_paid_mint_payment_count == 0
-        && economics.unknown_paid_mint_receiver_count == 0;
-    let usd_valuation_complete = economics.unpriced_sale_count == 0
+    let observed_usd_pricing_complete = economics.unpriced_sale_count == 0
         && economics.amountless_sale_count == 0
         && economics.assumed_stablecoin_peg_sale_count == 0
         && economics.unpriced_value_flow_count == 0
-        && operator_output_complete
+        && economics.unpriced_operator_sale_proceeds_count == 0
+        && economics.unpriced_operator_paid_mint_payment_count == 0
         && economics.unpriced_honest_paid_mint_loss_count == 0
         && economics.unpriced_gas_cost_contract_count == 0;
-    let economics_json = json!({
+    let operator_output_attribution_complete = economics.unknown_operator_sale_proceeds_count == 0
+        && economics.unknown_royalty_recipient_count == 0
+        && economics.unknown_paid_mint_receiver_count == 0;
+    let operator_output_pricing_complete = economics.unpriced_operator_sale_proceeds_count == 0
+        && economics.unpriced_operator_paid_mint_payment_count == 0;
+    let operator_output_complete = required_evidence_complete
+        && operator_output_pricing_complete
+        && operator_output_attribution_complete;
+    let usd_valuation_complete = required_evidence_complete && observed_usd_pricing_complete;
+    let ratio_sample_complete =
+        suspected_n > 0 && economics.output_input_ratio_count == suspected_n;
+    let stuck_nft_ratio_valid =
+        hit_contract_nft_count > 0 && economics.stuck_nft_count <= hit_contract_nft_count;
+    let mut economics_json = json!({
         "operator_output_usd": economics.operator_output_usd,
         "honest_paid_exposure_usd": economics.honest_loss_usd,
         "secondary_sale_paid_exposure_usd": economics.secondary_sale_loss_usd,
@@ -1165,10 +1235,10 @@ pub fn build_run_summary_for_scope(
         "revenue_backflow_usd": economics.revenue_backflow_usd,
         "withdrawal_usd": economics.withdrawal_usd,
         "stuck_nft_count": economics.stuck_nft_count,
-        "stuck_nft_ratio": (infringing_nfts > 0)
-            .then_some(economics.stuck_nft_count as f64 / infringing_nfts as f64),
-        "output_input_ratio": (economics.attacker_input_usd > 0.0)
-            .then_some(economics.ratio_operator_output_usd / economics.attacker_input_usd),
+        "stuck_nft_ratio": stuck_nft_ratio_valid
+            .then_some(economics.stuck_nft_count as f64 / hit_contract_nft_count as f64),
+        "output_input_ratio": (economics.ratio_attacker_input_usd > 0.0)
+            .then_some(economics.ratio_operator_output_usd / economics.ratio_attacker_input_usd),
         "ratio_operator_output_usd": economics.ratio_operator_output_usd,
         "output_input_ratio_count": economics.output_input_ratio_count,
         "output_input_ratio_ge1_count": economics.output_input_ratio_ge1_count,
@@ -1187,6 +1257,46 @@ pub fn build_run_summary_for_scope(
         "usd_valuation_complete": usd_valuation_complete,
         "operator_output_complete": operator_output_complete,
     });
+    if let Some(object) = economics_json.as_object_mut() {
+        object.insert(
+            "all_observed_operator_output_usd".into(),
+            json!(economics.operator_output_usd),
+        );
+        object.insert(
+            "hit_contract_nft_count".into(),
+            json!(hit_contract_nft_count),
+        );
+        object.insert(
+            "hit_contract_nft_count_complete".into(),
+            json!(hit_contract_nft_count_complete),
+        );
+        object.insert("stuck_nft_ratio_valid".into(), json!(stuck_nft_ratio_valid));
+        object.insert(
+            "ratio_eligible_operator_output_usd".into(),
+            json!(economics.ratio_operator_output_usd),
+        );
+        object.insert(
+            "ratio_eligible_attacker_input_usd".into(),
+            json!(economics.ratio_attacker_input_usd),
+        );
+        object.insert(
+            "ratio_eligible_contract_count".into(),
+            json!(economics.output_input_ratio_count),
+        );
+        object.insert("ratio_sample_complete".into(), json!(ratio_sample_complete));
+        object.insert(
+            "evidence_coverage_complete".into(),
+            json!(required_evidence_complete),
+        );
+        object.insert(
+            "observed_usd_pricing_complete".into(),
+            json!(observed_usd_pricing_complete),
+        );
+        object.insert(
+            "operator_output_attribution_complete".into(),
+            json!(operator_output_attribution_complete),
+        );
+    }
     let pricing_quality = json!({
         "sale_count": economics.sale_count,
         "priced_sale_count": economics.priced_sale_count,
@@ -1213,6 +1323,9 @@ pub fn build_run_summary_for_scope(
         "unpriced_gas_cost_contract_count": economics.unpriced_gas_cost_contract_count,
         "usd_valuation_complete": usd_valuation_complete,
         "operator_output_complete": operator_output_complete,
+        "evidence_coverage_complete": required_evidence_complete,
+        "observed_usd_pricing_complete": observed_usd_pricing_complete,
+        "operator_output_attribution_complete": operator_output_attribution_complete,
     });
     let data_quality = json!({
         "representative_candidate_count": representative_candidate_count,
@@ -1222,6 +1335,8 @@ pub fn build_run_summary_for_scope(
         "suspected_duplicate_contract_count": suspected_n,
         "legit_duplicate_contract_count": legit_contract_count,
         "infringing_nft_count": infringing_nfts,
+        "hit_contract_nft_count": hit_contract_nft_count,
+        "hit_contract_nft_count_complete": hit_contract_nft_count_complete,
         "legit_relation_verification_complete": legit_relation_complete,
         "legit_relation_verification_incomplete": legit_relation_incomplete,
         "pricing": pricing_quality,
@@ -1243,11 +1358,15 @@ pub fn build_run_summary_for_scope(
         })
         .collect::<Vec<_>>();
 
-    json!({
+    let mut summary = json!({
         "analysis_available": true,
         "selected_seed_count": selected_n,
+        "included_seed_report_count": included_n,
+        "excluded_seed_count": selected_n.saturating_sub(included_n),
         "seed_with_duplicate_count": with_dup,
         "seed_duplicate_ratio": (included_n > 0).then_some(with_dup as f64 / included_n as f64),
+        "seed_duplicate_ratio_numerator": with_dup,
+        "seed_duplicate_ratio_denominator": included_n,
         "representative_candidate_count": representative_candidate_count,
         "representative_candidate_nft_count": representative_candidate_count,
         "candidate_contract_count": candidates.len() as u64,
@@ -1271,7 +1390,9 @@ pub fn build_run_summary_for_scope(
             "economics_usd": economics,
         },
         "seeds": seed_rows,
-    })
+    });
+    normalize_negative_zero(&mut summary);
+    summary
 }
 
 /// Backward-compatible all-chains summary builder.
@@ -1337,30 +1458,33 @@ pub fn write_run_outputs(
     // to candidate quality/error records instead of deleting the whole seed.
     let dedup_refs: Vec<&SeedDedupReport> = ok_reports.iter().map(|r| &r.dedup).collect();
     let analysis_refs: Vec<&CandidateAnalysis> = analyses.iter().collect();
-    let mut all_summary = build_run_summary_for_scope(
+    let mut all_summary = build_run_summary_for_scope_with_store(
         selected_seeds,
         &ok_reports,
         &[],
         &failures,
         &analysis_refs,
+        Some(store),
         RunSummaryScope::All,
     );
     let intra_refs: Vec<&CandidateAnalysis> = scope_analyses.intra_chain.iter().collect();
-    let mut intra_summary = build_run_summary_for_scope(
+    let mut intra_summary = build_run_summary_for_scope_with_store(
         selected_seeds,
         &ok_reports,
         &[],
         &failures,
         &intra_refs,
+        Some(store),
         RunSummaryScope::Intra,
     );
     let cross_refs: Vec<&CandidateAnalysis> = scope_analyses.cross_chain.iter().collect();
-    let mut cross_summary = build_run_summary_for_scope(
+    let mut cross_summary = build_run_summary_for_scope_with_store(
         selected_seeds,
         &ok_reports,
         &[],
         &failures,
         &cross_refs,
+        Some(store),
         RunSummaryScope::Cross,
     );
     let mut intra_chain_summaries = BTreeMap::new();
@@ -1375,12 +1499,13 @@ pub fn write_run_outputs(
             .collect();
         intra_chain_summaries.insert(
             chain_key.clone(),
-            build_run_summary_for_scope(
+            build_run_summary_for_scope_with_store(
                 selected_seeds,
                 &ok_reports,
                 &[],
                 &failures,
                 &intra_refs,
+                Some(store),
                 RunSummaryScope::IntraChain { chain },
             ),
         );
@@ -1392,12 +1517,13 @@ pub fn write_run_outputs(
             .collect();
         cross_primary_summaries.insert(
             chain_key,
-            build_run_summary_for_scope(
+            build_run_summary_for_scope_with_store(
                 selected_seeds,
                 &ok_reports,
                 &[],
                 &failures,
                 &cross_refs,
+                Some(store),
                 RunSummaryScope::CrossPrimary {
                     primary_chain: chain,
                 },
@@ -1425,12 +1551,13 @@ pub fn write_run_outputs(
                 .collect();
             matrix_summaries.insert(
                 direction,
-                build_run_summary_for_scope(
+                build_run_summary_for_scope_with_store(
                     selected_seeds,
                     &ok_reports,
                     &[],
                     &failures,
                     &refs,
+                    Some(store),
                     RunSummaryScope::Matrix {
                         primary_chain: &primary,
                         secondary_chain: secondary,
@@ -1548,6 +1675,7 @@ mod tests {
         LegitClassification, LifecycleFacts, ValueFlowContribution, ValueFlowFacts,
     };
     use crate::enrich::{EvidenceStatus, ValueFlowKind};
+    use crate::entity::SourceOrder;
     use crate::reporting::aggregate::SeedDuplicateScale;
     use crate::reporting::json::SeedRelationJson;
 
@@ -1727,6 +1855,125 @@ mod tests {
                 }],
             }),
         }
+    }
+
+    #[test]
+    fn stuck_ratio_uses_every_resident_nft_in_suspected_hit_contracts() {
+        let mut store = ResidentStore::new();
+        for (row, token_id) in ["1", "2", "3", "4"].into_iter().enumerate() {
+            store
+                .ingest_identity_strs(
+                    "base",
+                    "0xcand",
+                    token_id,
+                    "",
+                    "",
+                    "",
+                    SourceOrder {
+                        file_ordinal: 0,
+                        file_row_number: row as u64,
+                    },
+                )
+                .unwrap();
+        }
+        store.rebuild_contract_nft_csr();
+        store.shrink_identity_for_analysis();
+
+        let report = formal_seed_sharing_candidate(
+            "ethereum",
+            "0xseed",
+            "base",
+            "0xcand",
+            EconomicsUsdRollup::default(),
+            1,
+            vec![0],
+            vec!["token_uri".into()],
+            false,
+        );
+        let mut analysis = empty_analysis("base", "0xcand", 0);
+        analysis.economics.stuck_nft_count = 2;
+        let summary = build_run_summary_for_scope_with_store(
+            std::slice::from_ref(&report.dedup.seed),
+            &[&report],
+            &[],
+            &[],
+            &[&analysis],
+            Some(&store),
+            RunSummaryScope::All,
+        );
+
+        assert_eq!(summary["economics"]["hit_contract_nft_count"], 4);
+        assert_eq!(summary["economics"]["stuck_nft_count"], 2);
+        assert_eq!(summary["economics"]["stuck_nft_ratio"], 0.5);
+        assert_eq!(summary["infringing_nft_count"], 1);
+    }
+
+    #[test]
+    fn aggregate_ratio_uses_only_the_same_ratio_eligible_contracts() {
+        let report_a = formal_seed_sharing_candidate(
+            "ethereum",
+            "0xseed_a",
+            "base",
+            "0xcand_a",
+            EconomicsUsdRollup::default(),
+            1,
+            vec![10],
+            vec!["token_uri".into()],
+            false,
+        );
+        let report_b = formal_seed_sharing_candidate(
+            "ethereum",
+            "0xseed_b",
+            "base",
+            "0xcand_b",
+            EconomicsUsdRollup::default(),
+            1,
+            vec![11],
+            vec!["token_uri".into()],
+            false,
+        );
+        let mut eligible = empty_analysis("base", "0xcand_a", 1);
+        eligible.economics.operator_output_usd = 0.5;
+        eligible.economics.attacker_input_usd = Some(1.0);
+        eligible.economics.output_input_ratio = Some(0.5);
+        eligible.economics.output_input_ratio_is_usd = true;
+        eligible.economics.economic_contributions = vec![EconomicContribution {
+            tx_hash: "0xeligible".into(),
+            token_id: "1".into(),
+            from: "0xbuyer".into(),
+            to: "0xoperator".into(),
+            kind: EconomicContributionKind::OperatorSaleProceeds,
+            usd: 0.5,
+        }];
+        let mut ineligible = empty_analysis("base", "0xcand_b", 2);
+        ineligible.economics.operator_output_usd = 100.0;
+        ineligible.economics.attacker_input_usd = Some(1.0);
+        ineligible.economics.output_input_ratio = None;
+        ineligible.economics.output_input_ratio_is_usd = false;
+        ineligible.economics.economic_contributions = vec![EconomicContribution {
+            tx_hash: "0xineligible".into(),
+            token_id: "2".into(),
+            from: "0xbuyer".into(),
+            to: "0xoperator".into(),
+            kind: EconomicContributionKind::OperatorSaleProceeds,
+            usd: 100.0,
+        }];
+        let selected = vec![report_a.dedup.seed.clone(), report_b.dedup.seed.clone()];
+        let summary = build_run_summary(
+            &selected,
+            &[&report_a, &report_b],
+            &[],
+            &[],
+            &[&eligible, &ineligible],
+        );
+        let economics = &summary["economics"];
+
+        assert_eq!(economics["all_observed_operator_output_usd"], 100.5);
+        assert_eq!(economics["ratio_eligible_operator_output_usd"], 0.5);
+        assert_eq!(economics["ratio_eligible_attacker_input_usd"], 1.0);
+        assert_eq!(economics["output_input_ratio"], 0.5);
+        assert_eq!(economics["output_input_ratio_lt1_count"], 1);
+        assert_eq!(economics["output_input_ratio_ge1_count"], 0);
     }
 
     #[test]
