@@ -2054,6 +2054,13 @@ pub async fn fetch_external_transfers(
             format!("unsupported alchemy network for {chain}"),
         );
     };
+    let Some(address) = crate::seed::address::normalize_address(chain, address) else {
+        return FetchOutcome::failed(
+            "input",
+            "alchemy_external_address",
+            format!("invalid {chain} address excluded before provider request"),
+        );
+    };
 
     let to_block_value = if to_block == u64::MAX {
         Value::String("latest".into())
@@ -2070,8 +2077,8 @@ pub async fn fetch_external_transfers(
         "order": "asc"
     });
     match direction {
-        "from" => params["fromAddress"] = Value::String(address.to_owned()),
-        "to" => params["toAddress"] = Value::String(address.to_owned()),
+        "from" => params["fromAddress"] = Value::String(address.clone()),
+        "to" => params["toAddress"] = Value::String(address),
         other => {
             return FetchOutcome::failed(
                 "alchemy",

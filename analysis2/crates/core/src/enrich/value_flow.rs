@@ -12,6 +12,8 @@ use ahash::{AHashMap, AHashSet};
 use futures_util::{StreamExt, stream};
 use tokio::sync::{Mutex as AsyncMutex, OnceCell};
 
+use crate::seed::address::{normalize_address, valid_evm_address};
+
 use super::alchemy::{self, FetchOutcome, NativeTransfer};
 use super::http::HttpClient;
 use super::roles::{HolderSnapshot, victim_addresses};
@@ -120,8 +122,9 @@ pub(crate) fn derive_operator_seeds(
     let mut all = BTreeSet::new();
     let victims = victim_addresses(chain, transfers, sales, holders);
     let mut insert = |raw: &str| {
-        let address = normalize_chain_address(chain, raw);
-        if !address.is_empty() && address != ZERO {
+        if let Some(address) = normalize_address(chain, raw)
+            && address != ZERO
+        {
             all.insert(address);
         }
     };
@@ -147,7 +150,7 @@ pub(crate) fn derive_operator_seeds(
 
 fn insert_addr(set: &mut BTreeSet<String>, raw: &str) {
     let addr = raw.trim().to_ascii_lowercase();
-    if addr.is_empty() || addr == ZERO {
+    if addr == ZERO || !valid_evm_address(&addr) {
         return;
     }
     set.insert(addr);
@@ -599,9 +602,57 @@ mod tests {
 
     #[test]
     fn operator_seed_normalization_uses_only_the_classified_input_set() {
-        let seeds = collect_operator_seeds(&["0xAAA".into()]);
-        assert!(seeds.contains(&"0xaaa".to_owned()));
+        let address = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mixed_case = "0xAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned();
+        let seeds = collect_operator_seeds(&[mixed_case]);
+        assert!(seeds.contains(&address.to_owned()));
         assert!(!seeds.contains(&"0xfeepayer".to_owned()));
+    }
+
+    #[test]
+    fn malformed_evm_operator_seed_is_excluded_before_alchemy_request() {
+        let malformed = "0x3611b361f58d549a7b2fca5dac124d3e6630ae";
+        assert_eq!(malformed.len(), 40);
+        assert!(collect_operator_seeds(&[malformed.into()]).is_empty());
+    }
+
+    #[tokio::test]
+    async fn malformed_operator_never_reaches_alchemy() {
+        let server = MockServer::start_async().await;
+        let rpc = server
+            .mock_async(|when, then| {
+                when.method(POST).body_contains("alchemy_getAssetTransfers");
+                then.status(400);
+            })
+            .await;
+        let endpoints = ProviderEndpoints {
+            alchemy_rpc_template: format!("{}/rpc", server.base_url()),
+            ..ProviderEndpoints::default()
+        };
+        let client = HttpClient::with_retries(2, 0).unwrap();
+        let malformed = "0x3611b361f58d549a7b2fca5dac124d3e6630ae";
+        let activity = transfer(
+            "0xactivity",
+            "0x1111111111111111111111111111111111111111",
+            "0x2222222222222222222222222222222222222222",
+            false,
+            None,
+            Some(1),
+        );
+
+        let outcome = fetch_evm_value_flows(
+            &client,
+            &endpoints,
+            Some("key"),
+            "ethereum",
+            &[malformed.into()],
+            &[activity],
+            &[],
+        )
+        .await;
+
+        assert_eq!(outcome.status, EvidenceStatus::Empty);
+        assert_eq!(rpc.hits(), 0);
     }
 
     #[test]

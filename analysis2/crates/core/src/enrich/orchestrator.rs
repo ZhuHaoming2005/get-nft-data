@@ -800,8 +800,31 @@ async fn enrich_solana(
             }
         }
         if snapshot.status == EvidenceStatus::Empty {
+            // The Solana ingester intentionally stores an NFT without a
+            // collection as (contract_address=mint, token_id=mint). Such an
+            // asset has no collection grouping, so getAssetsByGroup is
+            // expected to be empty even though getAsset can prove it exists.
+            let direct = helius::fetch_assets_by_ids(
+                client,
+                &limits.endpoints.helius,
+                keys.helius(),
+                known_mints,
+                limits.max_solana_assets,
+            )
+            .await;
+            if matches!(
+                direct.status,
+                EvidenceStatus::Complete | EvidenceStatus::Truncated
+            ) && !direct.value.assets.is_empty()
+            {
+                snapshot = direct;
+            } else if let Some(failure) = direct.failure {
+                resolution_errors.push(failure);
+            }
+        }
+        if snapshot.status == EvidenceStatus::Empty {
             let mut detail = format!(
-                "resident collection has {} NFT mint(s), but Helius returned no assets for candidate {address} or resolved collection {collection}",
+                "resident collection has {} NFT mint(s), but Helius returned no grouped or direct assets for candidate {address} or resolved collection {collection}",
                 known_mints.len()
             );
             if !resolution_errors.is_empty() {

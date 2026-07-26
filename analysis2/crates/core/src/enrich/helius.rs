@@ -8,6 +8,7 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
+use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
@@ -42,6 +43,8 @@ pub struct SolanaAssetSnapshot {
     /// Collection updateAuthority (+ verified creators) extracted while paging assets.
     pub authority: Vec<String>,
 }
+
+type DirectAssetRow = Result<Option<(SolanaAsset, Vec<String>, bool)>, ()>;
 
 /// Resolve on-chain collection address for a mint via `getAsset`.
 pub async fn resolve_collection_address(
@@ -411,6 +414,113 @@ async fn fetch_collection_assets_with_visibility(
         "helius_assets"
     };
     FetchOutcome::ok(snapshot, count, truncated, "helius", request_key)
+}
+
+/// Recover resident singleton NFTs (or otherwise ungrouped assets) directly
+/// through DAS `getAsset` when `getAssetsByGroup` cannot enumerate them.
+///
+/// This outcome is always Truncated: the supplied ids prove those resident
+/// assets exist, but they cannot prove that the complete collection was
+/// enumerated.
+pub async fn fetch_assets_by_ids(
+    client: &HttpClient,
+    rpc_url: &str,
+    api_key: Option<&str>,
+    asset_ids: &[String],
+    max_assets: usize,
+) -> FetchOutcome<SolanaAssetSnapshot> {
+    let Some(api_key) = api_key else {
+        return FetchOutcome::skipped("helius_assets_by_id");
+    };
+    let unique_ids: Vec<String> = asset_ids
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| valid_solana_address(value))
+        .map(str::to_owned)
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    if unique_ids.is_empty() {
+        return FetchOutcome::ok(
+            SolanaAssetSnapshot::default(),
+            0,
+            false,
+            "helius",
+            "helius_assets_by_id",
+        );
+    }
+
+    let selected: Vec<String> = unique_ids.iter().take(max_assets.max(1)).cloned().collect();
+    let url = with_api_key(rpc_url, api_key);
+    let rows: Vec<DirectAssetRow> = stream::iter(selected.into_iter().map(|mint| {
+        let client = client.clone();
+        let url = url.clone();
+        async move {
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": format!("asset-{mint}"),
+                "method": "getAsset",
+                "params": {"id": mint}
+            });
+            let payload = client
+                .post_json_helius(&url, &[], &body)
+                .await
+                .map_err(|_| ())?;
+            if payload.get("error").is_some() {
+                return Err(());
+            }
+            let Some(result) = payload.get("result").filter(|value| !value.is_null()) else {
+                return Ok(None);
+            };
+            let asset = parse_asset(result).ok_or(())?;
+            let collection = parse_collection_address(result).unwrap_or_else(|| asset.mint.clone());
+            let authorities = solana_authorities_from_asset(result, result, &collection);
+            Ok(Some((asset, authorities, is_open_license_payload(result))))
+        }
+    }))
+    .buffer_unordered(32)
+    .collect()
+    .await;
+
+    let mut snapshot = SolanaAssetSnapshot::default();
+    let mut failures = 0usize;
+    for row in rows {
+        match row {
+            Ok(Some((asset, authorities, open_license))) => {
+                snapshot.assets.push(asset);
+                snapshot.authority.extend(authorities);
+                snapshot.open_license |= open_license;
+            }
+            Ok(None) => {}
+            Err(()) => failures += 1,
+        }
+    }
+    snapshot.authority.sort();
+    snapshot.authority.dedup();
+
+    if snapshot.assets.is_empty() && failures > 0 {
+        return FetchOutcome::failed(
+            "helius",
+            "helius_assets_by_id",
+            format!("{failures} getAsset request(s) failed"),
+        );
+    }
+
+    let count = snapshot.assets.len();
+    if count == 0 {
+        return FetchOutcome::ok(snapshot, 0, false, "helius", "helius_assets_by_id");
+    }
+
+    // Direct ids are positive existence evidence, not a complete collection
+    // listing. Preserve that distinction even when every supplied id resolved.
+    snapshot.truncated = true;
+    let mut outcome = FetchOutcome::ok(snapshot, count, true, "helius", "helius_assets_by_id");
+    if failures > 0 {
+        outcome.failure = Some(format!(
+            "helius_assets_by_id: recovered {count} asset(s), but {failures} getAsset request(s) failed"
+        ));
+    }
+    outcome
 }
 
 /// Bounded history via `getSignaturesForAsset` → transfer/sale stubs.
@@ -1767,6 +1877,49 @@ mod tests {
         assert_eq!(outcome.status, EvidenceStatus::Complete);
         assert_eq!(outcome.value.assets.len(), 1);
         assert_eq!(outcome.value.assets[0].mint, "resident-mint");
+    }
+
+    #[tokio::test]
+    async fn direct_asset_retry_recovers_singleton_without_collection_grouping() {
+        let server = MockServer::start_async().await;
+        let mint = "So11111111111111111111111111111111111111112";
+        let asset = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .body_contains("getAsset")
+                    .body_contains("So11111111111111111111111111111111111111112");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": "asset",
+                    "result": {
+                        "id": "So11111111111111111111111111111111111111112",
+                        "ownership": {"owner": "holder"},
+                        "compression": {"compressed": false},
+                        "grouping": [],
+                        "creators": [{
+                            "address": "creator",
+                            "verified": true
+                        }]
+                    }
+                }));
+            })
+            .await;
+        let client = HttpClient::with_retries(2, 0).unwrap();
+        let outcome = fetch_assets_by_ids(
+            &client,
+            &server.base_url(),
+            Some("key"),
+            &[mint.to_owned()],
+            10,
+        )
+        .await;
+
+        assert_eq!(asset.hits(), 1);
+        assert_eq!(outcome.status, EvidenceStatus::Truncated);
+        assert!(outcome.truncated);
+        assert_eq!(outcome.value.assets.len(), 1);
+        assert_eq!(outcome.value.assets[0].mint, mint);
+        assert_eq!(outcome.value.authority, vec!["creator"]);
     }
 
     #[tokio::test]

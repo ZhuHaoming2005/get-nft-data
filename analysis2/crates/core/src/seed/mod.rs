@@ -1,6 +1,6 @@
 //! Seed selection (`select-seeds`) and seed manifest writers.
 
-mod address;
+pub(crate) mod address;
 mod magic_eden;
 mod select;
 
