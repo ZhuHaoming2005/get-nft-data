@@ -1247,19 +1247,22 @@ pub struct ReceiptGas {
     pub fee_payer: Option<String>,
 }
 
+type ReceiptResult = Result<ReceiptGas, String>;
+type ReceiptRow = (String, ReceiptResult);
+
 #[derive(Default)]
 struct ReceiptCell {
-    value: AsyncMutex<Option<Result<ReceiptGas, String>>>,
+    value: AsyncMutex<Option<ReceiptResult>>,
     notify: Notify,
 }
 
 impl ReceiptCell {
-    async fn set(&self, value: Result<ReceiptGas, String>) {
+    async fn set(&self, value: ReceiptResult) {
         *self.value.lock().await = Some(value);
         self.notify.notify_waiters();
     }
 
-    async fn wait(&self) -> Result<ReceiptGas, String> {
+    async fn wait(&self) -> ReceiptResult {
         loop {
             let notified = self.notify.notified();
             if let Some(value) = self.value.lock().await.clone() {
@@ -1322,12 +1325,16 @@ impl ReceiptRequestCache {
             let leader_hashes: Vec<String> = leaders.iter().map(|(hash, _)| hash.clone()).collect();
             let fetched =
                 fetch_receipt_gas(client, endpoints, Some(api_key), chain, &leader_hashes).await;
+            let missing_reason = fetched
+                .failure
+                .clone()
+                .unwrap_or_else(|| "receipt unavailable without provider detail".to_owned());
             for (hash, cell) in leaders {
                 let result = fetched
                     .value
                     .get(&hash)
                     .cloned()
-                    .ok_or_else(|| "receipt unavailable".to_owned());
+                    .ok_or_else(|| missing_reason.clone());
                 cell.set(result).await;
             }
         }
@@ -1358,7 +1365,11 @@ impl ReceiptRequestCache {
             }
         }
         if receipts.is_empty() {
-            return FetchOutcome::failed("alchemy", "alchemy_receipts", failures.join("; "));
+            return FetchOutcome::failed(
+                "alchemy",
+                "alchemy_receipts",
+                summarize_receipt_failures("receipt cache", &failures, hashes.len()),
+            );
         }
         let truncated = receipts.len() < hashes.len();
         let mut outcome = FetchOutcome::ok(
@@ -1784,11 +1795,7 @@ pub async fn fetch_receipt_gas(
     let requested = tx_hashes.len();
     let succeeded = ok.len();
     if succeeded == 0 {
-        let detail = if failures.is_empty() {
-            "all receipt fetches failed".into()
-        } else {
-            failures.join("; ")
-        };
+        let detail = summarize_receipt_failures("receipt fetch", &failures, requested);
         return FetchOutcome::failed("alchemy", "alchemy_receipts", detail);
     }
     let truncated = succeeded < requested;
@@ -1809,7 +1816,7 @@ async fn fetch_receipt_gas_batch(
     rpc: &str,
     batch_idx: usize,
     hashes: &[String],
-) -> Vec<(String, Result<ReceiptGas, String>)> {
+) -> Vec<ReceiptRow> {
     if hashes.is_empty() {
         return Vec::new();
     }
@@ -1833,15 +1840,46 @@ async fn fetch_receipt_gas_batch(
             Ok(rows) => rows,
             Err(_) => fetch_receipt_gas_singles(client, rpc, batch_idx, hashes).await,
         },
+        Err(error) if super::http::is_rate_limited(&error) => hashes
+            .iter()
+            .cloned()
+            .map(|hash| (hash, Err(error.to_string())))
+            .collect(),
         Err(_) => fetch_receipt_gas_singles(client, rpc, batch_idx, hashes).await,
     }
+}
+
+fn summarize_receipt_failures(context: &str, failures: &[String], requested: usize) -> String {
+    if failures.is_empty() {
+        return format!("{context}: all {requested} receipt fetches failed without detail");
+    }
+    let examples = failures
+        .iter()
+        .take(3)
+        .map(|failure| {
+            const MAX_EXAMPLE_CHARS: usize = 320;
+            let mut chars = failure.chars();
+            let text = chars.by_ref().take(MAX_EXAMPLE_CHARS).collect::<String>();
+            if chars.next().is_some() {
+                format!("{text}…")
+            } else {
+                text
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    format!(
+        "{context}: {}/{} receipt fetches failed; examples: {examples}",
+        failures.len(),
+        requested
+    )
 }
 
 fn parse_receipt_batch_payload(
     payload: &Value,
     batch_idx: usize,
     hashes: &[String],
-) -> Result<Vec<(String, Result<ReceiptGas, String>)>, ()> {
+) -> Result<Vec<ReceiptRow>, ()> {
     let responses = payload.as_array().ok_or(())?;
     let mut by_id: AHashMap<String, &Value> = AHashMap::with_capacity(responses.len());
     for response in responses {
@@ -1895,7 +1933,7 @@ async fn fetch_receipt_gas_singles(
     rpc: &str,
     batch_idx: usize,
     hashes: &[String],
-) -> Vec<(String, Result<ReceiptGas, String>)> {
+) -> Vec<ReceiptRow> {
     let mut handles = Vec::with_capacity(hashes.len());
     for (i, hash) in hashes.iter().cloned().enumerate() {
         let client = client.clone();
@@ -1943,10 +1981,10 @@ pub fn attach_receipt_gas(
         if transfer.gas_native.is_none() {
             transfer.gas_native = info.gas_native;
         }
-        if transfer.fee_payer.is_none() {
-            if let Some(payer) = info.fee_payer.clone() {
-                transfer.fee_payer = Some(payer);
-            }
+        if transfer.fee_payer.is_none()
+            && let Some(payer) = info.fee_payer.clone()
+        {
+            transfer.fee_payer = Some(payer);
         }
     }
 }
@@ -2033,6 +2071,7 @@ fn parse_u128(value: Option<&Value>) -> Option<u128> {
 /// Fetch native EXTERNAL transfers for one address (`from` or `to`) in a block window.
 ///
 /// `to_block == u64::MAX` means `"latest"`. One page only (`maxCount`); pageKey ⇒ Truncated.
+#[allow(clippy::too_many_arguments)] // Mirrors the provider's directional block-window query.
 pub async fn fetch_external_transfers(
     client: &HttpClient,
     endpoints: &ProviderEndpoints,
@@ -2275,6 +2314,36 @@ mod receipt_gas_tests {
             assert_eq!(outcome.value.len(), 1);
         }
         assert_eq!(rpc.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn receipt_cache_preserves_rate_limit_without_single_request_fanout() {
+        let server = MockServer::start_async().await;
+        let rpc = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .path("/rpc")
+                    .body_contains("eth_getTransactionReceipt");
+                then.status(429).header("retry-after", "0");
+            })
+            .await;
+        let endpoints = ProviderEndpoints {
+            alchemy_rpc_template: format!("{}/rpc", server.base_url()),
+            ..ProviderEndpoints::default()
+        };
+        let client = HttpClient::with_retries(2, 0).unwrap();
+        let hashes = (0..10)
+            .map(|index| format!("0x{index:064x}"))
+            .collect::<Vec<_>>();
+        let outcome = ReceiptRequestCache::default()
+            .fetch(&client, &endpoints, Some("key"), "ethereum", &hashes)
+            .await;
+
+        assert_eq!(rpc.hits(), 1, "429 batch must not fan out into singles");
+        assert_eq!(outcome.status, EvidenceStatus::Failed);
+        let failure = outcome.failure.expect("rate-limit failure detail");
+        assert!(failure.contains("HTTP 429"));
+        assert!(failure.len() < 2_000, "failure summary must stay bounded");
     }
 
     #[test]

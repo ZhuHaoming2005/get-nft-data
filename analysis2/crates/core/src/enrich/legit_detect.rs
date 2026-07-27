@@ -379,6 +379,7 @@ fn continuity_signals(
     signals
 }
 
+#[allow(clippy::too_many_arguments)] // Relation probing combines two identities and shared provider context.
 async fn probe_relation(
     client: &HttpClient,
     keys: &ApiKeys,

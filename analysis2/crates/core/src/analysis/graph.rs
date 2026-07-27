@@ -33,10 +33,7 @@ impl AddressGraph {
         }))
     }
 
-    pub fn from_sales_filtered<'a>(
-        sales: &'a [SaleEvent],
-        include: impl Fn(&SaleEvent) -> bool,
-    ) -> Self {
+    pub fn from_sales_filtered(sales: &[SaleEvent], include: impl Fn(&SaleEvent) -> bool) -> Self {
         Self::build(
             sales
                 .iter()

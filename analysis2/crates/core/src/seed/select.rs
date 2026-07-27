@@ -587,7 +587,6 @@ mod tests {
             opensea_base_url: Some(base.clone()),
             magic_eden_base_url: Some(base.clone()),
             helius_base_url: Some(format!("{base}/")),
-            ..SelectSeedsOptions::default()
         })
         .await
         .unwrap();

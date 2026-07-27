@@ -505,6 +505,7 @@ pub fn query_name_for_seed_with_scratch(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)] // Hot path: grouping these borrowed scratch values adds no clarity.
 fn emit_for_query(
     store: &ResidentStore,
     seed: ContractId,

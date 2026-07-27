@@ -21,6 +21,7 @@ struct ShardAnchors {
 }
 
 impl ShardAnchors {
+    #[allow(clippy::too_many_arguments)] // Fields are moved directly into a bounded metadata record.
     fn insert(
         &mut self,
         chain: String,

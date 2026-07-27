@@ -20,6 +20,7 @@ pub const OPENSEA_RATE_LIMIT_BURST: usize = 4;
 pub const OPENSEA_RATE_LIMIT_REFILL_MS: u64 = 300;
 /// Shared cool-down applied to a provider bucket after HTTP 429 / rate-limit.
 pub const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(1);
+const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 struct TokenBucketState {
@@ -390,7 +391,7 @@ impl HttpClient {
                 "[api/miss] endpoint={endpoint} method={method} provider={} action=not_found",
                 lane.name
             );
-        } else {
+        } else if should_print_request_error(&final_error) {
             eprintln!(
                 "[api/error] endpoint={endpoint} method={method} provider={} action=give_up error={}",
                 lane.name,
@@ -419,7 +420,7 @@ impl HttpClient {
         // 5xx: start from 500ms (503 connection resets need more space than 100ms).
         let backoff = if will_retry {
             if rate_limited {
-                let delay = retry_after_from_error(&error).unwrap_or(RATE_LIMIT_COOLDOWN);
+                let delay = rate_limit_backoff(&error, attempt);
                 lane.limiter.note_rate_limited(delay);
                 Some(delay)
             } else if is_http_status(&error, 503)
@@ -437,8 +438,9 @@ impl HttpClient {
         } else {
             None
         };
-        // Skip per-attempt spam for permanent 404 (give_up path logs once).
-        if !not_found {
+        // Permanent 404 is logged once as api/miss. Rate limits are routine
+        // flow-control signals and remain silent at every logging layer.
+        if !not_found && should_print_request_error(&error) {
             print_request_error(
                 method,
                 endpoint,
@@ -556,6 +558,16 @@ fn retry_after_from_error(error: &Analysis2Error) -> Option<Duration> {
     Some(Duration::from_millis(milliseconds))
 }
 
+fn rate_limit_backoff(error: &Analysis2Error, attempt: usize) -> Duration {
+    let multiplier = 1u32 << attempt.min(5);
+    let adaptive = RATE_LIMIT_COOLDOWN
+        .saturating_mul(multiplier)
+        .min(MAX_RATE_LIMIT_COOLDOWN);
+    retry_after_from_error(error)
+        .unwrap_or(Duration::ZERO)
+        .max(adaptive)
+}
+
 fn format_transport_error(
     method: &reqwest::Method,
     endpoint: &str,
@@ -633,27 +645,38 @@ pub fn is_http_not_found(error: &Analysis2Error) -> bool {
 }
 
 /// Provider rate-limit signal: HTTP 429, transport status=429, or rate-limit text.
-fn is_rate_limited(error: &Analysis2Error) -> bool {
+pub(crate) fn is_rate_limited(error: &Analysis2Error) -> bool {
     match error {
-        Analysis2Error::Http(message) => {
-            if is_http_status(error, 429) {
-                return true;
-            }
-            let lower = message.to_ascii_lowercase();
-            lower.contains("too many requests")
-                || lower.contains("rate limit")
-                || lower.contains("rate-limit")
-                || lower.contains("ratelimited")
-                || lower.contains("\"code\":-32429")
-                || lower.contains("\"code\": 429")
-                || lower.contains("\"code\":429")
-        }
+        Analysis2Error::Http(message) => is_rate_limit_message(message),
         _ => false,
     }
 }
 
+fn is_rate_limit_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("http 429")
+        || lower.contains("status=429")
+        || lower.contains("too many requests")
+        || lower.contains("rate limit")
+        || lower.contains("rate-limit")
+        || lower.contains("ratelimited")
+        || lower.contains("\"code\":-32429")
+        || lower.contains("\"code\": -32429")
+        || lower.contains("\"code\": 429")
+        || lower.contains("\"code\":429")
+        || lower.contains("\"code\":-32005")
+        || lower.contains("\"code\": -32005")
+}
+
+fn should_print_request_error(error: &Analysis2Error) -> bool {
+    !is_rate_limited(error)
+}
+
 /// If a successful JSON-RPC payload is a rate-limit error, return a short body snippet.
 fn jsonrpc_rate_limit_error(value: &Value) -> Option<String> {
+    if let Some(rows) = value.as_array() {
+        return rows.iter().find_map(jsonrpc_rate_limit_error);
+    }
     let err = value.get("error")?;
     let code = err.get("code").and_then(|c| c.as_i64());
     let message = err
@@ -793,18 +816,18 @@ fn redact_path_secrets(endpoint: &str) -> String {
         } else {
             i + 1
         };
-        if let Some(next) = parts.get_mut(key_idx) {
-            if looks_like_api_key_segment(next) {
-                let trailing: String = next
-                    .chars()
-                    .rev()
-                    .take_while(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
-                    .collect::<String>()
-                    .chars()
-                    .rev()
-                    .collect();
-                *next = format!("***{trailing}");
-            }
+        if let Some(next) = parts.get_mut(key_idx)
+            && looks_like_api_key_segment(next)
+        {
+            let trailing: String = next
+                .chars()
+                .rev()
+                .take_while(|c| !c.is_ascii_alphanumeric() && *c != '-' && *c != '_')
+                .collect::<String>()
+                .chars()
+                .rev()
+                .collect();
+            *next = format!("***{trailing}");
         }
     }
     parts.join("/")
@@ -820,7 +843,7 @@ fn redact_sensitive_text(text: &str) -> String {
             let idx = search_from + rel;
             let start = idx + marker.len();
             let end = out[start..]
-                .find(|c: char| c == '&' || c == ' ' || c == '"' || c == '\'' || c == ')')
+                .find(['&', ' ', '"', '\'', ')'])
                 .map(|n| start + n)
                 .unwrap_or(out.len());
             out.replace_range(start..end, "***");
@@ -843,6 +866,9 @@ fn one_line_error(message: &str, max_chars: usize) -> String {
 
 /// Print a provider-layer failure (non-HTTP transport already logged above).
 pub fn print_provider_error(source: &str, request_key: &str, error: &str) {
+    if is_rate_limit_message(error) {
+        return;
+    }
     eprintln!(
         "[api/error] source={source} request_key={request_key} error={}",
         one_line_error(&redact_sensitive_text(error), ERROR_LOG_CHARS)
@@ -912,6 +938,16 @@ mod tests {
         let error =
             Analysis2Error::http("HTTP 429 endpoint=example.test retry_after_ms=7000 body=limited");
         assert_eq!(retry_after_from_error(&error), Some(Duration::from_secs(7)));
+        assert_eq!(rate_limit_backoff(&error, 0), Duration::from_secs(7));
+    }
+
+    #[test]
+    fn rate_limit_backoff_grows_and_is_capped() {
+        let error = Analysis2Error::http("HTTP 429 endpoint=example.test");
+        assert_eq!(rate_limit_backoff(&error, 0), Duration::from_secs(1));
+        assert_eq!(rate_limit_backoff(&error, 1), Duration::from_secs(2));
+        assert_eq!(rate_limit_backoff(&error, 4), Duration::from_secs(16));
+        assert_eq!(rate_limit_backoff(&error, 8), Duration::from_secs(30));
     }
 
     #[tokio::test]
@@ -984,7 +1020,7 @@ mod tests {
     }
 
     #[test]
-    fn http_429_is_detected_for_fixed_backoff() {
+    fn http_429_is_detected_for_adaptive_backoff() {
         let err = Analysis2Error::http(
             "HTTP 429 Too Many Requests endpoint=example.com/ content_type=application/json body=rate limited",
         );
@@ -1007,8 +1043,29 @@ mod tests {
             "error": { "code": -32429, "message": "rate limited" }
         });
         assert!(jsonrpc_rate_limit_error(&payload).is_some());
+        let batch = serde_json::json!([
+            {"jsonrpc":"2.0","id":"1","result":{}},
+            {"jsonrpc":"2.0","id":"2","error":{"code":-32005,"message":"rate limited"}}
+        ]);
+        assert!(jsonrpc_rate_limit_error(&batch).is_some());
         let ok = serde_json::json!({"jsonrpc":"2.0","id":"1","result":{}});
         assert!(jsonrpc_rate_limit_error(&ok).is_none());
+    }
+
+    #[test]
+    fn rate_limit_errors_are_silent_at_request_and_provider_layers() {
+        for message in [
+            "HTTP 429 Too Many Requests endpoint=example.test",
+            "transport error status=429",
+            "JSON-RPC error {\"code\":-32005,\"message\":\"rate limited\"}",
+        ] {
+            let error = Analysis2Error::http(message);
+            assert!(!should_print_request_error(&error));
+            assert!(is_rate_limit_message(message));
+        }
+        let error = Analysis2Error::http("HTTP 500 endpoint=example.test");
+        assert!(should_print_request_error(&error));
+        assert!(!is_rate_limit_message(&error.to_string()));
     }
 
     #[tokio::test]

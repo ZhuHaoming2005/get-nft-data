@@ -155,13 +155,12 @@ pub fn detect_behaviors(
         let buyer = normalize_chain_address(&evidence.chain, &sale.buyer);
         if let (Some(&left), Some(&right)) =
             (wash_by_address.get(&seller), wash_by_address.get(&buyer))
+            && left == right
         {
-            if left == right {
-                let values = &mut cycle_values[left];
-                values.end = [values.end, sale.timestamp].into_iter().flatten().max();
-                add_value(values, sale, ValueSide::Internal);
-                values.internal_events.push(event_index);
-            }
+            let values = &mut cycle_values[left];
+            values.end = [values.end, sale.timestamp].into_iter().flatten().max();
+            add_value(values, sale, ValueSide::Internal);
+            values.internal_events.push(event_index);
         }
     }
     for (event_index, sale) in evidence.sales.iter().enumerate() {
@@ -864,9 +863,9 @@ fn inventory_instances(
                 instance_from_prop_events(BehaviorKind::InventoryConcentration, evidence, selected);
             let sources = selected
                 .iter()
-                .filter_map(|event| match event {
-                    PropEvent::Transfer(index) => Some(evidence.transfers[*index].from.as_str()),
-                    PropEvent::Sale(index) => Some(evidence.sales[*index].seller.as_str()),
+                .map(|event| match event {
+                    PropEvent::Transfer(index) => evidence.transfers[*index].from.as_str(),
+                    PropEvent::Sale(index) => evidence.sales[*index].seller.as_str(),
                 })
                 .collect::<BTreeSet<_>>();
             instance.source_address_count = Some(sources.len() as u64);

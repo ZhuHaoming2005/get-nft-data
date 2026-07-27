@@ -383,13 +383,13 @@ async fn fetch_collection_assets_with_visibility(
                     snapshot.authority = authorities;
                 }
             }
-            if let Some(asset) = parse_asset(item) {
-                if seen_mints.insert(asset.mint.clone()) {
-                    snapshot.assets.push(asset);
-                    if snapshot.assets.len() >= max_assets {
-                        snapshot.truncated = true;
-                        break;
-                    }
+            if let Some(asset) = parse_asset(item)
+                && seen_mints.insert(asset.mint.clone())
+            {
+                snapshot.assets.push(asset);
+                if snapshot.assets.len() >= max_assets {
+                    snapshot.truncated = true;
+                    break;
                 }
             }
         }
@@ -397,10 +397,10 @@ async fn fetch_collection_assets_with_visibility(
             break;
         }
         page += 1;
-        if let Some(total) = snapshot.total {
-            if snapshot.assets.len() >= total {
-                break;
-            }
+        if let Some(total) = snapshot.total
+            && snapshot.assets.len() >= total
+        {
+            break;
         }
     }
 
@@ -834,17 +834,20 @@ fn parse_asset_history(asset: &SolanaAsset, payload: &Value, max_sigs: usize) ->
 
 #[derive(Default)]
 struct TransactionCell {
-    value: AsyncMutex<Option<Result<Option<Value>, String>>>,
+    value: AsyncMutex<Option<TransactionResult>>,
     notify: Notify,
 }
 
+type TransactionResult = Result<Option<Value>, String>;
+type TransactionRow = (String, TransactionResult);
+
 impl TransactionCell {
-    async fn set(&self, value: Result<Option<Value>, String>) {
+    async fn set(&self, value: TransactionResult) {
         *self.value.lock().await = Some(value);
         self.notify.notify_waiters();
     }
 
-    async fn wait(&self) -> Result<Option<Value>, String> {
+    async fn wait(&self) -> TransactionResult {
         loop {
             let notified = self.notify.notified();
             if let Some(value) = self.value.lock().await.clone() {
@@ -870,7 +873,7 @@ impl TransactionRequestCache {
         client: &HttpClient,
         url: &str,
         signatures: &[String],
-    ) -> Vec<(String, Result<Option<Value>, String>)> {
+    ) -> Vec<TransactionRow> {
         const TX_RPC_BATCH_SIZE: usize = 100;
         let mut rows = Vec::with_capacity(signatures.len());
         let mut leaders = Vec::new();
@@ -1235,7 +1238,7 @@ async fn fetch_transactions_batch(
     url: &str,
     batch_idx: usize,
     signatures: &[String],
-) -> Vec<(String, Result<Option<Value>, String>)> {
+) -> Vec<TransactionRow> {
     if signatures.is_empty() {
         return Vec::new();
     }
@@ -1266,7 +1269,7 @@ fn parse_transaction_batch_payload(
     payload: &Value,
     batch_idx: usize,
     signatures: &[String],
-) -> Result<Vec<(String, Result<Option<Value>, String>)>, ()> {
+) -> Result<Vec<TransactionRow>, ()> {
     let responses = payload.as_array().ok_or(())?;
     let mut by_id: AHashMap<String, &Value> = AHashMap::with_capacity(responses.len());
     for response in responses {
@@ -1306,7 +1309,7 @@ async fn fetch_transactions_singles(
     url: &str,
     batch_idx: usize,
     signatures: &[String],
-) -> Vec<(String, Result<Option<Value>, String>)> {
+) -> Vec<TransactionRow> {
     let mut handles = Vec::with_capacity(signatures.len());
     for (i, signature) in signatures.iter().cloned().enumerate() {
         let client = client.clone();

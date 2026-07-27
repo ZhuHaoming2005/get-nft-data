@@ -647,6 +647,9 @@ fn parse_relation_key(key: &str) -> Option<(String, String)> {
     Some(normalized_relation_key(chain, address))
 }
 
+type RelationIdentity = (String, String);
+type ExpectedRelations = AHashMap<ContractId, Vec<(String, RelationIdentity)>>;
+
 /// Reuse candidate-scoped HTTP evidence while aligning seed-scoped legitimacy
 /// results to the current registry.
 fn reconcile_cached_relation_legit(
@@ -654,7 +657,7 @@ fn reconcile_cached_relation_legit(
     registry: &CandidateRegistry,
     store: &ResidentStore,
 ) -> AHashSet<ContractId> {
-    let mut expected: AHashMap<ContractId, Vec<(String, (String, String))>> = AHashMap::new();
+    let mut expected = ExpectedRelations::new();
     for relation in registry.relations() {
         let seed = &store.contracts[relation.seed_contract as usize];
         let chain = store.chain_name(seed.chain_id);

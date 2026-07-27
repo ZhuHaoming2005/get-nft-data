@@ -486,6 +486,7 @@ pub fn attribute_addresses(
     AttributionResult { roles, records }
 }
 
+#[allow(clippy::too_many_arguments)] // Keeps each role-evidence call explicit at the call site.
 fn push_evidence(
     evidence: &mut BTreeMap<String, Vec<AddressEvidence>>,
     chain: &str,

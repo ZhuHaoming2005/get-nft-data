@@ -208,11 +208,13 @@ pub fn validate_dedup_cache(
     Ok(())
 }
 
+type RematerializedDedupBatch = (Vec<(SeedRecord, ContractId, HitGraph)>, Vec<FailureRecord>);
+
 /// Rematerialize in-memory seed hit graphs from a validated cache.
 pub fn rematerialize_dedup_batch(
     store: &ResidentStore,
     cache: &DedupCacheFile,
-) -> Result<(Vec<(SeedRecord, ContractId, HitGraph)>, Vec<FailureRecord>), Analysis2Error> {
+) -> Result<RematerializedDedupBatch, Analysis2Error> {
     let mut completed = Vec::with_capacity(cache.completed.len());
     for entry in &cache.completed {
         let seed_id = store

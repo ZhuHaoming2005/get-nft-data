@@ -1489,6 +1489,7 @@ struct BehaviorAgg {
 ///
 /// Layout: `intermediate/` (manifest, failures), `detail/` (seeds + candidates),
 /// `summary/` (intra_chain / chain_matrix / cross_chain / all_chains).
+#[allow(clippy::too_many_arguments)] // Top-level writer receives each already-built report component.
 pub fn write_run_outputs(
     output_dir: &Path,
     params: &DedupRunParams,
@@ -1873,6 +1874,7 @@ mod tests {
         assert!(summary["wash_cycle_size_distribution"].as_array().is_some());
     }
 
+    #[allow(clippy::too_many_arguments)] // Compact test fixture builder.
     fn formal_seed_sharing_candidate(
         seed_chain: &str,
         seed_addr: &str,

@@ -129,10 +129,10 @@ pub fn attach_mint_payments(
         ) {
             observations.push((existing, receiver));
         }
-        if let Some((extra, receiver)) = extra_native_by_payer_tx.get(&key) {
-            if *extra > 0.0 {
-                observations.push((*extra, receiver.clone()));
-            }
+        if let Some((extra, receiver)) = extra_native_by_payer_tx.get(&key)
+            && *extra > 0.0
+        {
+            observations.push((*extra, receiver.clone()));
         }
         let selected = observations.into_iter().max_by(|left, right| {
             left.0

@@ -1,9 +1,7 @@
 //! Interned string pool backed by a single owned copy per unique string.
 
-use ahash::{AHashMap, RandomState};
-use std::hash::{BuildHasher, Hash, Hasher};
-
 use super::ids::StringId;
+use ahash::{AHashMap, RandomState};
 
 /// Fixed-seed hasher so lookup/intern agree for the process lifetime.
 fn hash_str(s: &str) -> u64 {
@@ -14,9 +12,7 @@ fn hash_str(s: &str) -> u64 {
         0x1122_3344_5566_7788,
         0x99AA_BBCC_DDEE_FF00,
     );
-    let mut hasher = state.build_hasher();
-    s.hash(&mut hasher);
-    hasher.finish()
+    state.hash_one(s)
 }
 
 /// Global intern table for names, URIs, and other repeated strings.

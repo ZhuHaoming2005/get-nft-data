@@ -292,6 +292,7 @@ fn intersect_token_hit_scopes(
     }
 }
 
+#[allow(clippy::too_many_arguments)] // Hot path with optional borrowed output accumulators.
 fn emit_uri_hits(
     store: &ResidentStore,
     seed: ContractId,
@@ -309,40 +310,38 @@ fn emit_uri_hits(
     let excluded = |scope: UriScope| exclude_candidates.and_then(|m| m.get(&scope));
 
     // Intra-chain: URI on ≥2 distinct contracts (after optional token-hit exclusion).
-    if !skip(UriScope::Intra) {
-        if let Some(primary_members) = by_chain.get(seed_chain as usize) {
-            let excl = excluded(UriScope::Intra);
-            if has_seed_and_other_contract(store, primary_members, excl, seed) {
-                let mut any = false;
-                for &nft_id in primary_members {
-                    if excl.is_some_and(|s| s.contains(&nft_id)) {
-                        continue;
-                    }
-                    let cand = store.nfts[nft_id as usize].contract_id;
-                    if cand == seed {
-                        continue;
-                    }
-                    if graph.push(HitEdge {
-                        seed_contract: seed,
-                        candidate_contract: cand,
-                        candidate_nft: Some(nft_id),
-                        dimension,
-                        score: 1.0,
-                        primary_chain: seed_chain,
-                        secondary_chain: seed_chain,
-                    }) {
-                        if let Some(out) = hit_candidates_out.as_deref_mut() {
-                            out.entry(UriScope::Intra).or_default().insert(nft_id);
-                        }
-                        any = true;
-                    }
+    if !skip(UriScope::Intra)
+        && let Some(primary_members) = by_chain.get(seed_chain as usize)
+    {
+        let excl = excluded(UriScope::Intra);
+        if has_seed_and_other_contract(store, primary_members, excl, seed) {
+            let mut any = false;
+            for &nft_id in primary_members {
+                if excl.is_some_and(|s| s.contains(&nft_id)) {
+                    continue;
                 }
-                if any {
-                    if let Some(out) = hit_scopes_out.as_deref_mut() {
-                        for &seed_nft in seed_nfts {
-                            out.entry(seed_nft).or_default().insert(UriScope::Intra);
-                        }
+                let cand = store.nfts[nft_id as usize].contract_id;
+                if cand == seed {
+                    continue;
+                }
+                if graph.push(HitEdge {
+                    seed_contract: seed,
+                    candidate_contract: cand,
+                    candidate_nft: Some(nft_id),
+                    dimension,
+                    score: 1.0,
+                    primary_chain: seed_chain,
+                    secondary_chain: seed_chain,
+                }) {
+                    if let Some(out) = hit_candidates_out.as_deref_mut() {
+                        out.entry(UriScope::Intra).or_default().insert(nft_id);
                     }
+                    any = true;
+                }
+            }
+            if any && let Some(out) = hit_scopes_out.as_deref_mut() {
+                for &seed_nft in seed_nfts {
+                    out.entry(seed_nft).or_default().insert(UriScope::Intra);
                 }
             }
         }
@@ -407,11 +406,9 @@ fn emit_uri_hits(
                 any = true;
             }
         }
-        if any {
-            if let Some(out) = hit_scopes_out.as_deref_mut() {
-                for &seed_nft in seed_nfts {
-                    out.entry(seed_nft).or_default().insert(scope);
-                }
+        if any && let Some(out) = hit_scopes_out.as_deref_mut() {
+            for &seed_nft in seed_nfts {
+                out.entry(seed_nft).or_default().insert(scope);
             }
         }
     }

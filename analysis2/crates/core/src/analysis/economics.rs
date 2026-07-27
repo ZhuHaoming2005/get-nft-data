@@ -496,31 +496,31 @@ pub fn compute_economics(
                 }
             }
         }
-        if gas_usable(evidence.quality.gas) {
-            if let Some(gas) = transfer.gas_native.filter(|value| *value > 0.0) {
-                let payer = transfer
-                    .fee_payer
-                    .as_deref()
-                    .unwrap_or(if transfer.is_mint {
-                        transfer.to.as_str()
-                    } else {
-                        transfer.from.as_str()
-                    });
-                let payer = normalize_chain_address(&evidence.chain, payer);
-                if operators.contains(&payer) {
-                    let native_entry = gas_native_by_tx
-                        .entry(transfer.tx_hash.clone())
-                        .or_insert(0.0);
-                    *native_entry = native_entry.max(gas);
-                    let stage = GasStage::Lure;
-                    let entry = gas_by_tx
-                        .entry(transfer.tx_hash.clone())
-                        .or_insert((stage, 0.0));
-                    if stage > entry.0 {
-                        entry.0 = stage;
-                    }
-                    entry.1 = entry.1.max(gas);
+        if gas_usable(evidence.quality.gas)
+            && let Some(gas) = transfer.gas_native.filter(|value| *value > 0.0)
+        {
+            let payer = transfer
+                .fee_payer
+                .as_deref()
+                .unwrap_or(if transfer.is_mint {
+                    transfer.to.as_str()
+                } else {
+                    transfer.from.as_str()
+                });
+            let payer = normalize_chain_address(&evidence.chain, payer);
+            if operators.contains(&payer) {
+                let native_entry = gas_native_by_tx
+                    .entry(transfer.tx_hash.clone())
+                    .or_insert(0.0);
+                *native_entry = native_entry.max(gas);
+                let stage = GasStage::Lure;
+                let entry = gas_by_tx
+                    .entry(transfer.tx_hash.clone())
+                    .or_insert((stage, 0.0));
+                if stage > entry.0 {
+                    entry.0 = stage;
                 }
+                entry.1 = entry.1.max(gas);
             }
         }
     }

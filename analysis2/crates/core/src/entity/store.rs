@@ -162,6 +162,7 @@ impl ResidentStore {
     }
 
     /// Zero intermediate-`IdentityRow` ingest: intern from borrowed field slices.
+    #[allow(clippy::too_many_arguments)] // Avoids constructing an owned row in the zero-copy scan path.
     pub fn ingest_identity_strs(
         &mut self,
         chain: &str,

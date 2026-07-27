@@ -28,6 +28,8 @@ use super::value_flow;
 /// a large multiplier with high `--http-concurrency` causes mass timeouts.
 const CANDIDATE_TASK_MULTIPLIER: usize = 2;
 
+type BundleHook<'a> = dyn FnMut(&EvidenceBundle) -> Result<(), Analysis2Error> + 'a;
+
 /// Enrich each unique candidate once; missing keys → `not_requested`, continue.
 pub async fn enrich_candidates(
     registry: &CandidateRegistry,
@@ -47,7 +49,7 @@ pub async fn enrich_candidates_with_hook(
     keys: &ApiKeys,
     limits: &HttpLimits,
     progress: &dyn ProgressObserver,
-    mut on_bundle: Option<&mut dyn FnMut(&EvidenceBundle) -> Result<(), Analysis2Error>>,
+    mut on_bundle: Option<&mut BundleHook<'_>>,
 ) -> Result<AHashMap<ContractId, EvidenceBundle>, Analysis2Error> {
     let client = HttpClient::with_retries(limits.concurrency.max(1), limits.retries)?;
     progress.set_stage("enrich_legit");
