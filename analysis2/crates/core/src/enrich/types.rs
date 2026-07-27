@@ -260,6 +260,11 @@ pub struct EvidenceBundle {
     pub transfers: Vec<TransferEvent>,
     pub sales: Vec<SaleEvent>,
     pub holders: Vec<HolderRecord>,
+    /// Current NFT/token-id population for the whole candidate contract.
+    /// Present only when the provider completed the same collection/holder
+    /// universe used by holder-based stuck-NFT attribution.
+    pub collection_nft_count: Option<u64>,
+    pub collection_nft_count_complete: bool,
     pub prices: Vec<PriceBucket>,
     /// Native funding / withdrawal / cashout edges (populated by enrich E2–E4).
     pub value_flows: Vec<ValueFlowEdge>,
@@ -294,6 +299,8 @@ impl EvidenceBundle {
             transfers: Vec::new(),
             sales: Vec::new(),
             holders: Vec::new(),
+            collection_nft_count: None,
+            collection_nft_count_complete: false,
             prices: Vec::new(),
             value_flows: Vec::new(),
             quality: EvidenceQuality::default(),

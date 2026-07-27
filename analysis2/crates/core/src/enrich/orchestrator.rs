@@ -504,6 +504,26 @@ async fn enrich_evm(
         &mut bundle.quality.failures,
         &holders,
     );
+    let holder_population_complete = matches!(
+        holders.status,
+        EvidenceStatus::Complete | EvidenceStatus::Empty
+    ) && !holders.truncated
+        && holders
+            .value
+            .iter()
+            .all(|holder| !holder.token_id.trim().is_empty());
+    if holder_population_complete {
+        bundle.collection_nft_count = Some(
+            holders
+                .value
+                .iter()
+                .filter(|holder| holder.balance.is_none_or(|balance| balance > 0))
+                .map(|holder| holder.token_id.as_str())
+                .collect::<std::collections::BTreeSet<_>>()
+                .len() as u64,
+        );
+        bundle.collection_nft_count_complete = true;
+    }
     bundle.holders = holders.value;
 
     apply_outcome(
@@ -835,6 +855,20 @@ async fn enrich_solana(
         }
     }
 
+    let asset_population_complete = matches!(
+        snapshot.status,
+        EvidenceStatus::Complete | EvidenceStatus::Empty
+    ) && !snapshot.truncated
+        && snapshot
+            .value
+            .total
+            .is_none_or(|total| total <= snapshot.value.assets.len());
+    if asset_population_complete {
+        bundle.collection_nft_count =
+            Some(snapshot.value.total.unwrap_or(snapshot.value.assets.len()) as u64);
+        bundle.collection_nft_count_complete = true;
+    }
+
     let holders = holders_from_assets(&snapshot.value.assets);
     let holder_status = match snapshot.status {
         EvidenceStatus::NotRequested => EvidenceStatus::NotRequested,
@@ -921,6 +955,9 @@ async fn enrich_solana(
     }
     bundle.holders = holders;
 
+    if let Some(failure) = history.failure.clone() {
+        bundle.quality.failures.push(failure);
+    }
     match history.status {
         EvidenceStatus::NotRequested => {
             bundle.quality.histories = EvidenceStatus::NotRequested;
@@ -931,9 +968,6 @@ async fn enrich_solana(
             bundle.quality.histories = EvidenceStatus::Failed;
             bundle.quality.transfers = EvidenceStatus::Failed;
             bundle.quality.sales = EvidenceStatus::Failed;
-            if let Some(failure) = history.failure {
-                bundle.quality.failures.push(failure);
-            }
         }
         _ => {
             // Asset/signature page caps, or decode incomplete → Truncated.

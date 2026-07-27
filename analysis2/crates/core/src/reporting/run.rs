@@ -98,6 +98,8 @@ pub struct SeedAnalysisRollup {
     pub infringing_nft_count: u64,
     pub malicious_address_count: u64,
     pub honest_address_count: u64,
+    #[serde(default)]
+    pub overlapping_role_address_count: u64,
     pub economics_usd: EconomicsUsdRollup,
     pub candidate_refs: Vec<CandidateRef>,
 }
@@ -507,6 +509,8 @@ pub fn build_seed_analysis_rollup(
     >::new();
     let mut gas_events = AHashMap::<(String, String), (GasStage, f64)>::new();
     let mut economic_events = AHashMap::<EconomicEventKey, f64>::new();
+    let mut ratio_gas_events = AHashMap::<(String, String), f64>::new();
+    let mut ratio_economic_events = AHashMap::<EconomicEventKey, f64>::new();
     let mut refs = Vec::new();
     let mut all_ok = true;
 
@@ -534,6 +538,9 @@ pub fn build_seed_analysis_rollup(
             }
             merge_usd(&mut economics, &economics_usd_from(&analysis.economics));
             collect_economic_events(&mut economic_events, analysis);
+            if analysis.economics.output_input_ratio_is_usd {
+                collect_economic_events(&mut ratio_economic_events, analysis);
+            }
             for contribution in &analysis.economics.value_flow_contributions {
                 let event_key = (
                     analysis.chain.trim().to_ascii_lowercase(),
@@ -563,12 +570,18 @@ pub fn build_seed_analysis_rollup(
                     normalize_chain_transaction(&analysis.chain, &contribution.tx_hash),
                 );
                 gas_events
-                    .entry(event_key)
+                    .entry(event_key.clone())
                     .and_modify(|(stage, usd)| {
                         *stage = (*stage).max(contribution.stage);
                         *usd = (*usd).max(contribution.usd);
                     })
                     .or_insert((contribution.stage, contribution.usd));
+                if analysis.economics.output_input_ratio_is_usd {
+                    ratio_gas_events
+                        .entry(event_key)
+                        .and_modify(|usd| *usd = (*usd).max(contribution.usd))
+                        .or_insert(contribution.usd);
+                }
             }
         }
         let path = format!(
@@ -583,6 +596,12 @@ pub fn build_seed_analysis_rollup(
         });
     }
     apply_deduped_economic_events(&mut economics, economic_events);
+    if economics.output_input_ratio_count > 0 {
+        let mut ratio_economics = EconomicsUsdRollup::default();
+        apply_deduped_economic_events(&mut ratio_economics, ratio_economic_events);
+        economics.ratio_operator_output_usd = ratio_economics.operator_output_usd;
+        economics.ratio_attacker_input_usd = ratio_gas_events.into_values().sum();
+    }
     if !value_flow_events.is_empty() {
         economics.funding_usd = 0.0;
         economics.revenue_backflow_usd = 0.0;
@@ -635,6 +654,9 @@ pub fn build_seed_analysis_rollup(
         }
     }
 
+    let overlapping_role_address_count = malicious.intersection(&honest).count() as u64;
+    let honest_only_count = honest.difference(&malicious).count() as u64;
+
     (
         SeedAnalysisRollup {
             analyzed_candidate_count: analyzed,
@@ -642,7 +664,8 @@ pub fn build_seed_analysis_rollup(
             legit_duplicate_contract_count: legit,
             infringing_nft_count: infringing_nfts,
             malicious_address_count: malicious.len() as u64,
-            honest_address_count: honest.len() as u64,
+            honest_address_count: honest_only_count,
+            overlapping_role_address_count,
             economics_usd: economics,
             candidate_refs: refs,
         },
@@ -825,20 +848,24 @@ fn build_run_summary_for_scope_with_store(
         .sum();
     let infringing_nfts = infringing_nft_ids.len() as u64 + infringing_fallback;
     let mut hit_contract_nft_count = 0u64;
-    let mut hit_contract_nft_count_complete = store.is_some();
+    let mut hit_contract_nft_count_complete = true;
     for key in &suspected {
         let state = &candidates[key];
         let fallback = (state.all_nfts.len() as u64).max(state.fallback_nft_count);
+        let analysis = analysis_by_key.get(key);
+        let provider_count = analysis
+            .filter(|analysis| analysis.collection_nft_count_complete)
+            .and_then(|analysis| analysis.collection_nft_count);
         let resident_count = store.and_then(|resident| {
-            let analysis = analysis_by_key.get(key)?;
+            let analysis = analysis?;
             resident
                 .contracts
                 .get(analysis.contract_id as usize)
                 .map(|contract| contract.nft_count)
         });
-        let count = resident_count.unwrap_or_else(|| {
+        let count = provider_count.unwrap_or_else(|| {
             hit_contract_nft_count_complete = false;
-            fallback
+            resident_count.unwrap_or(fallback)
         });
         if count < fallback {
             hit_contract_nft_count_complete = false;
@@ -875,6 +902,8 @@ fn build_run_summary_for_scope_with_store(
     >::new();
     let mut gas_usd_by_tx = AHashMap::<(String, String), (GasStage, f64, String)>::new();
     let mut economic_usd_by_event = AHashMap::<EconomicEventKey, f64>::new();
+    let mut ratio_gas_usd_by_tx = AHashMap::<(String, String), f64>::new();
+    let mut ratio_economic_usd_by_event = AHashMap::<EconomicEventKey, f64>::new();
     let mut evidence_statuses: BTreeMap<&'static str, [u64; 5]> = [
         "transfers",
         "sales",
@@ -899,6 +928,9 @@ fn build_run_summary_for_scope_with_store(
         let econ = economics_usd_from(&analysis.economics);
         merge_usd(&mut economics, &econ);
         collect_economic_events(&mut economic_usd_by_event, analysis);
+        if analysis.economics.output_input_ratio_is_usd {
+            collect_economic_events(&mut ratio_economic_usd_by_event, analysis);
+        }
         gas_by_contract.push((
             key.clone(),
             analysis.economics.attacker_input_usd.unwrap_or(0.0),
@@ -932,7 +964,7 @@ fn build_run_summary_for_scope_with_store(
                 normalize_chain_transaction(&analysis.chain, &contribution.tx_hash),
             );
             gas_usd_by_tx
-                .entry(tx_key)
+                .entry(tx_key.clone())
                 .and_modify(|(stage, usd, owner)| {
                     *stage = (*stage).max(contribution.stage);
                     *usd = (*usd).max(contribution.usd);
@@ -941,6 +973,12 @@ fn build_run_summary_for_scope_with_store(
                     }
                 })
                 .or_insert((contribution.stage, contribution.usd, key.clone()));
+            if analysis.economics.output_input_ratio_is_usd {
+                ratio_gas_usd_by_tx
+                    .entry(tx_key)
+                    .and_modify(|usd| *usd = (*usd).max(contribution.usd))
+                    .or_insert(contribution.usd);
+            }
         }
 
         for (name, status) in [
@@ -1030,6 +1068,12 @@ fn build_run_summary_for_scope_with_store(
     // Run-level totals deduplicate the same on-chain transaction contribution
     // when it was relevant to more than one candidate.
     apply_deduped_economic_events(&mut economics, economic_usd_by_event);
+    if economics.output_input_ratio_count > 0 {
+        let mut ratio_economics = EconomicsUsdRollup::default();
+        apply_deduped_economic_events(&mut ratio_economics, ratio_economic_usd_by_event);
+        economics.ratio_operator_output_usd = ratio_economics.operator_output_usd;
+        economics.ratio_attacker_input_usd = ratio_gas_usd_by_tx.into_values().sum();
+    }
     if !value_flow_usd_by_event.is_empty() {
         economics.funding_usd = 0.0;
         economics.revenue_backflow_usd = 0.0;
@@ -1121,6 +1165,8 @@ fn build_run_summary_for_scope_with_store(
     let gas_concentration = (gas_total > 0.0 && economics.unpriced_gas_cost_contract_count == 0)
         .then_some(top_gas / gas_total);
 
+    let overlapping_role_address_count = malicious_addrs.intersection(&honest_addrs).count() as u64;
+    let honest_only_address_count = honest_addrs.difference(&malicious_addrs).count() as u64;
     let repeat_malicious = addr_to_suspect_contracts
         .values()
         .filter(|contracts| contracts.len() >= 2)
@@ -1214,10 +1260,13 @@ fn build_run_summary_for_scope_with_store(
         && operator_output_pricing_complete
         && operator_output_attribution_complete;
     let usd_valuation_complete = required_evidence_complete && observed_usd_pricing_complete;
-    let ratio_sample_complete =
+    let ratio_candidate_coverage_complete =
         suspected_n > 0 && economics.output_input_ratio_count == suspected_n;
-    let stuck_nft_ratio_valid =
-        hit_contract_nft_count > 0 && economics.stuck_nft_count <= hit_contract_nft_count;
+    let ratio_evidence_complete = ratio_candidate_coverage_complete && operator_output_complete;
+    let ratio_sample_complete = ratio_evidence_complete;
+    let stuck_nft_ratio_valid = hit_contract_nft_count_complete
+        && hit_contract_nft_count > 0
+        && economics.stuck_nft_count <= hit_contract_nft_count;
     let mut economics_json = json!({
         "operator_output_usd": economics.operator_output_usd,
         "honest_paid_exposure_usd": economics.honest_loss_usd,
@@ -1284,6 +1333,18 @@ fn build_run_summary_for_scope_with_store(
             json!(economics.output_input_ratio_count),
         );
         object.insert("ratio_sample_complete".into(), json!(ratio_sample_complete));
+        object.insert(
+            "ratio_candidate_coverage_complete".into(),
+            json!(ratio_candidate_coverage_complete),
+        );
+        object.insert(
+            "ratio_evidence_complete".into(),
+            json!(ratio_evidence_complete),
+        );
+        object.insert(
+            "ratio_is_observed_only".into(),
+            json!(economics.output_input_ratio_count > 0 && !ratio_evidence_complete),
+        );
         object.insert(
             "evidence_coverage_complete".into(),
             json!(required_evidence_complete),
@@ -1376,7 +1437,8 @@ fn build_run_summary_for_scope_with_store(
         "address_classification": {
             "malicious_address_count": malicious_addrs.len() as u64,
             "repeat_infringing_malicious_address_count": repeat_malicious,
-            "honest_address_count": honest_addrs.len() as u64,
+            "honest_address_count": honest_only_address_count,
+            "overlapping_role_address_count": overlapping_role_address_count,
             "total_address_count": total_address_count,
         },
         "behaviors": behaviors,
@@ -1708,6 +1770,8 @@ mod tests {
                 notes: vec![],
             },
             evidence_quality: crate::enrich::EvidenceQuality::default(),
+            collection_nft_count: None,
+            collection_nft_count_complete: false,
             analysis_timestamp: 0,
         }
     }
@@ -1742,6 +1806,7 @@ mod tests {
                 infringing_nft_count: 1,
                 malicious_address_count: 0,
                 honest_address_count: 0,
+                overlapping_role_address_count: 0,
                 economics_usd: EconomicsUsdRollup {
                     operator_output_usd: 10.0,
                     honest_loss_usd: 3.0,
@@ -1846,6 +1911,7 @@ mod tests {
                 infringing_nft_count: if is_legit { 0 } else { infringing_nft_count },
                 malicious_address_count: 0,
                 honest_address_count: 0,
+                overlapping_role_address_count: 0,
                 economics_usd: economics.clone(),
                 candidate_refs: vec![CandidateRef {
                     chain: cand_chain.into(),
@@ -1858,7 +1924,7 @@ mod tests {
     }
 
     #[test]
-    fn stuck_ratio_uses_every_resident_nft_in_suspected_hit_contracts() {
+    fn stuck_ratio_uses_provider_complete_contract_population() {
         let mut store = ResidentStore::new();
         for (row, token_id) in ["1", "2", "3", "4"].into_iter().enumerate() {
             store
@@ -1892,6 +1958,8 @@ mod tests {
         );
         let mut analysis = empty_analysis("base", "0xcand", 0);
         analysis.economics.stuck_nft_count = 2;
+        analysis.collection_nft_count = Some(4);
+        analysis.collection_nft_count_complete = true;
         let summary = build_run_summary_for_scope_with_store(
             std::slice::from_ref(&report.dedup.seed),
             &[&report],
@@ -1905,7 +1973,42 @@ mod tests {
         assert_eq!(summary["economics"]["hit_contract_nft_count"], 4);
         assert_eq!(summary["economics"]["stuck_nft_count"], 2);
         assert_eq!(summary["economics"]["stuck_nft_ratio"], 0.5);
+        assert_eq!(
+            summary["economics"]["hit_contract_nft_count_complete"],
+            true
+        );
         assert_eq!(summary["infringing_nft_count"], 1);
+    }
+
+    #[test]
+    fn stuck_ratio_is_unavailable_without_provider_complete_population() {
+        let report = formal_seed_sharing_candidate(
+            "ethereum",
+            "0xseed",
+            "base",
+            "0xcand",
+            EconomicsUsdRollup::default(),
+            1,
+            vec![0],
+            vec!["token_uri".into()],
+            false,
+        );
+        let mut analysis = empty_analysis("base", "0xcand", 0);
+        analysis.economics.stuck_nft_count = 2;
+        let summary = build_run_summary(
+            std::slice::from_ref(&report.dedup.seed),
+            &[&report],
+            &[],
+            &[],
+            &[&analysis],
+        );
+
+        assert_eq!(summary["economics"]["stuck_nft_ratio"], Value::Null);
+        assert_eq!(summary["economics"]["stuck_nft_ratio_valid"], false);
+        assert_eq!(
+            summary["economics"]["hit_contract_nft_count_complete"],
+            false
+        );
     }
 
     #[test]
@@ -1944,6 +2047,11 @@ mod tests {
             to: "0xoperator".into(),
             kind: EconomicContributionKind::OperatorSaleProceeds,
             usd: 0.5,
+        }];
+        eligible.economics.gas_contributions = vec![GasContribution {
+            tx_hash: "0xeligible-gas".into(),
+            stage: GasStage::Setup,
+            usd: 1.0,
         }];
         let mut ineligible = empty_analysis("base", "0xcand_b", 2);
         ineligible.economics.operator_output_usd = 100.0;
@@ -2026,6 +2134,64 @@ mod tests {
     }
 
     #[test]
+    fn summary_reports_addresses_with_overlapping_roles() {
+        use crate::analysis::{AddressAttribution, AddressRole};
+
+        let report_a = formal_seed_sharing_candidate(
+            "ethereum",
+            "0xseed_a",
+            "base",
+            "0xcand_a",
+            EconomicsUsdRollup::default(),
+            1,
+            vec![10],
+            vec!["token_uri".into()],
+            false,
+        );
+        let report_b = formal_seed_sharing_candidate(
+            "ethereum",
+            "0xseed_b",
+            "base",
+            "0xcand_b",
+            EconomicsUsdRollup::default(),
+            1,
+            vec![11],
+            vec!["token_uri".into()],
+            false,
+        );
+        let mut analysis_a = empty_analysis("base", "0xcand_a", 1);
+        analysis_a.attribution = vec![(
+            "0xshared".into(),
+            AddressAttribution {
+                role: AddressRole::SuspectedOperator,
+                evidence: vec![],
+            },
+        )];
+        let mut analysis_b = empty_analysis("base", "0xcand_b", 2);
+        analysis_b.attribution = vec![(
+            "0xshared".into(),
+            AddressAttribution {
+                role: AddressRole::LikelyVictim,
+                evidence: vec![],
+            },
+        )];
+        let selected = vec![report_a.dedup.seed.clone(), report_b.dedup.seed.clone()];
+        let summary = build_run_summary(
+            &selected,
+            &[&report_a, &report_b],
+            &[],
+            &[],
+            &[&analysis_a, &analysis_b],
+        );
+        let addresses = &summary["address_classification"];
+
+        assert_eq!(addresses["malicious_address_count"], 1);
+        assert_eq!(addresses["honest_address_count"], 0);
+        assert_eq!(addresses["overlapping_role_address_count"], 1);
+        assert_eq!(addresses["total_address_count"], 1);
+    }
+
+    #[test]
     fn summary_deduplicates_shared_value_flow_and_gas_transactions() {
         let empty_rollup = EconomicsUsdRollup::default();
         let report_a = formal_seed_sharing_candidate(
@@ -2060,6 +2226,8 @@ mod tests {
             analysis.economics.setup_gas_usd = 2.0;
             analysis.economics.total_gas_usd = 2.0;
             analysis.economics.attacker_input_usd = Some(2.0);
+            analysis.economics.output_input_ratio = Some(5.0);
+            analysis.economics.output_input_ratio_is_usd = true;
             analysis
                 .economics
                 .value_flow_contributions
@@ -2110,6 +2278,12 @@ mod tests {
         assert_eq!(economics["setup_gas_usd"], 2.0);
         assert_eq!(economics["total_gas_usd"], 2.0);
         assert_eq!(economics["attacker_input_usd"], 2.0);
+        assert_eq!(economics["ratio_eligible_attacker_input_usd"], 2.0);
+        assert_eq!(economics["output_input_ratio_count"], 2);
+        assert_eq!(economics["ratio_candidate_coverage_complete"], true);
+        assert_eq!(economics["ratio_evidence_complete"], false);
+        assert_eq!(economics["ratio_sample_complete"], false);
+        assert_eq!(economics["ratio_is_observed_only"], true);
     }
 
     #[test]

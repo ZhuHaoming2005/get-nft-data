@@ -361,13 +361,17 @@ pub fn write_all_chains_md(
     // ## 地址分类
     let addr = &summary["address_classification"];
     body.push_str("\n## 地址分类\n\n");
-    body.push_str("| 类别 | 恶意地址数量 | 多次侵权地址数 | 诚实地址数量 | 地址总数 |\n| --- | ---: | ---: | ---: | ---: |\n");
+    body.push_str("| 类别 | 恶意地址数 | 多次侵权恶意地址数 | 诚实地址数 | 地址总数 |\n| --- | ---: | ---: | ---: | ---: |\n");
     body.push_str(&format!(
         "| all | {} | {} | {} | {} |\n",
         u64_cell(&addr["malicious_address_count"]),
         u64_cell(&addr["repeat_infringing_malicious_address_count"]),
         u64_cell(&addr["honest_address_count"]),
         u64_cell(&addr["total_address_count"]),
+    ));
+    body.push_str(&format!(
+        "\n> 地址分类为互斥二分；发现同时具有恶意与诚实角色的 {} 个地址，均按恶意地址统计。\n",
+        u64_cell(&addr["overlapping_role_address_count"]),
     ));
 
     // ## 攻击者成本（all monetary fields use run-time USD prices）
@@ -467,9 +471,11 @@ pub fn write_all_chains_md(
         lt1,
     ));
     body.push_str(&format!(
-        "\n> 口径：总比值与 >=1/<1 分布均只使用同一批 {} 个可比合约；样本覆盖全部疑似合约：{}。全部已观察操作者产出为 {} USD。\n",
+        "\n> 口径：总比值与 >=1/<1 分布均只使用同一批 {} 个可比合约；候选覆盖完整：{}；证据覆盖完整：{}；仅为已观察值：{}。全部已观察操作者产出为 {} USD。\n",
         u64_cell(econ.get("ratio_eligible_contract_count").unwrap_or(&econ["output_input_ratio_count"])),
-        econ["ratio_sample_complete"],
+        econ["ratio_candidate_coverage_complete"],
+        econ["ratio_evidence_complete"],
+        econ["ratio_is_observed_only"],
         f64_cell(econ.get("all_observed_operator_output_usd").unwrap_or(&econ["operator_output_usd"])),
     ));
     body.push_str(&format!(

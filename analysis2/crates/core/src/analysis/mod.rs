@@ -73,6 +73,11 @@ pub struct CandidateAnalysis {
     /// Provider completeness copied before the evidence bundle is released.
     #[serde(default)]
     pub evidence_quality: EvidenceQuality,
+    /// Provider-derived whole-contract NFT/token-id population.
+    #[serde(default)]
+    pub collection_nft_count: Option<u64>,
+    #[serde(default)]
+    pub collection_nft_count_complete: bool,
     pub analysis_timestamp: i64,
 }
 
@@ -242,6 +247,8 @@ pub fn analyze_candidate(
             economics: EconomicFacts::default(),
             economics_quality: EconomicsQuality::default(),
             evidence_quality: evidence.quality.clone(),
+            collection_nft_count: evidence.collection_nft_count,
+            collection_nft_count_complete: evidence.collection_nft_count_complete,
             analysis_timestamp: cfg.analysis_timestamp,
         });
     }
@@ -333,6 +340,8 @@ pub fn analyze_candidate(
         economics,
         economics_quality,
         evidence_quality: evidence.quality.clone(),
+        collection_nft_count: evidence.collection_nft_count,
+        collection_nft_count_complete: evidence.collection_nft_count_complete,
         analysis_timestamp: cfg.analysis_timestamp,
     })
 }
@@ -1138,6 +1147,8 @@ mod tests {
             },
             economics_quality: EconomicsQuality::default(),
             evidence_quality: EvidenceQuality::default(),
+            collection_nft_count: None,
+            collection_nft_count_complete: false,
             analysis_timestamp: 0,
         };
         analysis.shrink_for_summary_memory();

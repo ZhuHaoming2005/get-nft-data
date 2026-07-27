@@ -44,7 +44,7 @@ pub struct SolanaAssetSnapshot {
     pub authority: Vec<String>,
 }
 
-type DirectAssetRow = Result<Option<(SolanaAsset, Vec<String>, bool)>, ()>;
+type DirectAssetRow = Result<Option<(SolanaAsset, Vec<String>, bool)>, String>;
 
 /// Resolve on-chain collection address for a mint via `getAsset`.
 pub async fn resolve_collection_address(
@@ -465,14 +465,24 @@ pub async fn fetch_assets_by_ids(
             let payload = client
                 .post_json_helius(&url, &[], &body)
                 .await
-                .map_err(|_| ())?;
-            if payload.get("error").is_some() {
-                return Err(());
+                .map_err(|error| format!("getAsset {mint}: {error}"))?;
+            if let Some(error) = payload.get("error") {
+                return Err(format!("getAsset {mint}: JSON-RPC error {error}"));
             }
             let Some(result) = payload.get("result").filter(|value| !value.is_null()) else {
                 return Ok(None);
             };
-            let asset = parse_asset(result).ok_or(())?;
+            if !is_nft_asset_payload(result) {
+                let interface = result
+                    .get("interface")
+                    .and_then(Value::as_str)
+                    .unwrap_or("missing");
+                return Err(format!(
+                    "getAsset {mint}: returned non-NFT or unknown interface {interface}"
+                ));
+            }
+            let asset = parse_asset(result)
+                .ok_or_else(|| format!("getAsset {mint}: missing valid asset identity"))?;
             let collection = parse_collection_address(result).unwrap_or_else(|| asset.mint.clone());
             let authorities = solana_authorities_from_asset(result, result, &collection);
             Ok(Some((asset, authorities, is_open_license_payload(result))))
@@ -483,7 +493,7 @@ pub async fn fetch_assets_by_ids(
     .await;
 
     let mut snapshot = SolanaAssetSnapshot::default();
-    let mut failures = 0usize;
+    let mut failures = Vec::new();
     for row in rows {
         match row {
             Ok(Some((asset, authorities, open_license))) => {
@@ -492,17 +502,21 @@ pub async fn fetch_assets_by_ids(
                 snapshot.open_license |= open_license;
             }
             Ok(None) => {}
-            Err(()) => failures += 1,
+            Err(error) => failures.push(error),
         }
     }
     snapshot.authority.sort();
     snapshot.authority.dedup();
 
-    if snapshot.assets.is_empty() && failures > 0 {
+    if snapshot.assets.is_empty() && !failures.is_empty() {
         return FetchOutcome::failed(
             "helius",
             "helius_assets_by_id",
-            format!("{failures} getAsset request(s) failed"),
+            format!(
+                "{} getAsset request(s) failed: {}",
+                failures.len(),
+                failures.join("; ")
+            ),
         );
     }
 
@@ -515,9 +529,11 @@ pub async fn fetch_assets_by_ids(
     // listing. Preserve that distinction even when every supplied id resolved.
     snapshot.truncated = true;
     let mut outcome = FetchOutcome::ok(snapshot, count, true, "helius", "helius_assets_by_id");
-    if failures > 0 {
+    if !failures.is_empty() {
         outcome.failure = Some(format!(
-            "helius_assets_by_id: recovered {count} asset(s), but {failures} getAsset request(s) failed"
+            "helius_assets_by_id: recovered {count} asset(s), but {} getAsset request(s) failed: {}",
+            failures.len(),
+            failures.join("; ")
         ));
     }
     outcome
@@ -566,7 +582,7 @@ pub async fn fetch_asset_histories(
     let mut transfers = Vec::new();
     let mut sales = Vec::new();
     let mut any_ok = false;
-    let mut failures = 0usize;
+    let mut failures = Vec::new();
     for handle in handles {
         match handle.await {
             Ok(rows) => {
@@ -580,33 +596,45 @@ pub async fn fetch_asset_histories(
                             transfers.append(&mut t);
                             sales.append(&mut s);
                         }
-                        Err(()) => failures += 1,
+                        Err(error) => failures.push(error),
                     }
                 }
             }
-            Err(_) => failures += 1,
+            Err(error) => failures.push(format!("history worker join failure: {error}")),
         }
     }
 
-    if !any_ok && failures > 0 {
+    if !any_ok && !failures.is_empty() {
         return FetchOutcome::failed(
             "helius",
             "helius_histories",
-            format!("{failures} signature discovery failures"),
+            format!(
+                "{} signature discovery failure(s): {}",
+                failures.len(),
+                failures.join("; ")
+            ),
         );
     }
     let count = transfers.len() + sales.len();
     // Only mark truncated for discovery caps; decode quality is decided later.
-    FetchOutcome::ok(
+    let mut outcome = FetchOutcome::ok(
         (transfers, sales),
         count,
-        truncated,
+        truncated || !failures.is_empty(),
         "helius",
         "helius_histories",
-    )
+    );
+    if !failures.is_empty() {
+        outcome.failure = Some(format!(
+            "helius_histories: {} asset history failure(s): {}",
+            failures.len(),
+            failures.join("; ")
+        ));
+    }
+    outcome
 }
 
-type AssetHistoryRow = Result<(Vec<TransferEvent>, Vec<SaleEvent>, bool), ()>;
+type AssetHistoryRow = Result<(Vec<TransferEvent>, Vec<SaleEvent>, bool), String>;
 
 fn signature_request(asset: &SolanaAsset, request_id: String, max_sigs: usize) -> Value {
     json!({
@@ -634,7 +662,7 @@ async fn fetch_asset_history_batch(
             client
                 .post_json_helius(url, &[], &body)
                 .await
-                .map_err(|_| ())
+                .map_err(|error| format!("getSignaturesForAsset {}: {error}", assets[0].mint))
                 .and_then(|payload| parse_asset_history(&assets[0], &payload, max_sigs)),
         ];
     }
@@ -663,7 +691,12 @@ async fn fetch_asset_history_batch(
                 by_id
                     .get(id.as_str())
                     .copied()
-                    .ok_or(())
+                    .ok_or_else(|| {
+                        format!(
+                            "getSignaturesForAsset {}: batch response omitted id {id}",
+                            asset.mint
+                        )
+                    })
                     .and_then(|response| parse_asset_history(asset, response, max_sigs))
             })
             .collect();
@@ -683,27 +716,39 @@ async fn fetch_asset_history_batch(
             client
                 .post_json_helius(&url, &[], &body)
                 .await
-                .map_err(|_| ())
+                .map_err(|error| format!("getSignaturesForAsset {}: {error}", asset.mint))
                 .and_then(|payload| parse_asset_history(&asset, &payload, max_sigs))
         }));
     }
     let mut rows = Vec::with_capacity(handles.len());
     for handle in handles {
-        rows.push(handle.await.unwrap_or(Err(())));
+        rows.push(
+            handle
+                .await
+                .unwrap_or_else(|error| Err(format!("history worker join failure: {error}"))),
+        );
     }
     rows
 }
 
 fn parse_asset_history(asset: &SolanaAsset, payload: &Value, max_sigs: usize) -> AssetHistoryRow {
-    if payload.get("error").is_some() {
-        return Err(());
+    if let Some(error) = payload.get("error") {
+        return Err(format!(
+            "getSignaturesForAsset {}: JSON-RPC error {error}",
+            asset.mint
+        ));
     }
     let items = payload
         .get("result")
         .and_then(|result| result.get("items"))
         .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+        .ok_or_else(|| {
+            format!(
+                "getSignaturesForAsset {}: response omitted result.items",
+                asset.mint
+            )
+        })?
+        .clone();
     let page_truncated = items.len() >= max_sigs;
     let mut transfers = Vec::new();
     let mut sales = Vec::new();
@@ -1783,6 +1828,30 @@ pub fn holders_from_assets(assets: &[SolanaAsset]) -> Vec<HolderRecord> {
         .collect()
 }
 
+fn is_nft_asset_payload(item: &Value) -> bool {
+    let interface_is_nft = item
+        .get("interface")
+        .and_then(Value::as_str)
+        .is_some_and(|interface| {
+            matches!(
+                interface.to_ascii_lowercase().as_str(),
+                "v1_nft"
+                    | "v1_print"
+                    | "legacy_nft"
+                    | "v2_nft"
+                    | "programmablenft"
+                    | "mplcoreasset"
+            )
+        });
+    let standard_is_nft = item
+        .get("content")
+        .and_then(|content| content.get("metadata"))
+        .and_then(|metadata| metadata.get("token_standard"))
+        .and_then(Value::as_str)
+        .is_some_and(|standard| standard.to_ascii_lowercase().contains("nonfungible"));
+    interface_is_nft || standard_is_nft
+}
+
 fn parse_asset(item: &Value) -> Option<SolanaAsset> {
     let mint = item.get("id").and_then(Value::as_str)?.trim().to_owned();
     if mint.is_empty() {
@@ -1892,6 +1961,7 @@ mod tests {
                     "jsonrpc": "2.0",
                     "id": "asset",
                     "result": {
+                        "interface": "V1_NFT",
                         "id": "So11111111111111111111111111111111111111112",
                         "ownership": {"owner": "holder"},
                         "compression": {"compressed": false},
@@ -1920,6 +1990,38 @@ mod tests {
         assert_eq!(outcome.value.assets.len(), 1);
         assert_eq!(outcome.value.assets[0].mint, mint);
         assert_eq!(outcome.value.authority, vec!["creator"]);
+    }
+
+    #[test]
+    fn direct_asset_identity_accepts_only_explicit_nft_payloads() {
+        assert!(is_nft_asset_payload(
+            &json!({"interface": "ProgrammableNFT"})
+        ));
+        assert!(is_nft_asset_payload(&json!({"interface": "MplCoreAsset"})));
+        assert!(is_nft_asset_payload(&json!({
+            "content": {"metadata": {"token_standard": "NonFungible"}}
+        })));
+        assert!(!is_nft_asset_payload(
+            &json!({"interface": "FungibleToken"})
+        ));
+        assert!(!is_nft_asset_payload(&json!({"id": "unknown"})));
+    }
+
+    #[test]
+    fn asset_history_preserves_provider_error_detail() {
+        let asset = SolanaAsset {
+            mint: "mint-1".into(),
+            ..SolanaAsset::default()
+        };
+        let error = parse_asset_history(
+            &asset,
+            &json!({"error": {"code": -32602, "message": "invalid asset"}}),
+            10,
+        )
+        .unwrap_err();
+        assert!(error.contains("mint-1"));
+        assert!(error.contains("-32602"));
+        assert!(error.contains("invalid asset"));
     }
 
     #[tokio::test]

@@ -23,11 +23,11 @@ use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 use crate::reporting::json::SeedRecord;
 
-// v12 rejects cached Solana Empty collection snapshots when resident NFT mints
-// exist, resolving the collection identity and retrying unverified membership.
-// v11 remains readable so only affected Solana candidates need HTTP refresh.
-pub const EVIDENCE_CACHE_VERSION: u32 = 12;
-const MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION: u32 = 11;
+// v13 persists provider-complete whole-contract NFT populations and preserves
+// per-asset Helius failures; older evidence cannot support the corrected stuck
+// denominator or trustworthy Solana failure diagnosis.
+pub const EVIDENCE_CACHE_VERSION: u32 = 13;
+const MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION: u32 = 13;
 pub const DEFAULT_EVIDENCE_CACHE_FILE: &str = "evidence_cache.json";
 /// How many finished candidates to buffer before an append + snapshot flush.
 pub const DEFAULT_EVIDENCE_CACHE_BATCH: usize = 16;
@@ -688,7 +688,7 @@ mod tests {
     }
 
     #[test]
-    fn v11_cache_remains_readable_for_selective_solana_refresh() {
+    fn previous_cache_is_rejected_without_collection_population() {
         let mut cache = build_evidence_cache(params(), &AHashMap::new());
         cache.version = EVIDENCE_CACHE_VERSION - 1;
         let dir = std::env::temp_dir().join(format!(
@@ -700,9 +700,8 @@ mod tests {
         let path = dir.join("evidence_cache.json");
         write_evidence_cache(&path, &cache).unwrap();
 
-        let loaded = load_evidence_cache(&path).unwrap();
-        validate_evidence_cache(&loaded, &params()).unwrap();
-        assert_eq!(loaded.version, EVIDENCE_CACHE_VERSION - 1);
+        let error = load_evidence_cache(&path).unwrap_err().to_string();
+        assert!(error.contains("unsupported"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
