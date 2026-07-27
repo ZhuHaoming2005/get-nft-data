@@ -181,9 +181,9 @@ dedup stages run normally.
   source and fall back to OpenSea only when Alchemy is unavailable or fails.
   Base uses OpenSea collection Sale events filtered back to the candidate
   contract. Solana uses Helius asset histories plus decoded `getTransaction`
-  buyer/seller/payment evidence. Evidence cache v14 is required so non-NFT
-  exclusions, ungrouped-singleton completeness, and dependent failure states
-  cannot be confused with older evidence.
+  buyer/seller/payment evidence. The cache version is producer metadata rather
+  than an expiry switch: successfully collected historical evidence remains
+  reusable across upgrades, while failed or missing evidence is retried.
 - **EVM gas:** Alchemy/ETH `eth_getTransactionReceipt` → `TransferEvent.gas_native` /
   `fee_payer`; `quality.gas` Complete/Truncated/Empty/Failed/NotRequested.
 - **EVM value flows:** full-history native EXTERNAL transfers around addresses

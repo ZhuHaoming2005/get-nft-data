@@ -9,22 +9,22 @@ use std::thread;
 use ahash::{AHashMap, AHashSet};
 use analysis2_core::{
     Analysis2Error, ApiKeys, CandidateAnalysis, CandidateRegistry, ContractId,
-    DEFAULT_EVIDENCE_CACHE_BATCH, DedupCacheParams, DedupRunParams, EVIDENCE_CACHE_VERSION,
-    EvidenceBundle, EvidenceCacheSink, EvidenceStatus, FailureRecord, HitGraph, HttpLimits,
-    LegitSignals, LoadOptions, MetadataQueryScratch, NameQueryScratch, PaperConfig,
-    PendingDedupLoad, ProgressObserver, ResidentStore, ScopeAnalysisSets, SeedDedupReport,
-    SeedFullReport, SeedRecord, UriQueryScratch, analyze_candidate,
-    build_contract_nft_map_for_graphs, build_dedup_cache, build_evidence_cache,
-    build_seed_analysis_rollup, build_seed_dedup_report, candidate_json_rel_path,
-    default_dedup_cache_path, default_evidence_cache_path, enrich_candidates_with_hook,
-    evidence_cache_artifacts_present, evidence_cache_params, finalize_legit_signals,
-    load_dedup_cache, load_evidence_cache_resumable, load_resident_store_uri_ready,
-    load_seeds_json, query_metadata_for_seed_with_scratch, query_name_for_seed_with_scratch,
-    query_uri_for_seed_with_scratch, refresh_cached_evm_holders, refresh_cached_prices,
-    refresh_relation_legit, rematerialize_dedup_batch, rematerialize_evidence,
-    resolve_seed_contract, scopes_complete_for_seed, serialize_candidate_json,
-    validate_dedup_cache, validate_evidence_cache, write_candidate_json_bytes, write_dedup_cache,
-    write_dedup_outputs, write_evidence_cache, write_run_outputs,
+    DEFAULT_EVIDENCE_CACHE_BATCH, DedupCacheParams, DedupRunParams, EvidenceBundle,
+    EvidenceCacheSink, EvidenceStatus, FailureRecord, HitGraph, HttpLimits, LegitSignals,
+    LoadOptions, MetadataQueryScratch, NameQueryScratch, PaperConfig, PendingDedupLoad,
+    ProgressObserver, ResidentStore, ScopeAnalysisSets, SeedDedupReport, SeedFullReport,
+    SeedRecord, UriQueryScratch, analyze_candidate, build_contract_nft_map_for_graphs,
+    build_dedup_cache, build_evidence_cache, build_seed_analysis_rollup, build_seed_dedup_report,
+    candidate_json_rel_path, default_dedup_cache_path, default_evidence_cache_path,
+    enrich_candidates_with_hook, evidence_cache_artifacts_present, evidence_cache_params,
+    finalize_legit_signals, load_dedup_cache, load_evidence_cache_resumable,
+    load_resident_store_uri_ready, load_seeds_json, query_metadata_for_seed_with_scratch,
+    query_name_for_seed_with_scratch, query_uri_for_seed_with_scratch, refresh_cached_evm_holders,
+    refresh_cached_prices, refresh_relation_legit, rematerialize_dedup_batch,
+    rematerialize_evidence, resolve_seed_contract, scopes_complete_for_seed,
+    serialize_candidate_json, validate_dedup_cache, validate_evidence_cache,
+    write_candidate_json_bytes, write_dedup_cache, write_dedup_outputs, write_evidence_cache,
+    write_run_outputs,
 };
 use rayon::prelude::*;
 
@@ -756,23 +756,6 @@ fn cached_evm_holders_need_retry(bundle: &EvidenceBundle) -> bool {
                     .any(|failure| failure.to_ascii_lowercase().contains("alchemy_holders"))))
 }
 
-fn legacy_empty_solana_asset_candidates(
-    cache_version: u32,
-    evidence: &AHashMap<ContractId, EvidenceBundle>,
-) -> AHashSet<ContractId> {
-    if cache_version >= EVIDENCE_CACHE_VERSION {
-        return AHashSet::new();
-    }
-    evidence
-        .iter()
-        .filter(|(_, bundle)| {
-            bundle.chain.eq_ignore_ascii_case("solana")
-                && bundle.quality.assets == EvidenceStatus::Empty
-        })
-        .map(|(&candidate_id, _)| candidate_id)
-        .collect()
-}
-
 fn load_seed_batch_from_cache(
     store: &ResidentStore,
     cache: &analysis2_core::DedupCacheFile,
@@ -974,15 +957,6 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                     let current_candidates: AHashSet<ContractId> =
                         registry.candidate_contracts().iter().copied().collect();
                     evidence.retain(|candidate_id, _| current_candidates.contains(candidate_id));
-                    let legacy_empty_solana_assets =
-                        legacy_empty_solana_asset_candidates(cache.version, &evidence);
-                    if !legacy_empty_solana_assets.is_empty() {
-                        eprintln!(
-                            "evidence: refreshing {} legacy Solana Empty Asset bundle(s); all other cached evidence remains reusable",
-                            legacy_empty_solana_assets.len()
-                        );
-                    }
-                    forced_refresh.extend(legacy_empty_solana_assets);
                     forced_refresh.extend(
                         evidence
                             .iter()
@@ -1504,20 +1478,6 @@ mod tests {
         excluded.quality.assets = EvidenceStatus::Failed;
         excluded.quality.excluded_non_nft = true;
         assert!(!cached_evidence_needs_retry(&excluded));
-    }
-
-    #[test]
-    fn legacy_cache_refreshes_only_affected_empty_candidates() {
-        let mut empty_assets = EvidenceBundle::empty(3, "solana", "candidate-assets-empty");
-        empty_assets.quality.assets = EvidenceStatus::Empty;
-        let mut evm_empty_assets = EvidenceBundle::empty(4, "base", "0xcandidate-assets-empty");
-        evm_empty_assets.quality.assets = EvidenceStatus::Empty;
-        let evidence = AHashMap::from([(3, empty_assets), (4, evm_empty_assets)]);
-        assert_eq!(
-            legacy_empty_solana_asset_candidates(EVIDENCE_CACHE_VERSION - 1, &evidence),
-            AHashSet::from([3])
-        );
-        assert!(legacy_empty_solana_asset_candidates(EVIDENCE_CACHE_VERSION, &evidence).is_empty());
     }
 
     #[test]

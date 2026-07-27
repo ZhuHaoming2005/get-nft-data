@@ -8,8 +8,8 @@
 //! After an interrupt, the next run loads meta+jsonl (and/or the JSON snapshot),
 //! rematerializes bundles, and only HTTP-fetches candidates still missing.
 //! Pagination bounds must match. A stale pricing day triggers a price-only
-//! refresh; adding a provider key invalidates a cache that could not have
-//! collected that provider's data.
+//! refresh. Seed membership, provider-key presence, and producer-version
+//! changes do not discard successfully collected candidate evidence.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -23,11 +23,10 @@ use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 use crate::reporting::json::SeedRecord;
 
-// v14 distinguishes complete ungrouped Solana singleton units, propagates
-// failed asset identity to downstream evidence, and persists non-NFT
-// exclusions. Older evidence cannot support those corrected semantics.
+// This is a format/producer marker, not an expiry gate. Older caches remain
+// readable when serde can decode them: successful provider evidence must not
+// be discarded merely because analysis semantics or this marker changed.
 pub const EVIDENCE_CACHE_VERSION: u32 = 14;
-const MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION: u32 = 14;
 pub const DEFAULT_EVIDENCE_CACHE_FILE: &str = "evidence_cache.json";
 /// How many finished candidates to buffer before an append + snapshot flush.
 pub const DEFAULT_EVIDENCE_CACHE_BATCH: usize = 16;
@@ -176,10 +175,12 @@ pub fn load_evidence_cache(path: &Path) -> Result<EvidenceCacheFile, Analysis2Er
     let cache: EvidenceCacheFile = serde_json::from_str(&text).map_err(|e| {
         Analysis2Error::invalid(format!("parse evidence cache {}: {e}", path.display()))
     })?;
-    if !(MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION..=EVIDENCE_CACHE_VERSION).contains(&cache.version) {
+    // Refuse only caches produced by a newer binary. Historical versions are
+    // forward-filled through serde defaults and remain reusable.
+    if cache.version > EVIDENCE_CACHE_VERSION {
         return Err(Analysis2Error::invalid(format!(
-            "evidence cache version {} unsupported (supported {MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION}..={EVIDENCE_CACHE_VERSION})",
-            cache.version
+            "evidence cache version {} is newer than supported version {EVIDENCE_CACHE_VERSION}",
+            cache.version,
         )));
     }
     Ok(cache)
@@ -222,11 +223,10 @@ pub fn load_evidence_cache_resumable(path: &Path) -> Result<EvidenceCacheFile, A
         let meta: Meta = serde_json::from_str(&meta_text).map_err(|e| {
             Analysis2Error::invalid(format!("parse evidence meta {}: {e}", meta_path.display()))
         })?;
-        if !(MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION..=EVIDENCE_CACHE_VERSION).contains(&meta.version)
-        {
+        if meta.version > EVIDENCE_CACHE_VERSION {
             return Err(Analysis2Error::invalid(format!(
-                "evidence cache version {} unsupported (supported {MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION}..={EVIDENCE_CACHE_VERSION})",
-                meta.version
+                "evidence cache version {} is newer than supported version {EVIDENCE_CACHE_VERSION}",
+                meta.version,
             )));
         }
 
@@ -308,15 +308,6 @@ pub fn validate_evidence_cache(
     }
     // Price age is handled by a price-only refresh in the pipeline. It must not
     // invalidate unrelated chain and market evidence.
-    if (!got.had_alchemy && expected.had_alchemy)
-        || (!got.had_etherscan && expected.had_etherscan)
-        || (!got.had_helius && expected.had_helius)
-        || (!got.had_opensea && expected.had_opensea)
-    {
-        return Err(Analysis2Error::invalid(
-            "evidence cache was built without a provider key now available",
-        ));
-    }
     Ok(())
 }
 
@@ -670,9 +661,9 @@ mod tests {
     }
 
     #[test]
-    fn old_cache_is_rejected_after_authoritative_sale_provider_migration() {
+    fn historical_cache_remains_readable() {
         let mut cache = build_evidence_cache(params(), &AHashMap::new());
-        cache.version = MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION - 1;
+        cache.version = 1;
         let dir = std::env::temp_dir().join(format!(
             "analysis2_evidence_cache_old_provider_{}",
             std::process::id()
@@ -682,15 +673,15 @@ mod tests {
         let path = dir.join("evidence_cache.json");
         write_evidence_cache(&path, &cache).unwrap();
 
-        let error = load_evidence_cache(&path).unwrap_err().to_string();
-        assert!(error.contains("unsupported"), "{error}");
+        let loaded = load_evidence_cache(&path).unwrap();
+        assert_eq!(loaded.version, 1);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn previous_cache_is_rejected_without_collection_population() {
+    fn future_cache_is_rejected_to_prevent_downgrade_misread() {
         let mut cache = build_evidence_cache(params(), &AHashMap::new());
-        cache.version = EVIDENCE_CACHE_VERSION - 1;
+        cache.version = EVIDENCE_CACHE_VERSION + 1;
         let dir = std::env::temp_dir().join(format!(
             "analysis2_evidence_cache_previous_{}",
             std::process::id()
@@ -701,7 +692,7 @@ mod tests {
         write_evidence_cache(&path, &cache).unwrap();
 
         let error = load_evidence_cache(&path).unwrap_err().to_string();
-        assert!(error.contains("unsupported"), "{error}");
+        assert!(error.contains("newer than supported"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -776,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn validate_accepts_seed_changes_but_rejects_new_provider_coverage() {
+    fn validate_accepts_seed_and_provider_key_changes() {
         let cached = evidence_cache_params(
             &[],
             "seeds.json",
@@ -800,7 +791,8 @@ mod tests {
             bundles: Vec::new(),
         };
 
-        assert!(validate_evidence_cache(&cache, &current).is_err());
+        validate_evidence_cache(&cache, &current)
+            .expect("provider-key presence must not discard successful cached evidence");
 
         let mut seed_only = cache.params.clone();
         seed_only.seeds = current.seeds;
