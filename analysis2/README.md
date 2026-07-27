@@ -77,7 +77,7 @@ Metadata deduplication still run normally.
 Writes under `--output-dir` in three roots:
 
 ```text
-intermediate/          # run_manifest.json, failures.jsonl, caches
+intermediate/          # run_manifest.json, failures.jsonl, derived + raw API success caches
 detail/seeds/…         # per-seed report.json|.md
 summary/
   intra_chain/<chain>.*                 # 各单链结果
@@ -94,6 +94,11 @@ summary/
 End-to-end: load → dedup all seeds → enrich unique candidates → deep analysis → reports.
 The example explicitly enables Name deduplication with `--name-threshold 0.98`; omit
 that flag to skip both the Name index build and Name duplicate queries.
+
+Successful non-price provider JSON responses are durably cached under
+`intermediate/api_success_cache/`. Cache identities exclude API secrets and are
+independent of the derived evidence-cache version. Failed responses are retried;
+Alchemy spot-price responses remain day-refreshed rather than permanent.
 
 ```powershell
 cargo run --manifest-path analysis2/Cargo.toml --release -- run `

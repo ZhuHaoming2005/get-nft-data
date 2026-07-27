@@ -10,21 +10,21 @@ use ahash::{AHashMap, AHashSet};
 use analysis2_core::{
     Analysis2Error, ApiKeys, CandidateAnalysis, CandidateRegistry, ContractId,
     DEFAULT_EVIDENCE_CACHE_BATCH, DedupCacheParams, DedupRunParams, EvidenceBundle,
-    EvidenceCacheSink, EvidenceStatus, FailureRecord, HitGraph, HttpLimits, LegitSignals,
-    LoadOptions, MetadataQueryScratch, NameQueryScratch, PaperConfig, PendingDedupLoad,
-    ProgressObserver, ResidentStore, ScopeAnalysisSets, SeedDedupReport, SeedFullReport,
-    SeedRecord, UriQueryScratch, analyze_candidate, build_contract_nft_map_for_graphs,
-    build_dedup_cache, build_evidence_cache, build_seed_analysis_rollup, build_seed_dedup_report,
-    candidate_json_rel_path, default_dedup_cache_path, default_evidence_cache_path,
-    enrich_candidates_with_hook, evidence_cache_artifacts_present, evidence_cache_params,
-    finalize_legit_signals, load_dedup_cache, load_evidence_cache_resumable,
-    load_resident_store_uri_ready, load_seeds_json, query_metadata_for_seed_with_scratch,
-    query_name_for_seed_with_scratch, query_uri_for_seed_with_scratch, refresh_cached_evm_holders,
-    refresh_cached_prices, refresh_relation_legit, rematerialize_dedup_batch,
-    rematerialize_evidence, resolve_seed_contract, scopes_complete_for_seed,
-    serialize_candidate_json, validate_dedup_cache, validate_evidence_cache,
-    write_candidate_json_bytes, write_dedup_cache, write_dedup_outputs, write_evidence_cache,
-    write_run_outputs,
+    EvidenceCacheSink, EvidenceStatus, FailureRecord, HitGraph, HttpLimits, INTERMEDIATE_DIR,
+    LegitSignals, LoadOptions, MetadataQueryScratch, NameQueryScratch, PaperConfig,
+    PendingDedupLoad, ProgressObserver, ResidentStore, ScopeAnalysisSets, SeedDedupReport,
+    SeedFullReport, SeedRecord, UriQueryScratch, analyze_candidate,
+    build_contract_nft_map_for_graphs, build_dedup_cache, build_evidence_cache,
+    build_seed_analysis_rollup, build_seed_dedup_report, candidate_json_rel_path,
+    default_dedup_cache_path, default_evidence_cache_path, enrich_candidates_with_hook,
+    evidence_cache_artifacts_present, evidence_cache_params, finalize_legit_signals,
+    load_dedup_cache, load_evidence_cache_resumable, load_resident_store_uri_ready,
+    load_seeds_json, query_metadata_for_seed_with_scratch, query_name_for_seed_with_scratch,
+    query_uri_for_seed_with_scratch, refresh_cached_evm_holders, refresh_cached_prices,
+    refresh_relation_legit, rematerialize_dedup_batch, rematerialize_evidence,
+    resolve_seed_contract, scopes_complete_for_seed, serialize_candidate_json,
+    validate_dedup_cache, validate_evidence_cache, write_candidate_json_bytes, write_dedup_cache,
+    write_dedup_outputs, write_evidence_cache, write_run_outputs,
 };
 use rayon::prelude::*;
 
@@ -918,6 +918,12 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
     progress.set_stage("enrich");
     let limits = HttpLimits {
         concurrency: config.http_concurrency.max(1),
+        success_response_cache_dir: Some(
+            config
+                .output_dir
+                .join(INTERMEDIATE_DIR)
+                .join("api_success_cache"),
+        ),
         ..HttpLimits::default()
     };
     let evidence_path = evidence_cache_path(config);

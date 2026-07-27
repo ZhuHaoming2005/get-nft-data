@@ -37,6 +37,8 @@ pub struct EvidenceQuality {
     pub excluded_non_nft: bool,
     pub identity_exclusion_reason: Option<String>,
     pub failures: Vec<String>,
+    /// Stable machine-readable reasons for Truncated evidence families.
+    pub truncation_reasons: Vec<String>,
 }
 
 /// Provenance row for one provider request.
@@ -470,6 +472,9 @@ pub struct HttpLimits {
     pub max_solana_assets: usize,
     pub max_history_assets: usize,
     pub max_signatures_per_asset: usize,
+    /// Durable raw JSON cache for successful, non-volatile provider requests.
+    /// API secrets are excluded from cache identities.
+    pub success_response_cache_dir: Option<std::path::PathBuf>,
     pub endpoints: ProviderEndpoints,
 }
 
@@ -487,6 +492,7 @@ impl Default for HttpLimits {
             max_solana_assets: 200,
             max_history_assets: 20,
             max_signatures_per_asset: 50,
+            success_response_cache_dir: None,
             endpoints: ProviderEndpoints::default(),
         }
     }

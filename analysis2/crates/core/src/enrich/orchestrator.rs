@@ -51,7 +51,11 @@ pub async fn enrich_candidates_with_hook(
     progress: &dyn ProgressObserver,
     mut on_bundle: Option<&mut BundleHook<'_>>,
 ) -> Result<AHashMap<ContractId, EvidenceBundle>, Analysis2Error> {
-    let client = HttpClient::with_retries(limits.concurrency.max(1), limits.retries)?;
+    let client = HttpClient::with_retries_and_cache(
+        limits.concurrency.max(1),
+        limits.retries,
+        limits.success_response_cache_dir.clone(),
+    )?;
     progress.set_stage("enrich_legit");
     let preflight =
         legit_detect::prefilter_candidates(registry, store, &client, keys, limits, progress)
@@ -177,7 +181,11 @@ pub async fn refresh_relation_legit(
     limits: &HttpLimits,
     progress: &dyn ProgressObserver,
 ) -> Result<AHashMap<ContractId, EvidenceBundle>, Analysis2Error> {
-    let client = HttpClient::with_retries(limits.concurrency.max(1), limits.retries)?;
+    let client = HttpClient::with_retries_and_cache(
+        limits.concurrency.max(1),
+        limits.retries,
+        limits.success_response_cache_dir.clone(),
+    )?;
     progress.set_stage("enrich_legit");
     let preflight =
         legit_detect::prefilter_candidates(registry, store, &client, keys, limits, progress)
@@ -195,7 +203,11 @@ pub async fn refresh_cached_prices(
     limits: &HttpLimits,
     progress: &dyn ProgressObserver,
 ) -> Result<(), Analysis2Error> {
-    let client = HttpClient::with_retries(limits.concurrency.max(1), limits.retries)?;
+    let client = HttpClient::with_retries_and_cache(
+        limits.concurrency.max(1),
+        limits.retries,
+        limits.success_response_cache_dir.clone(),
+    )?;
     let price_cache = alchemy::PriceRequestCache::default();
     progress.set_stage("enrich_prices");
     progress.begin_phase("refresh_cached_prices", Some(candidates.len() as u64));
@@ -264,7 +276,11 @@ pub async fn refresh_cached_evm_holders(
     limits: &HttpLimits,
     progress: &dyn ProgressObserver,
 ) -> Result<(), Analysis2Error> {
-    let client = HttpClient::with_retries(limits.concurrency.max(1), limits.retries)?;
+    let client = HttpClient::with_retries_and_cache(
+        limits.concurrency.max(1),
+        limits.retries,
+        limits.success_response_cache_dir.clone(),
+    )?;
     progress.set_stage("enrich_holders");
     progress.begin_phase("refresh_cached_holders", Some(candidates.len() as u64));
     let mut stream = stream::iter(
@@ -845,7 +861,7 @@ async fn enrich_solana(
                 .iter()
                 .map(String::as_str)
                 .collect();
-            let all_resident_mints_explicitly_fungible = !known_mint_set.is_empty()
+            let all_resident_mints_explicitly_non_nft = !known_mint_set.is_empty()
                 && known_mint_set == rejected_mint_set
                 && direct.failure.is_none();
             if matches!(
@@ -854,11 +870,11 @@ async fn enrich_solana(
             ) && !direct.value.assets.is_empty()
             {
                 snapshot = direct;
-            } else if all_resident_mints_explicitly_fungible {
+            } else if all_resident_mints_explicitly_non_nft {
                 snapshot = direct;
                 bundle.quality.excluded_non_nft = true;
                 bundle.quality.identity_exclusion_reason = Some(format!(
-                    "Helius getAsset classified all {} resident mint(s) as fungible",
+                    "Helius getAsset classified all {} resident mint(s) as non-NFT digital assets",
                     known_mint_set.len()
                 ));
             } else if let Some(failure) = direct.failure {
@@ -965,6 +981,7 @@ async fn enrich_solana(
     ) && !history.truncated
         && !snapshot.truncated
         && snapshot.value.assets.len() <= limits.max_history_assets;
+    let history_was_truncated = history.truncated;
     let (mut transfers, mut helius_sales) = history.value;
 
     // Helius is the authoritative Solana sale source. Its history stubs are
@@ -1126,8 +1143,81 @@ async fn enrich_solana(
     // decoder has already required a unique same-transaction buyer outflow, so
     // do not apply the EVM controller-recipient restriction here.
 
+    record_solana_truncation_reasons(
+        &mut bundle,
+        &snapshot,
+        history_was_truncated,
+        limits,
+        &decode_stats,
+    );
+
     finalize_legit_signals(&mut bundle);
     bundle
+}
+
+fn push_truncation_reason(bundle: &mut EvidenceBundle, family: &str, reason: &str) {
+    let value = format!("{family}:{reason}");
+    if !bundle.quality.truncation_reasons.contains(&value) {
+        bundle.quality.truncation_reasons.push(value);
+    }
+}
+
+fn record_solana_truncation_reasons(
+    bundle: &mut EvidenceBundle,
+    snapshot: &FetchOutcome<helius::SolanaAssetSnapshot>,
+    history_truncated: bool,
+    limits: &HttpLimits,
+    decode_stats: &helius::DecodeStats,
+) {
+    if bundle.quality.assets == EvidenceStatus::Truncated {
+        let reason = if snapshot.value.direct_grouped {
+            "direct_asset_has_collection_group"
+        } else if snapshot
+            .value
+            .total
+            .is_some_and(|total| total > snapshot.value.assets.len())
+            || snapshot.value.assets.len() >= limits.max_solana_assets
+        {
+            "collection_asset_cap"
+        } else if snapshot
+            .observation
+            .as_ref()
+            .is_some_and(|obs| obs.request_key == "helius_assets_unverified")
+        {
+            "unverified_collection_membership"
+        } else {
+            "provider_partial_population"
+        };
+        push_truncation_reason(bundle, "assets", reason);
+    }
+    if bundle.quality.holders == EvidenceStatus::Truncated {
+        push_truncation_reason(bundle, "holders", "asset_population_incomplete");
+    }
+
+    let mut history_reasons = Vec::new();
+    if snapshot.truncated {
+        history_reasons.push("asset_population_incomplete");
+    }
+    if snapshot.value.assets.len() > limits.max_history_assets {
+        history_reasons.push("history_asset_cap");
+    }
+    if history_truncated {
+        history_reasons.push("signature_cap_or_provider_partial");
+    }
+    if !decode_stats.transfers_all_complete() || !decode_stats.sales_all_complete() {
+        history_reasons.push("transaction_decode_incomplete");
+    }
+    for reason in history_reasons {
+        if bundle.quality.histories == EvidenceStatus::Truncated {
+            push_truncation_reason(bundle, "histories", reason);
+        }
+        if bundle.quality.transfers == EvidenceStatus::Truncated {
+            push_truncation_reason(bundle, "transfers", reason);
+        }
+        if bundle.quality.sales == EvidenceStatus::Truncated {
+            push_truncation_reason(bundle, "sales", reason);
+        }
+    }
 }
 
 fn apply_outcome<T>(
@@ -2958,6 +3048,18 @@ mod tests {
         // Complete histories.
         assert_eq!(bundle.quality.histories, EvidenceStatus::Truncated);
         assert_eq!(bundle.quality.transfers, EvidenceStatus::Truncated);
+        assert!(
+            bundle
+                .quality
+                .truncation_reasons
+                .contains(&"assets:collection_asset_cap".to_owned())
+        );
+        assert!(
+            bundle
+                .quality
+                .truncation_reasons
+                .contains(&"histories:asset_population_incomplete".to_owned())
+        );
         let hist_obs = bundle
             .provenance
             .iter()

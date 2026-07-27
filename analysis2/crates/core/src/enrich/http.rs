@@ -1,9 +1,13 @@
 //! Shared HTTP client scaffolding for seed selection and enrichment.
 
+use std::fs;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 
@@ -21,6 +25,76 @@ pub const OPENSEA_RATE_LIMIT_REFILL_MS: u64 = 300;
 /// Shared cool-down applied to a provider bucket after HTTP 429 / rate-limit.
 pub const RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(1);
 const MAX_RATE_LIMIT_COOLDOWN: Duration = Duration::from_secs(30);
+static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Debug)]
+struct SuccessResponseCache {
+    root: PathBuf,
+    io: Arc<Mutex<()>>,
+}
+
+#[derive(Serialize, Deserialize)]
+struct SuccessCacheEntry {
+    request_identity: String,
+    response: Value,
+}
+
+impl SuccessResponseCache {
+    fn new(root: PathBuf) -> Self {
+        Self {
+            root,
+            io: Arc::new(Mutex::new(())),
+        }
+    }
+
+    fn path(&self, provider: &str, identity: &str) -> PathBuf {
+        self.root
+            .join(provider)
+            .join(format!("{:016x}.json", stable_fnv1a64(identity.as_bytes())))
+    }
+
+    fn load(&self, provider: &str, identity: &str) -> Option<Value> {
+        let _guard = self.io.lock().ok()?;
+        let body = fs::read(self.path(provider, identity)).ok()?;
+        let entry: SuccessCacheEntry = serde_json::from_slice(&body).ok()?;
+        (entry.request_identity == identity).then_some(entry.response)
+    }
+
+    fn store(&self, provider: &str, identity: &str, response: &Value) {
+        let Ok(_guard) = self.io.lock() else {
+            return;
+        };
+        let path = self.path(provider, identity);
+        let Some(parent) = path.parent() else {
+            return;
+        };
+        if fs::create_dir_all(parent).is_err() {
+            return;
+        }
+        let entry = SuccessCacheEntry {
+            request_identity: identity.to_owned(),
+            response: response.clone(),
+        };
+        let Ok(body) = serde_json::to_vec(&entry) else {
+            return;
+        };
+        let sequence = CACHE_TEMP_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        let tmp = path.with_extension(format!("{}.{}.tmp", std::process::id(), sequence));
+        if fs::write(&tmp, body).is_ok() && fs::rename(&tmp, &path).is_err() {
+            let _ = fs::copy(&tmp, &path);
+            let _ = fs::remove_file(&tmp);
+        }
+    }
+}
+
+fn stable_fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
 
 #[derive(Debug)]
 struct TokenBucketState {
@@ -172,6 +246,7 @@ pub struct HttpClient {
     etherscan: ProviderLane,
     /// Magic Eden / other non-primary providers.
     other: ProviderLane,
+    success_cache: Option<SuccessResponseCache>,
 }
 
 impl HttpClient {
@@ -180,6 +255,14 @@ impl HttpClient {
     }
 
     pub fn with_retries(concurrency: usize, retries: usize) -> Result<Self, Analysis2Error> {
+        Self::with_retries_and_cache(concurrency, retries, None)
+    }
+
+    pub fn with_retries_and_cache(
+        concurrency: usize,
+        retries: usize,
+        cache_dir: Option<PathBuf>,
+    ) -> Result<Self, Analysis2Error> {
         let n = concurrency.max(1);
         // Each provider gets its own pool of size `n` (Alchemy uses the CLI
         // --http-concurrency value; others are independent and not shared).
@@ -223,6 +306,7 @@ impl HttpClient {
                 TokenBucketRateLimiter::concurrency_only(),
             ),
             other: ProviderLane::new("other", other_n, TokenBucketRateLimiter::concurrency_only()),
+            success_cache: cache_dir.map(SuccessResponseCache::new),
         })
     }
 
@@ -319,6 +403,16 @@ impl HttpClient {
     ) -> Result<Value, Analysis2Error> {
         let header_map = build_headers(headers)?;
         let endpoint = redact_endpoint(url);
+        let cache_identity = success_cache_identity(&method, &endpoint, body);
+        let cacheable = success_response_is_cacheable(&endpoint);
+        if cacheable
+            && let Some(value) = self
+                .success_cache
+                .as_ref()
+                .and_then(|cache| cache.load(lane.name, &cache_identity))
+        {
+            return Ok(value);
+        }
         let mut last_error = None;
         for attempt in 0..=self.retries {
             // Rate / cool-down is provider-local.
@@ -364,6 +458,12 @@ impl HttpClient {
                             break;
                         }
                         continue;
+                    }
+                    if cacheable
+                        && response_is_fully_successful(&value)
+                        && let Some(cache) = &self.success_cache
+                    {
+                        cache.store(lane.name, &cache_identity, &value);
                     }
                     return Ok(value);
                 }
@@ -737,6 +837,41 @@ fn is_secret_query_key(key: &str) -> bool {
     )
 }
 
+fn success_cache_identity(
+    method: &reqwest::Method,
+    redacted_endpoint: &str,
+    body: Option<&Value>,
+) -> String {
+    let body = body
+        .and_then(|value| serde_json::to_string(value).ok())
+        .unwrap_or_default();
+    format!("{method}\n{redacted_endpoint}\n{body}")
+}
+
+/// Spot prices are intentionally refreshed by UTC day. All other enrichment
+/// requests describe historical/on-chain evidence and retain successful raw
+/// responses across analysis and derived-cache upgrades.
+fn success_response_is_cacheable(redacted_endpoint: &str) -> bool {
+    let lower = redacted_endpoint.to_ascii_lowercase();
+    !(lower.contains("api.g.alchemy.com/prices/") || lower.contains("/prices/v1/"))
+}
+
+fn response_is_fully_successful(value: &Value) -> bool {
+    if let Some(rows) = value.as_array() {
+        return !rows.is_empty() && rows.iter().all(response_is_fully_successful);
+    }
+    let Some(object) = value.as_object() else {
+        return true;
+    };
+    if object.contains_key("error") || object.contains_key("errors") {
+        return false;
+    }
+    if object.contains_key("jsonrpc") {
+        return object.get("result").is_some_and(|result| !result.is_null());
+    }
+    true
+}
+
 /// Host + path + redacted query for logs (never includes API keys).
 fn redact_endpoint(url: &str) -> String {
     // reqwest error strings wrap URLs in parentheses; peel them first.
@@ -878,6 +1013,7 @@ pub fn print_provider_error(source: &str, request_key: &str, error: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use httpmock::{Method::POST, MockServer};
 
     #[test]
     fn endpoint_log_label_never_contains_path_or_api_key() {
@@ -1053,6 +1189,23 @@ mod tests {
     }
 
     #[test]
+    fn durable_cache_rejects_partial_or_failed_jsonrpc_payloads_and_prices() {
+        assert!(response_is_fully_successful(&serde_json::json!({
+            "jsonrpc":"2.0", "result": {"id":"asset"}
+        })));
+        assert!(!response_is_fully_successful(&serde_json::json!({
+            "jsonrpc":"2.0", "result": null
+        })));
+        assert!(!response_is_fully_successful(&serde_json::json!([
+            {"jsonrpc":"2.0", "result": {"ok":true}},
+            {"jsonrpc":"2.0", "error": {"code":-32000}}
+        ])));
+        assert!(!success_response_is_cacheable(
+            "api.g.alchemy.com/prices/v1/***/tokens/by-symbol"
+        ));
+    }
+
+    #[test]
     fn rate_limit_errors_are_silent_at_request_and_provider_layers() {
         for message in [
             "HTTP 429 Too Many Requests endpoint=example.test",
@@ -1066,6 +1219,58 @@ mod tests {
         let error = Analysis2Error::http("HTTP 500 endpoint=example.test");
         assert!(should_print_request_error(&error));
         assert!(!is_rate_limit_message(&error.to_string()));
+    }
+
+    #[tokio::test]
+    async fn durable_success_cache_reuses_raw_response_across_clients_and_keys() {
+        let server = MockServer::start_async().await;
+        let mock = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/");
+                then.status(200)
+                    .json_body(serde_json::json!({"jsonrpc":"2.0","result":{"id":"asset"}}));
+            })
+            .await;
+        let dir = std::env::temp_dir().join(format!(
+            "analysis2_http_success_cache_{}",
+            std::process::id()
+        ));
+        let _ = fs::remove_dir_all(&dir);
+        let body = serde_json::json!({"method":"getAsset","params":{"id":"mint"}});
+
+        let first = HttpClient::with_retries_and_cache(1, 0, Some(dir.clone())).unwrap();
+        let first_value = first
+            .post_json_helius(
+                &format!("{}/?api-key=first-secret", server.base_url()),
+                &[],
+                &body,
+            )
+            .await
+            .unwrap();
+        let second = HttpClient::with_retries_and_cache(1, 0, Some(dir.clone())).unwrap();
+        let second_value = second
+            .post_json_helius(
+                &format!("{}/?api-key=different-secret", server.base_url()),
+                &[],
+                &body,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(first_value, second_value);
+        mock.assert_hits_async(1).await;
+        let cache_text = fs::read_to_string(
+            fs::read_dir(dir.join("helius"))
+                .unwrap()
+                .next()
+                .unwrap()
+                .unwrap()
+                .path(),
+        )
+        .unwrap();
+        assert!(!cache_text.contains("first-secret"));
+        assert!(!cache_text.contains("different-secret"));
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

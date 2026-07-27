@@ -124,6 +124,23 @@ fn behavior_label(key: &str) -> String {
     }
 }
 
+fn behavior_instance_ratio_cell(key: &str, row: &Value) -> String {
+    match row.get("instance_ratio").and_then(Value::as_f64) {
+        Some(ratio) => percent_value(ratio),
+        None if key == "total"
+            && row
+                .get("instance_count")
+                .and_then(Value::as_u64)
+                .unwrap_or(0)
+                > 0 =>
+        {
+            "100.00%".into()
+        }
+        None if key == "total" => "n/a (0/0)".into(),
+        None => "null".into(),
+    }
+}
+
 pub fn write_seed_report_md(path: &Path, report: &SeedDedupReport) -> Result<(), Analysis2Error> {
     write_text(path, &seed_dedup_md_body(report))
 }
@@ -571,11 +588,7 @@ pub fn write_all_chains_md(
                 None => "null".into(),
             };
             let instances = u64_cell(&row["instance_count"]);
-            let inst_ratio = match row.get("instance_ratio").and_then(|v| v.as_f64()) {
-                Some(r) => percent_value(r),
-                None if key == "total" => "100.00%".into(),
-                None => "null".into(),
-            };
+            let inst_ratio = behavior_instance_ratio_cell(key, row);
             body.push_str(&format!(
                 "| {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                 behavior_label(key),
@@ -669,6 +682,30 @@ pub fn write_all_chains_md(
         dimensions["metadata_enabled"],
         dimensions["name_enabled"],
     ));
+    if let Some(reasons) = dq
+        .get("truncation_reason_counts")
+        .and_then(|value| value.as_object())
+        .filter(|reasons| !reasons.is_empty())
+    {
+        body.push_str("- 截断原因（合约数）:\n");
+        for (reason, count) in reasons {
+            body.push_str(&format!("  - {reason}: {}\n", u64_cell(count)));
+        }
+    }
 
     write_text(path, &body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn zero_total_behavior_instances_are_not_reported_as_one_hundred_percent() {
+        let empty = json!({"instance_count": 0, "instance_ratio": null});
+        let populated = json!({"instance_count": 2, "instance_ratio": null});
+        assert_eq!(behavior_instance_ratio_cell("total", &empty), "n/a (0/0)");
+        assert_eq!(behavior_instance_ratio_cell("total", &populated), "100.00%");
+    }
 }

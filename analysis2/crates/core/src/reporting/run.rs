@@ -998,6 +998,7 @@ fn build_run_summary_for_scope_with_store(
     .into_iter()
     .map(|name| (name, [0; 5]))
     .collect();
+    let mut truncation_reason_counts = BTreeMap::<String, u64>::new();
     let mut analyzed_suspected_count = 0u64;
 
     for analysis in analyses {
@@ -1082,6 +1083,9 @@ fn build_run_summary_for_scope_with_store(
             ("value_flows", analysis.evidence_quality.value_flows),
         ] {
             evidence_statuses.get_mut(name).unwrap()[status_index(status)] += 1;
+        }
+        for reason in &analysis.evidence_quality.truncation_reasons {
+            *truncation_reason_counts.entry(reason.clone()).or_insert(0) += 1;
         }
 
         for (addr, attr) in &analysis.attribution {
@@ -1311,6 +1315,7 @@ fn build_run_summary_for_scope_with_store(
         json!({
             "contract_count": contracts_with_behavior.len() as u64,
             "instance_count": total_instances,
+            "instance_ratio": (total_instances > 0).then_some(1.0),
             "address_count": total_behavior_addresses.len() as u64,
             "nft_count": total_behavior_nfts.len() as u64,
             "linked_buyer_count": total_linked_buyers.len() as u64,
@@ -1522,6 +1527,7 @@ fn build_run_summary_for_scope_with_store(
         "legit_relation_verification_incomplete": legit_relation_incomplete,
         "pricing": pricing_quality,
         "evidence": evidence_quality,
+        "truncation_reason_counts": truncation_reason_counts,
     });
     let seed_rows = scoped_reports
         .iter()
@@ -2308,6 +2314,10 @@ mod tests {
         let mut partial = empty_analysis("base", "0xcand_b", 2);
         partial.evidence_quality = complete.evidence_quality.clone();
         partial.evidence_quality.gas = EvidenceStatus::Truncated;
+        partial
+            .evidence_quality
+            .truncation_reasons
+            .push("gas:receipt_partial".into());
         partial.economics.operator_output_usd = 100.0;
         partial.economics.attacker_input_usd = Some(1.0);
         partial.economics.output_input_ratio = Some(100.0);
@@ -2341,6 +2351,10 @@ mod tests {
         assert_eq!(economics["complete_evidence_output_input_ratio_count"], 1);
         assert_eq!(
             economics["complete_evidence_output_input_ratio_lt1_count"],
+            1
+        );
+        assert_eq!(
+            summary["data_quality"]["truncation_reason_counts"]["gas:receipt_partial"],
             1
         );
     }
@@ -2786,6 +2800,7 @@ mod tests {
             0
         );
         assert_eq!(summary["behaviors"]["total"]["instance_count"], 0);
+        assert_eq!(summary["behaviors"]["total"]["instance_ratio"], Value::Null);
         assert_eq!(summary["behaviors"]["wash_trading"]["instance_count"], 0);
     }
 

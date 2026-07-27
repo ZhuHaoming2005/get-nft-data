@@ -48,12 +48,15 @@ pub struct SolanaAssetSnapshot {
     /// Missing/unknown interfaces are not included because they are not
     /// authoritative negative NFT identity evidence.
     pub rejected_non_nft_ids: Vec<String>,
+    /// Direct getAsset recovery found collection grouping, so the returned ids
+    /// cannot prove the full collection population.
+    pub direct_grouped: bool,
 }
 
 enum DirectAssetRow {
     Asset(SolanaAsset, Vec<String>, bool, bool),
     Missing,
-    ExplicitlyFungible(String),
+    ExplicitlyNonNft(String),
     Failed(String),
 }
 
@@ -486,16 +489,26 @@ pub async fn fetch_assets_by_ids(
             let Some(result) = payload.get("result").filter(|value| !value.is_null()) else {
                 return DirectAssetRow::Missing;
             };
-            if !is_nft_asset_payload(result) {
-                let interface = result
-                    .get("interface")
-                    .and_then(Value::as_str)
-                    .unwrap_or("missing");
-                if is_explicit_fungible_interface(interface) {
-                    return DirectAssetRow::ExplicitlyFungible(mint);
+            let mut nft_identity = is_nft_asset_payload(result);
+            let interface = result
+                .get("interface")
+                .and_then(Value::as_str)
+                .unwrap_or("missing");
+            if !nft_identity
+                && !is_explicit_fungible_interface(interface)
+                && !is_explicit_non_nft_interface(interface)
+            {
+                nft_identity = custom_payload_is_single_nft(result)
+                    || verify_single_nft_mint(&client, &url, &mint).await;
+            }
+            if !nft_identity {
+                if is_explicit_fungible_interface(interface)
+                    || is_explicit_non_nft_interface(interface)
+                {
+                    return DirectAssetRow::ExplicitlyNonNft(mint);
                 }
                 return DirectAssetRow::Failed(format!(
-                    "getAsset {mint}: returned unknown NFT identity interface {interface}"
+                    "getAsset {mint}: returned ambiguous digital asset identity interface {interface}"
                 ));
             }
             let Some(asset) = parse_asset(result) else {
@@ -545,7 +558,7 @@ pub async fn fetch_assets_by_ids(
                 any_grouped |= grouped;
             }
             DirectAssetRow::Missing => missing_count += 1,
-            DirectAssetRow::ExplicitlyFungible(mint) => {
+            DirectAssetRow::ExplicitlyNonNft(mint) => {
                 snapshot.rejected_non_nft_ids.push(mint);
             }
             DirectAssetRow::Failed(error) => failures.push(error),
@@ -555,6 +568,7 @@ pub async fn fetch_assets_by_ids(
     snapshot.authority.dedup();
     snapshot.rejected_non_nft_ids.sort();
     snapshot.rejected_non_nft_ids.dedup();
+    snapshot.direct_grouped = any_grouped;
 
     if snapshot.assets.is_empty() && !failures.is_empty() {
         return FetchOutcome::failed(
@@ -1947,6 +1961,7 @@ fn is_nft_asset_payload(item: &Value) -> bool {
                     | "v2_nft"
                     | "programmablenft"
                     | "mplcoreasset"
+                    | "mplbubblegumv2"
             )
         });
     let standard_is_nft = item
@@ -1958,10 +1973,58 @@ fn is_nft_asset_payload(item: &Value) -> bool {
     interface_is_nft || standard_is_nft
 }
 
+fn json_u64(value: Option<&Value>) -> Option<u64> {
+    value.and_then(|value| {
+        value
+            .as_u64()
+            .or_else(|| value.as_str().and_then(|text| text.parse().ok()))
+    })
+}
+
+fn custom_payload_is_single_nft(item: &Value) -> bool {
+    let token_info = item.get("token_info");
+    let decimals = json_u64(token_info.and_then(|value| value.get("decimals")));
+    let supply = json_u64(token_info.and_then(|value| value.get("supply")));
+    let single_owner = item
+        .get("ownership")
+        .and_then(|value| value.get("ownership_model"))
+        .and_then(Value::as_str)
+        .is_none_or(|model| model.eq_ignore_ascii_case("single"));
+    decimals == Some(0) && supply == Some(1) && single_owner
+}
+
+async fn verify_single_nft_mint(client: &HttpClient, url: &str, mint: &str) -> bool {
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": format!("mint-identity-{mint}"),
+        "method": "getAccountInfo",
+        "params": [mint, {"encoding": "jsonParsed", "commitment": "confirmed"}]
+    });
+    let Ok(payload) = client.post_json_helius(url, &[], &body).await else {
+        return false;
+    };
+    let info = payload
+        .get("result")
+        .and_then(|value| value.get("value"))
+        .and_then(|value| value.get("data"))
+        .and_then(|value| value.get("parsed"))
+        .and_then(|value| value.get("info"));
+    let decimals = json_u64(info.and_then(|value| value.get("decimals")));
+    let supply = json_u64(info.and_then(|value| value.get("supply")));
+    decimals == Some(0) && supply == Some(1)
+}
+
 fn is_explicit_fungible_interface(interface: &str) -> bool {
     matches!(
         interface.to_ascii_lowercase().as_str(),
         "fungibleasset" | "fungibletoken"
+    )
+}
+
+fn is_explicit_non_nft_interface(interface: &str) -> bool {
+    matches!(
+        interface.to_ascii_lowercase().as_str(),
+        "identity" | "executable" | "mplcorecollection" | "mplcoregroup"
     )
 }
 
@@ -2141,6 +2204,53 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn direct_custom_asset_uses_mint_shape_fallback() {
+        let server = MockServer::start_async().await;
+        let mint = "So11111111111111111111111111111111111111112";
+        let asset = server
+            .mock_async(|when, then| {
+                when.method(POST).body_contains("getAsset");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "result": {
+                        "interface": "Custom",
+                        "id": mint,
+                        "ownership": {"owner": "holder"},
+                        "grouping": []
+                    }
+                }));
+            })
+            .await;
+        let mint_info = server
+            .mock_async(|when, then| {
+                when.method(POST).body_contains("getAccountInfo");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "result": {"value": {"data": {"parsed": {"info": {
+                        "decimals": 0,
+                        "supply": "1"
+                    }}}}}
+                }));
+            })
+            .await;
+        let client = HttpClient::with_retries(2, 0).unwrap();
+        let outcome = fetch_assets_by_ids(
+            &client,
+            &server.base_url(),
+            Some("key"),
+            &[mint.to_owned()],
+            10,
+        )
+        .await;
+
+        assert_eq!(asset.hits(), 1);
+        assert_eq!(mint_info.hits(), 1);
+        assert_eq!(outcome.status, EvidenceStatus::Complete);
+        assert_eq!(outcome.value.assets.len(), 1);
+        assert!(outcome.failure.is_none());
+    }
+
+    #[tokio::test]
     async fn direct_grouped_asset_remains_truncated_without_collection_enumeration() {
         let server = MockServer::start_async().await;
         let mint = "So11111111111111111111111111111111111111112";
@@ -2183,6 +2293,14 @@ mod tests {
             &json!({"interface": "ProgrammableNFT"})
         ));
         assert!(is_nft_asset_payload(&json!({"interface": "MplCoreAsset"})));
+        assert!(is_nft_asset_payload(&json!({
+            "interface": "MplBubblegumV2"
+        })));
+        assert!(custom_payload_is_single_nft(&json!({
+            "interface": "Custom",
+            "token_info": {"decimals": 0, "supply": "1"},
+            "ownership": {"ownership_model": "single"}
+        })));
         assert!(is_nft_asset_payload(&json!({
             "content": {"metadata": {"token_standard": "NonFungible"}}
         })));
