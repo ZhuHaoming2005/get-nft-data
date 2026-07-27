@@ -791,6 +791,48 @@ fn normalize_negative_zero(value: &mut Value) {
     }
 }
 
+fn apply_dedup_dimensions(summary: &mut Value, dimensions: &Value) {
+    if let Some(quality) = summary
+        .get_mut("data_quality")
+        .and_then(Value::as_object_mut)
+    {
+        quality.insert("dedup_dimensions".into(), dimensions.clone());
+    }
+    let Some(rows) = summary
+        .get_mut("duplicate_scale")
+        .and_then(Value::as_array_mut)
+    else {
+        return;
+    };
+    for row in rows {
+        let Some(category) = row.get("category").and_then(Value::as_str) else {
+            continue;
+        };
+        let enabled = dimensions
+            .get(format!("{category}_enabled"))
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let Some(object) = row.as_object_mut() else {
+            continue;
+        };
+        object.insert("enabled".into(), json!(enabled));
+        if !enabled {
+            for field in [
+                "duplicate_nft_count",
+                "duplicate_nft_ratio",
+                "duplicate_nft_ratio_numerator",
+                "duplicate_nft_ratio_denominator",
+                "duplicate_contract_count",
+                "duplicate_contract_ratio",
+                "duplicate_contract_ratio_numerator",
+                "duplicate_contract_ratio_denominator",
+            ] {
+                object.insert(field.into(), Value::Null);
+            }
+        }
+    }
+}
+
 /// Aggregate one independently analyzed reporting scope over every available
 /// seed report. Additional reports are kept for API compatibility and are
 /// included identically.
@@ -942,9 +984,13 @@ fn build_run_summary_for_scope_with_store(
                 .get(analysis.contract_id as usize)
                 .map(|contract| contract.nft_count)
         });
-        let count = provider_count.unwrap_or_else(|| {
+        // The denominator is the complete NFT population of every hit contract
+        // in the resident analysis universe. Provider holder snapshots describe
+        // current ownership and are only a fallback when no resident store is
+        // available; they must not redefine "all NFTs in the hit contract".
+        let count = resident_count.or(provider_count).unwrap_or_else(|| {
             hit_contract_nft_count_complete = false;
-            resident_count.unwrap_or(fallback)
+            fallback
         });
         if count < fallback {
             hit_contract_nft_count_complete = false;
@@ -974,6 +1020,8 @@ fn build_run_summary_for_scope_with_store(
     let mut wash_cycle_4 = 0u64;
     let mut wash_cycle_5p = 0u64;
     let mut contracts_with_behavior = AHashSet::new();
+    let mut complete_behavior_contracts = AHashSet::new();
+    let mut behavior_analyzable_contract_count = 0u64;
     let mut gas_by_contract = Vec::with_capacity(suspected.len());
     let mut value_flow_usd_by_event = AHashMap::<
         (String, String, String, String, String),
@@ -1007,6 +1055,22 @@ fn build_run_summary_for_scope_with_store(
             continue;
         }
         analyzed_suspected_count += 1;
+        let behavior_evidence_complete = [
+            analysis.evidence_quality.transfers,
+            analysis.evidence_quality.sales,
+            analysis.evidence_quality.holders,
+            analysis.evidence_quality.prices,
+        ]
+        .into_iter()
+        .all(|status| {
+            matches!(
+                status,
+                crate::enrich::EvidenceStatus::Complete | crate::enrich::EvidenceStatus::Empty
+            )
+        });
+        if behavior_evidence_complete {
+            behavior_analyzable_contract_count += 1;
+        }
         let econ = economics_usd_from(analysis);
         merge_usd(&mut economics, &econ);
         collect_economic_events(&mut economic_usd_by_event, analysis);
@@ -1107,6 +1171,10 @@ fn build_run_summary_for_scope_with_store(
             let behavior_key = behavior_kind_key(inst.kind);
             let aggregate = behavior_map.get_mut(behavior_key).unwrap();
             aggregate.instance_count += 1;
+            if behavior_evidence_complete {
+                aggregate.complete_instance_count += 1;
+                aggregate.complete_contracts.insert(key.clone());
+            }
             aggregate.addresses.extend(
                 inst.addresses
                     .iter()
@@ -1148,6 +1216,9 @@ fn build_run_summary_for_scope_with_store(
         }
         if !kinds_seen.is_empty() {
             contracts_with_behavior.insert(key.clone());
+            if behavior_evidence_complete {
+                complete_behavior_contracts.insert(key.clone());
+            }
         }
         for behavior_key in kinds_seen {
             behavior_map
@@ -1284,9 +1355,15 @@ fn build_run_summary_for_scope_with_store(
             (*key).into(),
             json!({
                 "contract_count": aggregate.contracts.len() as u64,
-                "contract_coverage_ratio": (suspected_n > 0)
+                "observed_contract_coverage_ratio": (suspected_n > 0)
                     .then_some(aggregate.contracts.len() as f64 / suspected_n as f64),
+                "complete_evidence_contract_count": aggregate.complete_contracts.len() as u64,
+                "behavior_analyzable_contract_count": behavior_analyzable_contract_count,
+                "contract_coverage_ratio": (behavior_analyzable_contract_count > 0).then_some(
+                    aggregate.complete_contracts.len() as f64
+                        / behavior_analyzable_contract_count as f64),
                 "instance_count": aggregate.instance_count,
+                "complete_evidence_instance_count": aggregate.complete_instance_count,
                 "instance_ratio": (total_instances > 0)
                     .then_some(aggregate.instance_count as f64 / total_instances as f64),
                 "address_count": aggregate.addresses.len() as u64,
@@ -1314,6 +1391,11 @@ fn build_run_summary_for_scope_with_store(
         "total".into(),
         json!({
             "contract_count": contracts_with_behavior.len() as u64,
+            "complete_evidence_contract_count": complete_behavior_contracts.len() as u64,
+            "behavior_analyzable_contract_count": behavior_analyzable_contract_count,
+            "contract_coverage_ratio": (behavior_analyzable_contract_count > 0).then_some(
+                complete_behavior_contracts.len() as f64
+                    / behavior_analyzable_contract_count as f64),
             "instance_count": total_instances,
             "instance_ratio": (total_instances > 0).then_some(1.0),
             "address_count": total_behavior_addresses.len() as u64,
@@ -1570,6 +1652,8 @@ fn build_run_summary_for_scope_with_store(
         },
         "behaviors": behaviors,
         "behavior_contract_count": contracts_with_behavior.len() as u64,
+        "behavior_analyzable_contract_count": behavior_analyzable_contract_count,
+        "complete_evidence_behavior_contract_count": complete_behavior_contracts.len() as u64,
         "wash_cycle_size_distribution": wash_cycle_size_distribution,
         "economics": economics_json,
         "data_quality": data_quality,
@@ -1605,7 +1689,9 @@ pub fn build_run_summary(
 #[derive(Default)]
 struct BehaviorAgg {
     contracts: AHashSet<String>,
+    complete_contracts: AHashSet<String>,
     instance_count: u64,
+    complete_instance_count: u64,
     addresses: AHashSet<String>,
     nfts: AHashSet<String>,
     linked_buyers: AHashSet<String>,
@@ -1803,31 +1889,16 @@ pub fn write_run_outputs(
         "name_enabled": params.name_threshold.is_some(),
     });
     for summary in [&mut all_summary, &mut intra_summary, &mut cross_summary] {
-        if let Some(quality) = summary
-            .get_mut("data_quality")
-            .and_then(Value::as_object_mut)
-        {
-            quality.insert("dedup_dimensions".into(), dimensions.clone());
-        }
+        apply_dedup_dimensions(summary, &dimensions);
     }
     for summary in matrix_summaries.values_mut() {
-        if let Some(quality) = summary
-            .get_mut("data_quality")
-            .and_then(Value::as_object_mut)
-        {
-            quality.insert("dedup_dimensions".into(), dimensions.clone());
-        }
+        apply_dedup_dimensions(summary, &dimensions);
     }
     for summary in intra_chain_summaries
         .values_mut()
         .chain(cross_primary_summaries.values_mut())
     {
-        if let Some(quality) = summary
-            .get_mut("data_quality")
-            .and_then(Value::as_object_mut)
-        {
-            quality.insert("dedup_dimensions".into(), dimensions.clone());
-        }
+        apply_dedup_dimensions(summary, &dimensions);
     }
     super::json::write_four_scope_paper_summaries_public(
         output_dir,
@@ -2012,6 +2083,11 @@ mod tests {
         ] {
             assert!(summary.get(key).is_some(), "missing summary key {key}");
         }
+        assert_eq!(summary["behavior_analyzable_contract_count"], 0);
+        assert_eq!(
+            summary["behaviors"]["pump_and_exit"]["contract_coverage_ratio"],
+            Value::Null
+        );
         for removed in [
             "analyzed_seed_count",
             "incomplete_seed_count",
@@ -2094,7 +2170,7 @@ mod tests {
     }
 
     #[test]
-    fn stuck_ratio_uses_provider_complete_contract_population() {
+    fn stuck_ratio_uses_resident_complete_contract_population() {
         let mut store = ResidentStore::new();
         for (row, token_id) in ["1", "2", "3", "4"].into_iter().enumerate() {
             store
@@ -2128,8 +2204,6 @@ mod tests {
         );
         let mut analysis = empty_analysis("base", "0xcand", 0);
         analysis.economics.stuck_nft_count = 2;
-        analysis.collection_nft_count = Some(4);
-        analysis.collection_nft_count_complete = true;
         let summary = build_run_summary_for_scope_with_store(
             std::slice::from_ref(&report.dedup.seed),
             &[&report],
@@ -2178,6 +2252,34 @@ mod tests {
         assert_eq!(
             summary["economics"]["hit_contract_nft_count_complete"],
             false
+        );
+    }
+
+    #[test]
+    fn disabled_dedup_dimension_is_null_not_zero() {
+        let mut summary = json!({
+            "data_quality": {},
+            "duplicate_scale": [{
+                "category": "name",
+                "duplicate_nft_count": 0,
+                "duplicate_nft_ratio": 0.0,
+                "duplicate_nft_ratio_numerator": 0,
+                "duplicate_nft_ratio_denominator": 10,
+                "duplicate_contract_count": 0,
+                "duplicate_contract_ratio": 0.0,
+                "duplicate_contract_ratio_numerator": 0,
+                "duplicate_contract_ratio_denominator": 5
+            }]
+        });
+        apply_dedup_dimensions(&mut summary, &json!({"name_enabled": false}));
+        assert_eq!(summary["duplicate_scale"][0]["enabled"], false);
+        assert_eq!(
+            summary["duplicate_scale"][0]["duplicate_nft_count"],
+            Value::Null
+        );
+        assert_eq!(
+            summary["duplicate_scale"][0]["duplicate_contract_ratio"],
+            Value::Null
         );
     }
 

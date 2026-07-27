@@ -141,6 +141,18 @@ fn behavior_instance_ratio_cell(key: &str, row: &Value) -> String {
     }
 }
 
+fn wash_cycle_ratio_cell(row: &Value) -> String {
+    if row["cycle_ratio_denominator"].as_u64() == Some(0) {
+        "n/a (0/0)".into()
+    } else {
+        pct_cell(
+            &row["cycle_ratio"],
+            &row["cycle_ratio_numerator"],
+            &row["cycle_ratio_denominator"],
+        )
+    }
+}
+
 pub fn write_seed_report_md(path: &Path, report: &SeedDedupReport) -> Result<(), Analysis2Error> {
     write_text(path, &seed_dedup_md_body(report))
 }
@@ -272,6 +284,13 @@ pub fn write_all_chains_md(
         if let Some(rows) = summary.get("duplicate_scale").and_then(|v| v.as_array()) {
             body.push_str("| 类别 | 重复 NFT 数 | NFT 占比 | 重复合约数 | 合约占比 |\n| --- | ---: | ---: | ---: | ---: |\n");
             for row in rows {
+                if row.get("enabled").and_then(Value::as_bool) == Some(false) {
+                    body.push_str(&format!(
+                        "| {} | n/a（未启用） | n/a | n/a（未启用） | n/a |\n",
+                        row["category"].as_str().unwrap_or("?")
+                    ));
+                    continue;
+                }
                 let nft_n = u64_cell(&row["duplicate_nft_count"]);
                 let c_n = u64_cell(&row["duplicate_contract_count"]);
                 let nft_ratio = match row["duplicate_nft_ratio"].as_f64() {
@@ -553,19 +572,24 @@ pub fn write_all_chains_md(
     // ## 恶意行为汇总
     body.push_str("\n## 恶意行为汇总\n\n");
     body.push_str(&format!(
-        "- 有合约级行为统计的合约数: {}\n",
+        "- 已观察到至少一种恶意行为的合约数: {}\n",
         u64_cell(
             summary
                 .get("behavior_contract_count")
                 .unwrap_or(&Value::Null)
         )
     ));
+    body.push_str(&format!(
+        "- 具备完整行为证据的合约数: {}\n",
+        u64_cell(
+            summary
+                .get("behavior_analyzable_contract_count")
+                .unwrap_or(&Value::Null)
+        )
+    ));
     body.push_str(
-        "| 行为 | 合约数 | 覆盖率 | 实例数 | 行为占比 | 地址数 | NFT 数 | 关联买家 | 关联付费暴露 USD |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
+        "| 行为 | 已观察合约数 | 完整证据命中率 | 已观察实例数 | 行为占比 | 地址数 | NFT 数 | 关联买家 | 关联付费暴露 USD |\n| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n",
     );
-    let suspected = summary["suspected_duplicate_contract_count"]
-        .as_u64()
-        .unwrap_or(0);
     let order = [
         "wash_trading",
         "pump_and_exit",
@@ -582,10 +606,11 @@ pub fn write_all_chains_md(
                 continue;
             };
             let contracts = u64_cell(&row["contract_count"]);
+            let complete_contracts = u64_cell(&row["complete_evidence_contract_count"]);
+            let analyzable = u64_cell(&row["behavior_analyzable_contract_count"]);
             let coverage = match row.get("contract_coverage_ratio").and_then(|v| v.as_f64()) {
-                Some(r) => format!("{} ({contracts}/{suspected})", percent_value(r)),
-                None if key == "total" => format!("n/a ({contracts}/{suspected})"),
-                None => "null".into(),
+                Some(r) => format!("{} ({complete_contracts}/{analyzable})", percent_value(r)),
+                None => format!("n/a ({complete_contracts}/{analyzable})"),
             };
             let instances = u64_cell(&row["instance_count"]);
             let inst_ratio = behavior_instance_ratio_cell(key, row);
@@ -603,6 +628,9 @@ pub fn write_all_chains_md(
             ));
         }
     }
+    body.push_str(
+        "\n> 行为命中率只使用具备完整行为证据的合约作为分母；不完整证据中的未检出不会按 0% 处理。\n",
+    );
 
     // ## Wash Cycle 节点规模
     body.push_str("\n## Wash Cycle 节点规模\n\n");
@@ -612,11 +640,7 @@ pub fn write_all_chains_md(
         .and_then(|v| v.as_array())
     {
         for row in rows {
-            let ratio = pct_cell(
-                &row["cycle_ratio"],
-                &row["cycle_ratio_numerator"],
-                &row["cycle_ratio_denominator"],
-            );
+            let ratio = wash_cycle_ratio_cell(row);
             body.push_str(&format!(
                 "| {} | {} | {} |\n",
                 row["node_count_bucket"].as_str().unwrap_or("?"),
@@ -707,5 +731,15 @@ mod tests {
         let populated = json!({"instance_count": 2, "instance_ratio": null});
         assert_eq!(behavior_instance_ratio_cell("total", &empty), "n/a (0/0)");
         assert_eq!(behavior_instance_ratio_cell("total", &populated), "100.00%");
+    }
+
+    #[test]
+    fn zero_wash_cycles_are_not_reported_as_null() {
+        let row = json!({
+            "cycle_ratio": null,
+            "cycle_ratio_numerator": 0,
+            "cycle_ratio_denominator": 0
+        });
+        assert_eq!(wash_cycle_ratio_cell(&row), "n/a (0/0)");
     }
 }

@@ -2,8 +2,9 @@
 //!
 //! Derive operators from candidate NFT activity, then query
 //! `alchemy_getAssetTransfers` category `external` for each operator
-//! across the operator's full history. A returned page key is marked
-//! Truncated, so formal reports never pretend a one-page partial history is complete.
+//! inside the candidate activity interval plus a bounded setup/cashout margin.
+//! A returned page key is marked Truncated, so formal reports never pretend a
+//! one-page partial history is complete.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -25,6 +26,9 @@ use super::types::{
 const ZERO: &str = "0x0000000000000000000000000000000000000000";
 /// Bound concurrent value-flow requests without dropping operator seeds.
 const VALUE_FLOW_REQUEST_CONCURRENCY: usize = 64;
+/// Maximum distance from candidate NFT activity for setup/cashout evidence.
+/// This prevents unrelated lifetime wallet traffic from becoming attack flow.
+const VALUE_FLOW_BOUNDARY_BLOCKS: u64 = 50_000;
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 struct ExternalTransferKey {
@@ -107,9 +111,9 @@ pub fn collect_operator_seeds(addresses: &[String]) -> Vec<String> {
     set.into_iter().collect()
 }
 
-/// Derive the value-flow query set from the same role rule used by attribution:
-/// paid buyers that still hold the purchased NFT are victims; every other
-/// participant remains eligible as an operator seed.
+/// Derive a conservative value-flow query set from positive operator evidence.
+/// Ordinary transfer/sale participants are not operators merely because they
+/// are not proven victims.
 pub(crate) fn derive_operator_seeds(
     chain: &str,
     candidate: &str,
@@ -135,13 +139,33 @@ pub(crate) fn derive_operator_seeds(
     if let Some(payer) = deployment.and_then(|event| event.fee_payer.as_deref()) {
         insert(payer);
     }
-    for transfer in transfers {
-        insert(&transfer.from);
-        insert(&transfer.to);
-    }
+    let mut seller_counts = AHashMap::<String, usize>::new();
     for sale in sales {
-        insert(&sale.seller);
-        insert(&sale.buyer);
+        if let Some(seller) = normalize_address(chain, &sale.seller) {
+            *seller_counts.entry(seller).or_default() += 1;
+        }
+    }
+    for (seller, count) in seller_counts {
+        if count >= 3 {
+            insert(&seller);
+        }
+    }
+    let mut distribution_targets = AHashMap::<String, AHashSet<String>>::new();
+    for transfer in transfers.iter().filter(|transfer| !transfer.is_mint) {
+        let Some(from) = normalize_address(chain, &transfer.from) else {
+            continue;
+        };
+        let Some(to) = normalize_address(chain, &transfer.to) else {
+            continue;
+        };
+        if from != ZERO && to != ZERO && from != to {
+            distribution_targets.entry(from).or_default().insert(to);
+        }
+    }
+    for (sender, targets) in distribution_targets {
+        if targets.len() >= 3 {
+            insert(&sender);
+        }
     }
     all.into_iter()
         .filter(|address| !victims.contains(address))
@@ -162,9 +186,9 @@ fn value_flow_request_key(association_incomplete: bool) -> String {
         notes.push("candidate activity window or value-flow block number unavailable".into());
     }
     if notes.is_empty() {
-        "alchemy_value_flows".into()
+        "alchemy_value_flows_bounded".into()
     } else {
-        format!("alchemy_value_flows ({})", notes.join("; "))
+        format!("alchemy_value_flows_bounded ({})", notes.join("; "))
     }
 }
 
@@ -198,12 +222,17 @@ fn activity_related_transfers(
             association_incomplete = true;
             continue;
         };
-        if block < lo && !from_op && to_op {
+        if block < lo && lo.saturating_sub(block) <= VALUE_FLOW_BOUNDARY_BLOCKS && !from_op && to_op
+        {
             nearest_funding
                 .entry(transfer.to.clone())
                 .and_modify(|current| *current = (*current).max(block))
                 .or_insert(block);
-        } else if block > hi && from_op && !to_op {
+        } else if block > hi
+            && block.saturating_sub(hi) <= VALUE_FLOW_BOUNDARY_BLOCKS
+            && from_op
+            && !to_op
+        {
             nearest_withdrawal
                 .entry(transfer.from.clone())
                 .and_modify(|current| *current = (*current).min(block))
@@ -358,20 +387,38 @@ async fn fetch_evm_value_flows_impl(
     cache: Option<ExternalTransferCache>,
 ) -> FetchOutcome<Vec<ValueFlowEdge>> {
     let Some(api_key) = api_key else {
-        return FetchOutcome::skipped("alchemy_value_flows");
+        return FetchOutcome::skipped("alchemy_value_flows_bounded");
     };
 
     let operators = collect_operator_seeds(operator_seeds);
     if operators.is_empty() {
-        return FetchOutcome::ok(Vec::new(), 0, false, "alchemy", "alchemy_value_flows");
+        return FetchOutcome::ok(
+            Vec::new(),
+            0,
+            false,
+            "alchemy",
+            "alchemy_value_flows_bounded",
+        );
     }
     if transfers.is_empty() && sales.is_empty() {
-        return FetchOutcome::ok(Vec::new(), 0, false, "alchemy", "alchemy_value_flows");
+        return FetchOutcome::ok(
+            Vec::new(),
+            0,
+            false,
+            "alchemy",
+            "alchemy_value_flows_bounded",
+        );
     }
 
-    // Fetch full history so the nearest setup/cashout boundary can be found,
-    // then retain only flows associated with the candidate activity window.
-    let (from_block, to_block) = (0, u64::MAX);
+    // Query only the candidate activity interval plus a bounded setup/cashout
+    // margin. Immutable successful pages remain reusable, but unrelated
+    // lifetime wallet traffic never enters this candidate's evidence.
+    let Some((activity_from, activity_to)) = activity_block_window(transfers, sales) else {
+        let request_key = value_flow_request_key(true);
+        return FetchOutcome::ok(Vec::new(), 0, true, "alchemy", &request_key);
+    };
+    let from_block = activity_from.saturating_sub(VALUE_FLOW_BOUNDARY_BLOCKS);
+    let to_block = activity_to.saturating_add(VALUE_FLOW_BOUNDARY_BLOCKS);
 
     let operator_set: AHashSet<String> = operators.iter().cloned().collect();
     let requests = operators
@@ -458,11 +505,11 @@ async fn fetch_evm_value_flows_impl(
         } else {
             failures.join("; ")
         };
-        return FetchOutcome::failed("alchemy", "alchemy_value_flows", detail);
+        return FetchOutcome::failed("alchemy", "alchemy_value_flows_bounded", detail);
     }
 
     let (raw, association_incomplete) =
-        activity_related_transfers(&raw, &operator_set, activity_block_window(transfers, sales));
+        activity_related_transfers(&raw, &operator_set, Some((activity_from, activity_to)));
     let mut edges = Vec::new();
     let mut seen = BTreeSet::new();
     for transfer in raw {
@@ -509,7 +556,7 @@ async fn fetch_evm_value_flows_impl(
     // (request_key), never in outcome.failure / quality.failures.
     if any_fail && !failures.is_empty() {
         outcome.failure = Some(format!(
-            "alchemy_value_flows: partial failures: {}",
+            "alchemy_value_flows_bounded: partial failures: {}",
             failures.into_iter().take(3).collect::<Vec<_>>().join("; ")
         ));
     }
@@ -687,6 +734,59 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_participants_are_not_derived_operator_seeds() {
+        let seller = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let buyer = "0xbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let sale = SaleEvent {
+            seller: seller.into(),
+            buyer: buyer.into(),
+            token_id: "1".into(),
+            native_amount: Some(1.0),
+            ..SaleEvent::default()
+        };
+        let seeds = derive_operator_seeds(
+            "ethereum",
+            "0xcccccccccccccccccccccccccccccccccccccccc",
+            &[],
+            None,
+            &[],
+            &[sale],
+            HolderSnapshot {
+                records: &[],
+                status: EvidenceStatus::Complete,
+            },
+        );
+        assert!(!seeds.contains(&seller.to_owned()));
+        assert!(!seeds.contains(&buyer.to_owned()));
+    }
+
+    #[test]
+    fn repeated_seller_is_a_derived_operator_seed() {
+        let seller = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let sales = (0..3)
+            .map(|index| SaleEvent {
+                seller: seller.into(),
+                buyer: format!("0x{:040x}", index + 1),
+                token_id: index.to_string(),
+                ..SaleEvent::default()
+            })
+            .collect::<Vec<_>>();
+        let seeds = derive_operator_seeds(
+            "ethereum",
+            "0xcccccccccccccccccccccccccccccccccccccccc",
+            &[],
+            None,
+            &[],
+            &sales,
+            HolderSnapshot {
+                records: &[],
+                status: EvidenceStatus::Complete,
+            },
+        );
+        assert!(seeds.contains(&seller.to_owned()));
+    }
+
+    #[test]
     fn operator_seeds_are_never_truncated() {
         let controllers: Vec<String> = (1..=35).map(|i| format!("0x{i:040x}")).collect();
         let seeds = collect_operator_seeds(&controllers);
@@ -697,7 +797,7 @@ mod tests {
     fn request_key_carries_association_incomplete_note() {
         let key = value_flow_request_key(true);
         assert!(key.contains("candidate activity window"));
-        assert_eq!(value_flow_request_key(false), "alchemy_value_flows");
+        assert_eq!(value_flow_request_key(false), "alchemy_value_flows_bounded");
     }
 
     #[test]
@@ -864,5 +964,22 @@ mod tests {
         let (selected, incomplete) = activity_related_transfers(&raw, &operators, Some((10, 20)));
         assert!(selected.is_empty());
         assert!(incomplete);
+    }
+
+    #[test]
+    fn activity_filter_rejects_distant_boundary_flows() {
+        let operators = AHashSet::from_iter(["0xop".to_owned()]);
+        let raw = vec![NativeTransfer {
+            tx_hash: "distant".into(),
+            from: "0xfunder".into(),
+            to: "0xop".into(),
+            block_number: Some(10),
+            ..NativeTransfer::default()
+        }];
+        let lo = VALUE_FLOW_BOUNDARY_BLOCKS + 100;
+        let (selected, incomplete) =
+            activity_related_transfers(&raw, &operators, Some((lo, lo + 10)));
+        assert!(selected.is_empty());
+        assert!(!incomplete);
     }
 }

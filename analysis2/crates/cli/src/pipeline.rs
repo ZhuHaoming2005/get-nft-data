@@ -732,7 +732,17 @@ fn cached_evidence_needs_retry(bundle: &EvidenceBundle) -> bool {
                     || bundle.quality.histories == EvidenceStatus::Truncated)
                 && failure.contains("helius"))
     });
-    failed || transient_partial
+    let stale_value_flow_semantics = !bundle.chain.eq_ignore_ascii_case("solana")
+        && matches!(
+            bundle.quality.value_flows,
+            EvidenceStatus::Complete | EvidenceStatus::Empty | EvidenceStatus::Truncated
+        )
+        && !bundle.provenance.iter().any(|observation| {
+            observation
+                .request_key
+                .starts_with("alchemy_value_flows_bounded")
+        });
+    failed || transient_partial || stale_value_flow_semantics
 }
 
 fn cached_prices_need_retry(bundle: &EvidenceBundle) -> bool {
@@ -1465,6 +1475,19 @@ mod tests {
         let mut failed = EvidenceBundle::empty(1, "ethereum", "0xcandidate");
         failed.quality.sales = EvidenceStatus::Failed;
         assert!(cached_evidence_needs_retry(&failed));
+
+        let mut old_value_flows = EvidenceBundle::empty(1, "ethereum", "0xold-flow");
+        old_value_flows.quality.value_flows = EvidenceStatus::Complete;
+        assert!(cached_evidence_needs_retry(&old_value_flows));
+        old_value_flows
+            .provenance
+            .push(analysis2_core::EvidenceObservation {
+                source: "alchemy".into(),
+                request_key: "alchemy_value_flows_bounded".into(),
+                observed_at: 0,
+                status: EvidenceStatus::Complete,
+            });
+        assert!(!cached_evidence_needs_retry(&old_value_flows));
 
         let mut price_only = EvidenceBundle::empty(2, "ethereum", "0xprice");
         price_only.quality.prices = EvidenceStatus::Failed;

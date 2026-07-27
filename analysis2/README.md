@@ -191,9 +191,11 @@ dedup stages run normally.
   reusable across upgrades, while failed or missing evidence is retried.
 - **EVM gas:** Alchemy/ETH `eth_getTransactionReceipt` → `TransferEvent.gas_native` /
   `fee_payer`; `quality.gas` Complete/Truncated/Empty/Failed/NotRequested.
-- **EVM value flows:** full-history native EXTERNAL transfers around addresses
-  classified as operators from candidate NFT activity → `ValueFlowEdge`
-  (Funding / Withdrawal / RevenueBackflow).
+- **EVM value flows:** native EXTERNAL transfers for positively identified
+  operator seeds (candidate/controller/deployer, repeated seller, or star
+  distributor), restricted to the candidate NFT activity interval plus a
+  50,000-block setup/cashout margin → `ValueFlowEdge` (Funding / Withdrawal /
+  RevenueBackflow). Ordinary non-victim participants are not operator seeds.
   Page-capped histories are `Truncated` and excluded from formal summaries.
 - **USD policy:** report amounts use execution-day Alchemy spot prices. Payment
   token addresses are preferred over symbols; unpriced or peg-assumed amounts
@@ -222,6 +224,10 @@ dedup stages run normally.
   completeness truncated. Withdrawal/Cashout edges with known `gas_native`
   contribute Exit. Reports expose both the observed output/input ratio and a
   separate ratio restricted to candidates with complete required evidence.
+- **Summary denominators:** stuck-NFT prevalence uses all NFTs in each hit
+  contract from the resident input snapshot. Behavior prevalence uses only
+  candidates with complete required behavior evidence; incomplete non-detections
+  are not rendered as zero. Disabled dedup dimensions are rendered as `n/a`.
 
 Additional outputs vs `run-dedup`:
 
