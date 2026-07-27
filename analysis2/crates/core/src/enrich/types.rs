@@ -31,6 +31,11 @@ pub struct EvidenceQuality {
     pub histories: EvidenceStatus,
     pub gas: EvidenceStatus,
     pub value_flows: EvidenceStatus,
+    /// The resident identity was authoritatively resolved by the provider as
+    /// fungible rather than NFT. Such candidates stay auditable in detail and
+    /// cache files, but are outside the NFT analysis population.
+    pub excluded_non_nft: bool,
+    pub identity_exclusion_reason: Option<String>,
     pub failures: Vec<String>,
 }
 

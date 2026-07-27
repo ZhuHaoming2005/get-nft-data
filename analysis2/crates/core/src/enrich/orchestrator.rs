@@ -834,15 +834,51 @@ async fn enrich_solana(
                 limits.max_solana_assets,
             )
             .await;
+            let known_mint_set: std::collections::BTreeSet<_> = known_mints
+                .iter()
+                .map(|mint| mint.trim())
+                .filter(|mint| !mint.is_empty())
+                .collect();
+            let rejected_mint_set: std::collections::BTreeSet<_> = direct
+                .value
+                .rejected_non_nft_ids
+                .iter()
+                .map(String::as_str)
+                .collect();
+            let all_resident_mints_explicitly_fungible = !known_mint_set.is_empty()
+                && known_mint_set == rejected_mint_set
+                && direct.failure.is_none();
             if matches!(
                 direct.status,
                 EvidenceStatus::Complete | EvidenceStatus::Truncated
             ) && !direct.value.assets.is_empty()
             {
                 snapshot = direct;
+            } else if all_resident_mints_explicitly_fungible {
+                snapshot = direct;
+                bundle.quality.excluded_non_nft = true;
+                bundle.quality.identity_exclusion_reason = Some(format!(
+                    "Helius getAsset classified all {} resident mint(s) as fungible",
+                    known_mint_set.len()
+                ));
             } else if let Some(failure) = direct.failure {
                 resolution_errors.push(failure);
             }
+        }
+        if bundle.quality.excluded_non_nft {
+            apply_outcome(
+                &mut bundle.quality.assets,
+                &mut bundle.provenance,
+                &mut bundle.quality.failures,
+                &snapshot,
+            );
+            bundle.quality.holders = EvidenceStatus::Empty;
+            bundle.quality.histories = EvidenceStatus::Empty;
+            bundle.quality.transfers = EvidenceStatus::Empty;
+            bundle.quality.sales = EvidenceStatus::Empty;
+            bundle.quality.prices = EvidenceStatus::NotRequested;
+            finalize_legit_signals(&mut bundle);
+            return bundle;
         }
         if snapshot.status == EvidenceStatus::Empty {
             let mut detail = format!(

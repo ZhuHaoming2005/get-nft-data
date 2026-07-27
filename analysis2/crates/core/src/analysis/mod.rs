@@ -129,6 +129,9 @@ impl CandidateAnalysis {
     /// the observed USD/behavior values as complete. Partial analyses still
     /// contribute their available results; this flag is quality metadata only.
     pub fn has_complete_evidence(&self) -> bool {
+        if self.evidence_quality.excluded_non_nft {
+            return true;
+        }
         if !self.legit_by_seed.is_empty()
             && self
                 .legit_by_seed

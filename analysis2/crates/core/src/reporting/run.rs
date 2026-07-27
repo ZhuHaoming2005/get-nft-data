@@ -519,6 +519,9 @@ pub fn build_seed_analysis_rollup(
             all_ok = false;
             continue;
         };
+        if analysis.evidence_quality.excluded_non_nft {
+            continue;
+        }
         analyzed += 1;
         let is_legit = classification_for_seed(analysis, seed_chain, seed_address)
             .map(|c| c.is_legit_duplicate)
@@ -795,8 +798,14 @@ fn build_run_summary_for_scope_with_store(
             if !scope.relation_matches(seed_chain, &rel.candidate_chain) {
                 continue;
             }
-            seed_has_duplicate = true;
             let key = format!("{}:{}", rel.candidate_chain, rel.candidate_address);
+            if analysis_by_key
+                .get(&key)
+                .is_some_and(|analysis| analysis.evidence_quality.excluded_non_nft)
+            {
+                continue;
+            }
+            seed_has_duplicate = true;
             let state = candidates.entry(key.clone()).or_default();
             state.fallback_nft_count = state.fallback_nft_count.max(rel.nft_count);
             state.all_nfts.extend(rel.nft_ids.iter().copied());

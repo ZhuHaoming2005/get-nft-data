@@ -696,6 +696,9 @@ fn reconcile_cached_relation_legit(
 }
 
 fn cached_evidence_needs_retry(bundle: &EvidenceBundle) -> bool {
+    if bundle.quality.excluded_non_nft {
+        return false;
+    }
     let mut statuses = vec![
         bundle.quality.transfers,
         bundle.quality.sales,
@@ -1496,6 +1499,11 @@ mod tests {
         holder_only.chain = "solana".into();
         assert!(cached_evidence_needs_retry(&holder_only));
         assert!(!cached_evm_holders_need_retry(&holder_only));
+
+        let mut excluded = EvidenceBundle::empty(4, "solana", "fungible-candidate");
+        excluded.quality.assets = EvidenceStatus::Failed;
+        excluded.quality.excluded_non_nft = true;
+        assert!(!cached_evidence_needs_retry(&excluded));
     }
 
     #[test]
@@ -1780,6 +1788,7 @@ mod tests {
                     gas: EvidenceStatus::Empty,
                     value_flows: EvidenceStatus::Empty,
                     failures: vec!["opensea_sales: partial page failure".into()],
+                    ..analysis2_core::EvidenceQuality::default()
                 };
                 map.insert(cid, bundle);
                 progress.add_completed(1);

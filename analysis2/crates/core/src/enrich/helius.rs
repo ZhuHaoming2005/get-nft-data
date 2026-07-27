@@ -44,9 +44,18 @@ pub struct SolanaAssetSnapshot {
     pub open_license: bool,
     /// Collection updateAuthority (+ verified creators) extracted while paging assets.
     pub authority: Vec<String>,
+    /// Asset ids whose DAS payload explicitly identifies a fungible asset.
+    /// Missing/unknown interfaces are not included because they are not
+    /// authoritative negative NFT identity evidence.
+    pub rejected_non_nft_ids: Vec<String>,
 }
 
-type DirectAssetRow = Result<Option<(SolanaAsset, Vec<String>, bool)>, String>;
+enum DirectAssetRow {
+    Asset(SolanaAsset, Vec<String>, bool),
+    Missing,
+    ExplicitlyFungible(String),
+    Failed(String),
+}
 
 /// Resolve on-chain collection address for a mint via `getAsset`.
 pub async fn resolve_collection_address(
@@ -464,30 +473,38 @@ pub async fn fetch_assets_by_ids(
                 "method": "getAsset",
                 "params": {"id": mint}
             });
-            let payload = client
-                .post_json_helius(&url, &[], &body)
-                .await
-                .map_err(|error| format!("getAsset {mint}: {error}"))?;
+            let payload = match client.post_json_helius(&url, &[], &body).await {
+                Ok(payload) => payload,
+                Err(error) => {
+                    return DirectAssetRow::Failed(format!("getAsset {mint}: {error}"));
+                }
+            };
             if let Some(error) = payload.get("error") {
-                return Err(format!("getAsset {mint}: JSON-RPC error {error}"));
+                return DirectAssetRow::Failed(format!("getAsset {mint}: JSON-RPC error {error}"));
             }
             let Some(result) = payload.get("result").filter(|value| !value.is_null()) else {
-                return Ok(None);
+                return DirectAssetRow::Missing;
             };
             if !is_nft_asset_payload(result) {
                 let interface = result
                     .get("interface")
                     .and_then(Value::as_str)
                     .unwrap_or("missing");
-                return Err(format!(
-                    "getAsset {mint}: returned non-NFT or unknown interface {interface}"
+                if is_explicit_fungible_interface(interface) {
+                    return DirectAssetRow::ExplicitlyFungible(mint);
+                }
+                return DirectAssetRow::Failed(format!(
+                    "getAsset {mint}: returned unknown NFT identity interface {interface}"
                 ));
             }
-            let asset = parse_asset(result)
-                .ok_or_else(|| format!("getAsset {mint}: missing valid asset identity"))?;
+            let Some(asset) = parse_asset(result) else {
+                return DirectAssetRow::Failed(format!(
+                    "getAsset {mint}: missing valid asset identity"
+                ));
+            };
             let collection = parse_collection_address(result).unwrap_or_else(|| asset.mint.clone());
             let authorities = solana_authorities_from_asset(result, result, &collection);
-            Ok(Some((asset, authorities, is_open_license_payload(result))))
+            DirectAssetRow::Asset(asset, authorities, is_open_license_payload(result))
         }
     }))
     .buffer_unordered(32)
@@ -498,17 +515,22 @@ pub async fn fetch_assets_by_ids(
     let mut failures = Vec::new();
     for row in rows {
         match row {
-            Ok(Some((asset, authorities, open_license))) => {
+            DirectAssetRow::Asset(asset, authorities, open_license) => {
                 snapshot.assets.push(asset);
                 snapshot.authority.extend(authorities);
                 snapshot.open_license |= open_license;
             }
-            Ok(None) => {}
-            Err(error) => failures.push(error),
+            DirectAssetRow::Missing => {}
+            DirectAssetRow::ExplicitlyFungible(mint) => {
+                snapshot.rejected_non_nft_ids.push(mint);
+            }
+            DirectAssetRow::Failed(error) => failures.push(error),
         }
     }
     snapshot.authority.sort();
     snapshot.authority.dedup();
+    snapshot.rejected_non_nft_ids.sort();
+    snapshot.rejected_non_nft_ids.dedup();
 
     if snapshot.assets.is_empty() && !failures.is_empty() {
         return FetchOutcome::failed(
@@ -1899,6 +1921,13 @@ fn is_nft_asset_payload(item: &Value) -> bool {
     interface_is_nft || standard_is_nft
 }
 
+fn is_explicit_fungible_interface(interface: &str) -> bool {
+    matches!(
+        interface.to_ascii_lowercase().as_str(),
+        "fungibleasset" | "fungibletoken"
+    )
+}
+
 fn parse_asset(item: &Value) -> Option<SolanaAsset> {
     let mint = item.get("id").and_then(Value::as_str)?.trim().to_owned();
     if mint.is_empty() {
@@ -2037,6 +2066,40 @@ mod tests {
         assert_eq!(outcome.value.assets.len(), 1);
         assert_eq!(outcome.value.assets[0].mint, mint);
         assert_eq!(outcome.value.authority, vec!["creator"]);
+    }
+
+    #[tokio::test]
+    async fn direct_asset_explicit_fungible_is_identity_rejection_not_api_failure() {
+        let server = MockServer::start_async().await;
+        let mint = "So11111111111111111111111111111111111111112";
+        let asset = server
+            .mock_async(|when, then| {
+                when.method(POST).body_contains("getAsset");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": "asset",
+                    "result": {
+                        "interface": "FungibleAsset",
+                        "id": mint
+                    }
+                }));
+            })
+            .await;
+        let client = HttpClient::with_retries(2, 0).unwrap();
+        let outcome = fetch_assets_by_ids(
+            &client,
+            &server.base_url(),
+            Some("key"),
+            &[mint.to_owned()],
+            10,
+        )
+        .await;
+
+        assert_eq!(asset.hits(), 1);
+        assert_eq!(outcome.status, EvidenceStatus::Empty);
+        assert!(outcome.failure.is_none());
+        assert!(outcome.value.assets.is_empty());
+        assert_eq!(outcome.value.rejected_non_nft_ids, vec![mint]);
     }
 
     #[test]
