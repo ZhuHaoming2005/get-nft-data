@@ -1,7 +1,9 @@
 //! Helius DAS helpers for Solana collection resolve + enrichment.
 //!
-//! History path: `getSignaturesForAsset` stubs → deduped `getTransaction` jsonParsed
-//! decode (standard SPL ownership + native SOL balance / transfer instructions).
+//! History paths: compressed NFTs use `getSignaturesForAsset`, ordinary NFTs
+//! use `getSignaturesForAddress`, then both feed deduped `getTransaction`
+//! jsonParsed decode (standard SPL ownership + native SOL balance / transfer
+//! instructions).
 //! Compressed NFT / Bubblegum full parity is intentionally out of MVP scope.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -539,7 +541,11 @@ pub async fn fetch_assets_by_ids(
     outcome
 }
 
-/// Bounded history via `getSignaturesForAsset` → transfer/sale stubs.
+/// Bounded history discovery for Solana NFTs → transfer/sale stubs.
+///
+/// Compressed assets use DAS `getSignaturesForAsset`; ordinary NFTs use the
+/// standard RPC `getSignaturesForAddress`. The DAS method resolves a Merkle
+/// tree and fails with `Tree not found` for ordinary mint accounts.
 ///
 /// Stubs alone are never Complete: callers must run [`decode_and_attach_transactions`]
 /// and recompute field quality from decode stats.
@@ -637,16 +643,33 @@ pub async fn fetch_asset_histories(
 type AssetHistoryRow = Result<(Vec<TransferEvent>, Vec<SaleEvent>, bool), String>;
 
 fn signature_request(asset: &SolanaAsset, request_id: String, max_sigs: usize) -> Value {
-    json!({
-        "jsonrpc": "2.0",
-        "id": request_id,
-        "method": "getSignaturesForAsset",
-        "params": {
-            "id": asset.mint,
-            "page": 1,
-            "limit": max_sigs
-        }
-    })
+    if asset.compressed {
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "getSignaturesForAsset",
+            "params": {
+                "id": asset.mint,
+                "page": 1,
+                "limit": max_sigs
+            }
+        })
+    } else {
+        json!({
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": "getSignaturesForAddress",
+            "params": [asset.mint, {"limit": max_sigs}]
+        })
+    }
+}
+
+fn signature_method(asset: &SolanaAsset) -> &'static str {
+    if asset.compressed {
+        "getSignaturesForAsset"
+    } else {
+        "getSignaturesForAddress"
+    }
 }
 
 async fn fetch_asset_history_batch(
@@ -662,7 +685,13 @@ async fn fetch_asset_history_batch(
             client
                 .post_json_helius(url, &[], &body)
                 .await
-                .map_err(|error| format!("getSignaturesForAsset {}: {error}", assets[0].mint))
+                .map_err(|error| {
+                    format!(
+                        "{} {}: {error}",
+                        signature_method(&assets[0]),
+                        assets[0].mint
+                    )
+                })
                 .and_then(|payload| parse_asset_history(&assets[0], &payload, max_sigs)),
         ];
     }
@@ -693,8 +722,9 @@ async fn fetch_asset_history_batch(
                     .copied()
                     .ok_or_else(|| {
                         format!(
-                            "getSignaturesForAsset {}: batch response omitted id {id}",
-                            asset.mint
+                            "{} {}: batch response omitted id {id}",
+                            signature_method(asset),
+                            asset.mint,
                         )
                     })
                     .and_then(|response| parse_asset_history(asset, response, max_sigs))
@@ -716,7 +746,7 @@ async fn fetch_asset_history_batch(
             client
                 .post_json_helius(&url, &[], &body)
                 .await
-                .map_err(|error| format!("getSignaturesForAsset {}: {error}", asset.mint))
+                .map_err(|error| format!("{} {}: {error}", signature_method(&asset), asset.mint))
                 .and_then(|payload| parse_asset_history(&asset, &payload, max_sigs))
         }));
     }
@@ -734,21 +764,35 @@ async fn fetch_asset_history_batch(
 fn parse_asset_history(asset: &SolanaAsset, payload: &Value, max_sigs: usize) -> AssetHistoryRow {
     if let Some(error) = payload.get("error") {
         return Err(format!(
-            "getSignaturesForAsset {}: JSON-RPC error {error}",
-            asset.mint
+            "{} {}: JSON-RPC error {error}",
+            signature_method(asset),
+            asset.mint,
         ));
     }
-    let items = payload
-        .get("result")
-        .and_then(|result| result.get("items"))
-        .and_then(Value::as_array)
-        .ok_or_else(|| {
-            format!(
-                "getSignaturesForAsset {}: response omitted result.items",
-                asset.mint
-            )
-        })?
-        .clone();
+    let items = if asset.compressed {
+        payload
+            .get("result")
+            .and_then(|result| result.get("items"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                format!(
+                    "getSignaturesForAsset {}: response omitted result.items",
+                    asset.mint
+                )
+            })?
+            .clone()
+    } else {
+        payload
+            .get("result")
+            .and_then(Value::as_array)
+            .ok_or_else(|| {
+                format!(
+                    "getSignaturesForAddress {}: response omitted result array",
+                    asset.mint
+                )
+            })?
+            .clone()
+    };
     let page_truncated = items.len() >= max_sigs;
     let mut transfers = Vec::new();
     let mut sales = Vec::new();
@@ -2051,7 +2095,7 @@ mod tests {
             .map(|idx| SolanaAsset {
                 mint: format!("mint-{idx}"),
                 owner: Some(format!("owner-{idx}")),
-                compressed: false,
+                compressed: true,
             })
             .collect();
         let client = HttpClient::with_retries(4, 0).unwrap();
@@ -2060,6 +2104,49 @@ mod tests {
 
         assert_eq!(histories.hits(), 1);
         assert_eq!(outcome.value.0.len(), 10);
+    }
+
+    #[tokio::test]
+    async fn ordinary_nft_history_uses_signatures_for_address() {
+        let server = MockServer::start_async().await;
+        let histories = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .body_contains("getSignaturesForAddress")
+                    .body_contains("ordinary-mint");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": "sigs-ordinary-mint",
+                    "result": [{
+                        "signature": "ordinary-signature",
+                        "slot": 42,
+                        "blockTime": 123
+                    }]
+                }));
+            })
+            .await;
+        let compressed_histories = server
+            .mock_async(|when, then| {
+                when.method(POST)
+                    .body_contains("getSignaturesForAsset")
+                    .body_contains("ordinary-mint");
+                then.status(500);
+            })
+            .await;
+        let asset = SolanaAsset {
+            mint: "ordinary-mint".into(),
+            owner: Some("owner".into()),
+            compressed: false,
+        };
+        let client = HttpClient::with_retries(1, 0).unwrap();
+        let outcome =
+            fetch_asset_histories(&client, &server.base_url(), Some("key"), &[asset], 1, 10).await;
+
+        assert_eq!(histories.hits(), 1);
+        assert_eq!(compressed_histories.hits(), 0);
+        assert_eq!(outcome.value.0.len(), 1);
+        assert_eq!(outcome.value.0[0].tx_hash, "ordinary-signature");
+        assert!(outcome.value.1.is_empty());
     }
 
     #[tokio::test]

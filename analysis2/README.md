@@ -199,8 +199,9 @@ dedup stages run normally.
 - **Shared candidates:** candidate-wide funding/withdrawal amounts appear in
   every related per-seed report; all run summaries re-union formal relations and
   count each candidate once.
-- **Solana decode:** Helius `getSignaturesForAsset` stubs → deduped `getTransaction` jsonParsed
-  fills from/to/timestamp/fee and SOL value-flow edges; signature-only stubs stay Truncated.
+- **Solana decode:** compressed NFTs use Helius `getSignaturesForAsset`, ordinary NFTs use
+  `getSignaturesForAddress`; deduped `getTransaction` jsonParsed then fills
+  from/to/timestamp/fee and SOL value-flow edges. Signature-only stubs stay Truncated.
 - **Request reuse:** preflight controller/slug/asset results flow into deep enrich. Prices,
   EVM receipts, EVM external transfers, and Solana transactions use run-scoped
   singleflight caches. Helius asset histories use 10-call history batches and

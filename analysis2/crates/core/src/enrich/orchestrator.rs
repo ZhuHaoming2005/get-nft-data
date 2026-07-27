@@ -2346,16 +2346,14 @@ mod tests {
             .mock_async(|when, then| {
                 when.method(POST)
                     .path("/helius")
-                    .body_contains("getSignaturesForAsset");
+                    .body_contains("getSignaturesForAddress");
                 then.status(200).json_body(json!({
                     "jsonrpc": "2.0",
                     "id": "1",
-                    "result": {
-                        "items": [
-                            ["SigTransfer111111111111111111111111111111", "transfer"],
-                            ["SigSale11111111111111111111111111111111111", "sale"]
-                        ]
-                    }
+                    "result": [
+                        {"signature": "SigTransfer111111111111111111111111111111"},
+                        {"signature": "SigSale11111111111111111111111111111111111"}
+                    ]
                 }));
             })
             .await;
@@ -2464,13 +2462,11 @@ mod tests {
             .mock_async(|when, then| {
                 when.method(POST)
                     .path("/helius")
-                    .body_contains("getSignaturesForAsset");
+                    .body_contains("getSignaturesForAddress");
                 then.status(200).json_body(json!({
                     "jsonrpc": "2.0",
                     "id": "1",
-                    "result": {
-                        "items": [[sig, "transfer"]]
-                    }
+                    "result": [{"signature": sig}]
                 }));
             })
             .await;
@@ -2744,13 +2740,11 @@ mod tests {
             .mock_async(|when, then| {
                 when.method(POST)
                     .path("/helius")
-                    .body_contains("getSignaturesForAsset");
+                    .body_contains("getSignaturesForAddress");
                 then.status(200).json_body(json!({
                     "jsonrpc": "2.0",
                     "id": "1",
-                    "result": {
-                        "items": [[sig, "transfer"]]
-                    }
+                    "result": [{"signature": sig}]
                 }));
             })
             .await;
