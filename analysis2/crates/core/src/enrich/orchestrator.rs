@@ -934,15 +934,30 @@ async fn enrich_solana(
         });
     }
 
-    let history = helius::fetch_asset_histories(
-        client,
-        &limits.endpoints.helius,
-        keys.helius(),
-        &snapshot.value.assets,
-        limits.max_history_assets,
-        limits.max_signatures_per_asset,
-    )
-    .await;
+    let history = match snapshot.status {
+        EvidenceStatus::Failed => FetchOutcome {
+            value: (Vec::new(), Vec::new()),
+            status: EvidenceStatus::Failed,
+            observation: snapshot.observation.clone().map(|mut observation| {
+                observation.request_key = "helius_histories".into();
+                observation
+            }),
+            failure: None,
+            truncated: false,
+        },
+        EvidenceStatus::NotRequested => FetchOutcome::skipped("helius_histories"),
+        _ => {
+            helius::fetch_asset_histories(
+                client,
+                &limits.endpoints.helius,
+                keys.helius(),
+                &snapshot.value.assets,
+                limits.max_history_assets,
+                limits.max_signatures_per_asset,
+            )
+            .await
+        }
+    };
 
     let transfer_discovery_complete = matches!(
         history.status,
@@ -964,7 +979,7 @@ async fn enrich_solana(
                 candidate: &evidence_collection_address,
                 controllers: &bundle.controllers,
                 holders: HolderSnapshot {
-                    records: &bundle.holders,
+                    records: &holders,
                     status: holder_status,
                 },
                 transfer_discovery_complete,
@@ -975,7 +990,26 @@ async fn enrich_solana(
         ),
         price_cache.fetch(client, &limits.endpoints, keys.alchemy(), chain, &[], &[],),
     );
-    let (gas, value_flows, decode_stats) = decode_result;
+    let (mut gas, mut value_flows, decode_stats) = decode_result;
+    if history.status == EvidenceStatus::Failed {
+        gas.status = EvidenceStatus::Failed;
+        value_flows.status = EvidenceStatus::Failed;
+        if let Some(observation) = gas.observation.as_mut() {
+            observation.status = EvidenceStatus::Failed;
+        }
+        if let Some(observation) = value_flows.observation.as_mut() {
+            observation.status = EvidenceStatus::Failed;
+        }
+    } else if history.status == EvidenceStatus::NotRequested {
+        gas.status = EvidenceStatus::NotRequested;
+        value_flows.status = EvidenceStatus::NotRequested;
+        if let Some(observation) = gas.observation.as_mut() {
+            observation.status = EvidenceStatus::NotRequested;
+        }
+        if let Some(observation) = value_flows.observation.as_mut() {
+            observation.status = EvidenceStatus::NotRequested;
+        }
+    }
     apply_prices_to_sales(&mut helius_sales, &prices.value, chain);
 
     apply_outcome(
@@ -2356,6 +2390,59 @@ mod tests {
         assert_eq!(bundle.quality.assets, EvidenceStatus::NotRequested);
         assert_eq!(bundle.quality.histories, EvidenceStatus::NotRequested);
         assert_eq!(bundle.quality.holders, EvidenceStatus::NotRequested);
+    }
+
+    #[tokio::test]
+    async fn solana_failed_asset_identity_propagates_to_dependent_evidence() {
+        let server = MockServer::start_async().await;
+        let _helius = server
+            .mock_async(|when, then| {
+                when.method(POST).path("/helius");
+                then.status(500).body("provider unavailable");
+            })
+            .await;
+        let evm = ["ethereum"].into_iter().map(str::to_owned).collect();
+        let mut store = ResidentStore::with_options(2, &evm);
+        store
+            .ingest_identity_row(identity(
+                "solana",
+                "ColSeed111111111111111111111111111111111",
+                "m1",
+                1,
+            ))
+            .unwrap();
+        store
+            .ingest_identity_row(identity(
+                "solana",
+                "ColCand111111111111111111111111111111111",
+                "m2",
+                2,
+            ))
+            .unwrap();
+        let seed = cid(&store, "solana", "ColSeed111111111111111111111111111111111");
+        let cand = cid(&store, "solana", "ColCand111111111111111111111111111111111");
+        let registry = registry_one(seed, cand);
+        let keys = ApiKeys {
+            helius: Some("key".into()),
+            ..ApiKeys::default()
+        };
+        let limits = HttpLimits {
+            retries: 0,
+            endpoints: mock_endpoints(&server),
+            ..HttpLimits::default()
+        };
+        let map = enrich_candidates(&registry, &store, &keys, &limits, &NoopProgress)
+            .await
+            .unwrap();
+        let bundle = map.get(&cand).unwrap();
+
+        assert_eq!(bundle.quality.assets, EvidenceStatus::Failed);
+        assert_eq!(bundle.quality.holders, EvidenceStatus::Failed);
+        assert_eq!(bundle.quality.histories, EvidenceStatus::Failed);
+        assert_eq!(bundle.quality.transfers, EvidenceStatus::Failed);
+        assert_eq!(bundle.quality.sales, EvidenceStatus::Failed);
+        assert_eq!(bundle.quality.gas, EvidenceStatus::Failed);
+        assert_eq!(bundle.quality.value_flows, EvidenceStatus::Failed);
     }
 
     #[tokio::test]

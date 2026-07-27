@@ -23,11 +23,11 @@ use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 use crate::reporting::json::SeedRecord;
 
-// v13 persists provider-complete whole-contract NFT populations and preserves
-// per-asset Helius failures; older evidence cannot support the corrected stuck
-// denominator or trustworthy Solana failure diagnosis.
-pub const EVIDENCE_CACHE_VERSION: u32 = 13;
-const MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION: u32 = 13;
+// v14 distinguishes complete ungrouped Solana singleton units, propagates
+// failed asset identity to downstream evidence, and persists non-NFT
+// exclusions. Older evidence cannot support those corrected semantics.
+pub const EVIDENCE_CACHE_VERSION: u32 = 14;
+const MIN_COMPATIBLE_EVIDENCE_CACHE_VERSION: u32 = 14;
 pub const DEFAULT_EVIDENCE_CACHE_FILE: &str = "evidence_cache.json";
 /// How many finished candidates to buffer before an append + snapshot flush.
 pub const DEFAULT_EVIDENCE_CACHE_BATCH: usize = 16;

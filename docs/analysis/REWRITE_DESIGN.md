@@ -488,6 +488,11 @@ output_input_ratio = operator_output_usd / attacker_gas_input_usd
 同时输出总产出、总投入、总体产出投入比，以及在投入大于零的合约中
 `output_input_ratio >= 1` 和 `< 1` 的数量与比例。
 
+报告同时保留两套口径：`observed_output_input_ratio` 使用 Complete 或
+Truncated 中已观察且已定价的金额；`complete_evidence_output_input_ratio`
+仅使用所有必需证据均 Complete/Empty 的候选。两套口径分别计算产出、
+投入、样本数量及 `>=1`/`<1` 分布，不能混用分子和分母。
+
 ### 诚实参与者损失
 
 诚实损失分为：

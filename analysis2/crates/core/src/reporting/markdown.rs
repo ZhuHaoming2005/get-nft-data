@@ -457,7 +457,7 @@ pub fn write_all_chains_md(
         None => "null".into(),
     };
     body.push_str(&format!(
-        "| total | {} | {} | {} | {} | {} |\n",
+        "| observed | {} | {} | {} | {} | {} |\n",
         f64_cell(
             econ.get("ratio_eligible_operator_output_usd")
                 .unwrap_or(&econ["ratio_operator_output_usd"])
@@ -469,6 +469,36 @@ pub fn write_all_chains_md(
         ratio_s,
         ge1,
         lt1,
+    ));
+    let complete_ratio = match econ["complete_evidence_output_input_ratio"].as_f64() {
+        Some(ratio) => format!("{ratio:.5}x"),
+        None => "null".into(),
+    };
+    let complete_ge1 = match econ["complete_evidence_output_input_ratio_ge1_share"].as_f64() {
+        Some(ratio) => format!(
+            "{} ({}/{})",
+            percent_value(ratio),
+            u64_cell(&econ["complete_evidence_output_input_ratio_ge1_count"]),
+            u64_cell(&econ["complete_evidence_output_input_ratio_count"])
+        ),
+        None => "null".into(),
+    };
+    let complete_lt1 = match econ["complete_evidence_output_input_ratio_lt1_share"].as_f64() {
+        Some(ratio) => format!(
+            "{} ({}/{})",
+            percent_value(ratio),
+            u64_cell(&econ["complete_evidence_output_input_ratio_lt1_count"]),
+            u64_cell(&econ["complete_evidence_output_input_ratio_count"])
+        ),
+        None => "null".into(),
+    };
+    body.push_str(&format!(
+        "| complete evidence | {} | {} | {} | {} | {} |\n",
+        f64_cell(&econ["complete_evidence_ratio_operator_output_usd"]),
+        f64_cell(&econ["complete_evidence_ratio_attacker_input_usd"]),
+        complete_ratio,
+        complete_ge1,
+        complete_lt1,
     ));
     body.push_str(&format!(
         "\n> 口径：总比值与 >=1/<1 分布均只使用同一批 {} 个可比合约；候选覆盖完整：{}；证据覆盖完整：{}；仅为已观察值：{}。全部已观察操作者产出为 {} USD。\n",

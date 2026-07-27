@@ -51,7 +51,7 @@ pub struct SolanaAssetSnapshot {
 }
 
 enum DirectAssetRow {
-    Asset(SolanaAsset, Vec<String>, bool),
+    Asset(SolanaAsset, Vec<String>, bool, bool),
     Missing,
     ExplicitlyFungible(String),
     Failed(String),
@@ -430,9 +430,9 @@ async fn fetch_collection_assets_with_visibility(
 /// Recover resident singleton NFTs (or otherwise ungrouped assets) directly
 /// through DAS `getAsset` when `getAssetsByGroup` cannot enumerate them.
 ///
-/// This outcome is always Truncated: the supplied ids prove those resident
-/// assets exist, but they cannot prove that the complete collection was
-/// enumerated.
+/// A fully resolved set of explicitly ungrouped ids is Complete because the
+/// ingester models those ids as the whole singleton analysis unit. Grouped,
+/// capped, missing, or partially failed direct recovery remains Truncated.
 pub async fn fetch_assets_by_ids(
     client: &HttpClient,
     rpc_url: &str,
@@ -462,6 +462,7 @@ pub async fn fetch_assets_by_ids(
     }
 
     let selected: Vec<String> = unique_ids.iter().take(max_assets.max(1)).cloned().collect();
+    let selected_count = selected.len();
     let url = with_api_key(rpc_url, api_key);
     let rows: Vec<DirectAssetRow> = stream::iter(selected.into_iter().map(|mint| {
         let client = client.clone();
@@ -502,9 +503,29 @@ pub async fn fetch_assets_by_ids(
                     "getAsset {mint}: missing valid asset identity"
                 ));
             };
-            let collection = parse_collection_address(result).unwrap_or_else(|| asset.mint.clone());
+            let has_collection_group = result
+                .get("grouping")
+                .and_then(Value::as_array)
+                .is_some_and(|groups| {
+                    groups.iter().any(|group| {
+                        group
+                            .get("group_key")
+                            .or_else(|| group.get("groupKey"))
+                            .and_then(Value::as_str)
+                            == Some("collection")
+                    })
+                });
+            let collection_group = parse_collection_address(result);
+            let collection = collection_group
+                .clone()
+                .unwrap_or_else(|| asset.mint.clone());
             let authorities = solana_authorities_from_asset(result, result, &collection);
-            DirectAssetRow::Asset(asset, authorities, is_open_license_payload(result))
+            DirectAssetRow::Asset(
+                asset,
+                authorities,
+                is_open_license_payload(result),
+                has_collection_group,
+            )
         }
     }))
     .buffer_unordered(32)
@@ -513,14 +534,17 @@ pub async fn fetch_assets_by_ids(
 
     let mut snapshot = SolanaAssetSnapshot::default();
     let mut failures = Vec::new();
+    let mut missing_count = 0usize;
+    let mut any_grouped = false;
     for row in rows {
         match row {
-            DirectAssetRow::Asset(asset, authorities, open_license) => {
+            DirectAssetRow::Asset(asset, authorities, open_license, grouped) => {
                 snapshot.assets.push(asset);
                 snapshot.authority.extend(authorities);
                 snapshot.open_license |= open_license;
+                any_grouped |= grouped;
             }
-            DirectAssetRow::Missing => {}
+            DirectAssetRow::Missing => missing_count += 1,
             DirectAssetRow::ExplicitlyFungible(mint) => {
                 snapshot.rejected_non_nft_ids.push(mint);
             }
@@ -549,10 +573,23 @@ pub async fn fetch_assets_by_ids(
         return FetchOutcome::ok(snapshot, 0, false, "helius", "helius_assets_by_id");
     }
 
-    // Direct ids are positive existence evidence, not a complete collection
-    // listing. Preserve that distinction even when every supplied id resolved.
-    snapshot.truncated = true;
-    let mut outcome = FetchOutcome::ok(snapshot, count, true, "helius", "helius_assets_by_id");
+    let complete_ungrouped_unit = !any_grouped
+        && selected_count == unique_ids.len()
+        && count == unique_ids.len()
+        && missing_count == 0
+        && failures.is_empty()
+        && snapshot.rejected_non_nft_ids.is_empty();
+    if complete_ungrouped_unit {
+        snapshot.total = Some(count);
+    }
+    snapshot.truncated = !complete_ungrouped_unit;
+    let mut outcome = FetchOutcome::ok(
+        snapshot,
+        count,
+        !complete_ungrouped_unit,
+        "helius",
+        "helius_assets_by_id",
+    );
     if !failures.is_empty() {
         outcome.failure = Some(format!(
             "helius_assets_by_id: recovered {count} asset(s), but {} getAsset request(s) failed: {}",
@@ -2061,9 +2098,10 @@ mod tests {
         .await;
 
         assert_eq!(asset.hits(), 1);
-        assert_eq!(outcome.status, EvidenceStatus::Truncated);
-        assert!(outcome.truncated);
+        assert_eq!(outcome.status, EvidenceStatus::Complete);
+        assert!(!outcome.truncated);
         assert_eq!(outcome.value.assets.len(), 1);
+        assert_eq!(outcome.value.total, Some(1));
         assert_eq!(outcome.value.assets[0].mint, mint);
         assert_eq!(outcome.value.authority, vec!["creator"]);
     }
@@ -2100,6 +2138,43 @@ mod tests {
         assert!(outcome.failure.is_none());
         assert!(outcome.value.assets.is_empty());
         assert_eq!(outcome.value.rejected_non_nft_ids, vec![mint]);
+    }
+
+    #[tokio::test]
+    async fn direct_grouped_asset_remains_truncated_without_collection_enumeration() {
+        let server = MockServer::start_async().await;
+        let mint = "So11111111111111111111111111111111111111112";
+        let _asset = server
+            .mock_async(|when, then| {
+                when.method(POST).body_contains("getAsset");
+                then.status(200).json_body(json!({
+                    "jsonrpc": "2.0",
+                    "id": "asset",
+                    "result": {
+                        "interface": "V1_NFT",
+                        "id": mint,
+                        "ownership": {"owner": "holder"},
+                        "grouping": [{
+                            "group_key": "collection",
+                            "group_value": mint
+                        }]
+                    }
+                }));
+            })
+            .await;
+        let client = HttpClient::with_retries(2, 0).unwrap();
+        let outcome = fetch_assets_by_ids(
+            &client,
+            &server.base_url(),
+            Some("key"),
+            &[mint.to_owned()],
+            10,
+        )
+        .await;
+
+        assert_eq!(outcome.status, EvidenceStatus::Truncated);
+        assert!(outcome.truncated);
+        assert_eq!(outcome.value.total, None);
     }
 
     #[test]

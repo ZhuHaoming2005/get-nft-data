@@ -13,8 +13,8 @@ use crate::entity::{ContractId, NftId, ResidentStore};
 use crate::error::Analysis2Error;
 
 use super::aggregate::{
-    AllChainsRelationRef, DuplicateScaleRow, ScopeScaleFilter, SeedDuplicateScale,
-    build_scope_duplicate_scale_for_chains, build_seed_duplicate_scale,
+    AllChainsRelationRef, ChainMatrixBlock, DuplicateScaleRow, ScopeScaleFilter,
+    SeedDuplicateScale, build_scope_duplicate_scale_for_chains, build_seed_duplicate_scale,
 };
 use super::layout::{
     SCOPE_ALL_CHAINS, SCOPE_CHAIN_MATRIX, SCOPE_CROSS_CHAIN, SCOPE_INTRA_CHAIN,
@@ -51,6 +51,9 @@ pub struct SeedRelationJson {
     pub candidate_address: String,
     pub dimensions: Vec<String>,
     pub nft_count: u64,
+    /// Raw dedup hit edges represented by this candidate relation.
+    #[serde(default)]
+    pub hit_edge_count: u64,
     /// Resident-store NFT ids for this relation; summary unions these across seeds.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nft_ids: Vec<u32>,
@@ -131,6 +134,17 @@ pub fn build_seed_dedup_report(
     registry: &CandidateRegistry,
     contract_nfts: &ahash::AHashMap<ContractId, Vec<NftId>>,
 ) -> SeedDedupReport {
+    let relation_hit_counts = graph
+        .edges()
+        .iter()
+        .filter(|edge| edge.seed_contract == seed_id)
+        .fold(
+            ahash::AHashMap::<ContractId, u64>::new(),
+            |mut counts, edge| {
+                *counts.entry(edge.candidate_contract).or_default() += 1;
+                counts
+            },
+        );
     let relations: Vec<SeedRelationJson> = registry
         .relations_for_seed(seed_id)
         .into_iter()
@@ -147,6 +161,10 @@ pub fn build_seed_dedup_report(
                     .map(str::to_owned)
                     .collect(),
                 nft_count: rel.nft_ids.len() as u64,
+                hit_edge_count: relation_hit_counts
+                    .get(&rel.candidate_contract)
+                    .copied()
+                    .unwrap_or_default(),
                 nft_ids: rel.nft_ids.clone(),
             }
         })
@@ -298,6 +316,50 @@ fn scope_relations<'a>(reports: &[&'a SeedDedupReport]) -> Vec<AllChainsRelation
         }
     }
     out
+}
+
+pub(crate) fn rebuild_seed_duplicate_scale(
+    store: &ResidentStore,
+    report: &SeedDedupReport,
+) -> SeedDuplicateScale {
+    let report_refs = [report];
+    let relations = scope_relations(&report_refs);
+    let primary_chains = ahash::AHashSet::from_iter([report.seed.chain.to_ascii_lowercase()]);
+    let intra_chain = build_scope_duplicate_scale_for_chains(
+        store,
+        relations.iter().copied(),
+        ScopeScaleFilter::Intra,
+        &primary_chains,
+    );
+    let cross_chain_summary = build_scope_duplicate_scale_for_chains(
+        store,
+        relations.iter().copied(),
+        ScopeScaleFilter::Cross,
+        &primary_chains,
+    );
+    let mut chain_matrix = store
+        .chains
+        .iter()
+        .filter(|secondary| !secondary.eq_ignore_ascii_case(&report.seed.chain))
+        .map(|secondary| ChainMatrixBlock {
+            secondary_chain: secondary.clone(),
+            rows: build_scope_duplicate_scale_for_chains(
+                store,
+                relations.iter().copied(),
+                ScopeScaleFilter::Matrix {
+                    primary_chain: &report.seed.chain,
+                    secondary_chain: secondary,
+                },
+                &primary_chains,
+            ),
+        })
+        .collect::<Vec<_>>();
+    chain_matrix.sort_by(|left, right| left.secondary_chain.cmp(&right.secondary_chain));
+    SeedDuplicateScale {
+        intra_chain,
+        chain_matrix,
+        cross_chain_summary,
+    }
 }
 
 fn seed_index_json(reports: &[&SeedDedupReport]) -> Vec<serde_json::Value> {

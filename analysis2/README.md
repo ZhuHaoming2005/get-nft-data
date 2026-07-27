@@ -181,8 +181,9 @@ dedup stages run normally.
   source and fall back to OpenSea only when Alchemy is unavailable or fails.
   Base uses OpenSea collection Sale events filtered back to the candidate
   contract. Solana uses Helius asset histories plus decoded `getTransaction`
-  buyer/seller/payment evidence. Evidence caches older than v11 are invalidated
-  so rows produced under the previous provider contract cannot be reused.
+  buyer/seller/payment evidence. Evidence cache v14 is required so non-NFT
+  exclusions, ungrouped-singleton completeness, and dependent failure states
+  cannot be confused with older evidence.
 - **EVM gas:** Alchemy/ETH `eth_getTransactionReceipt` → `TransferEvent.gas_native` /
   `fee_payer`; `quality.gas` Complete/Truncated/Empty/Failed/NotRequested.
 - **EVM value flows:** full-history native EXTERNAL transfers around addresses
@@ -201,7 +202,9 @@ dedup stages run normally.
   count each candidate once.
 - **Solana decode:** compressed NFTs use Helius `getSignaturesForAsset`, ordinary NFTs use
   `getSignaturesForAddress`; deduped `getTransaction` jsonParsed then fills
-  from/to/timestamp/fee and SOL value-flow edges. Signature-only stubs stay Truncated.
+  from/to/timestamp/fee and SOL value-flow edges. A fully resolved asset with no
+  collection group is a complete single-NFT analysis unit; grouped/partial direct
+  recovery and signature-only stubs stay Truncated.
 - **Request reuse:** preflight controller/slug/asset results flow into deep enrich. Prices,
   EVM receipts, EVM external transfers, and Solana transactions use run-scoped
   singleflight caches. Helius asset histories use 10-call history batches and
@@ -212,7 +215,8 @@ dedup stages run normally.
 - **Economics:** when `quality.gas` is Complete or Truncated, every observed
   operator-paid receipt cost remains usable; missing receipts keep formal
   completeness truncated. Withdrawal/Cashout edges with known `gas_native`
-  contribute Exit.
+  contribute Exit. Reports expose both the observed output/input ratio and a
+  separate ratio restricted to candidates with complete required evidence.
 
 Additional outputs vs `run-dedup`:
 
