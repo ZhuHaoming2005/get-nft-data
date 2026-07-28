@@ -17,7 +17,6 @@ pub use bm25::{
 
 use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::dedup::hits::{Dimension, HitEdge, HitGraph};
 use crate::entity::{ChainId, ContractId, CsrIndex, ResidentStore, normalized_evm_token_slice};
@@ -186,6 +185,7 @@ pub fn finalize_metadata_index_with_progress(
     progress: &dyn ProgressObserver,
 ) -> Result<(), Analysis2Error> {
     const PROGRESS_BATCH: usize = 1 << 10;
+    const TOKENIZE_BATCH: usize = 4 * 1024;
 
     let n_contracts = store.contracts.len();
     let anchor_count: usize = store
@@ -267,88 +267,51 @@ pub fn finalize_metadata_index_with_progress(
     drop(canonical_to_doc);
     drop(token_keys);
 
+    // Tokenize a bounded parallel batch, immediately intern and compact it,
+    // then release its borrowed/raw term vectors. Keeping raw tokenization for
+    // every document until a second pass made peak RSS grow with the complete
+    // metadata corpus (tens of millions of documents in production).
     progress.begin_phase("metadata_tokenize", Some(canonical_documents.len() as u64));
-    let raw_documents = canonical_documents
-        .par_iter()
-        .map(|&canonical| {
-            progress.check_cancelled()?;
-            let raw = tokenize_metadata_document(canonical);
-            progress.add_completed(1);
-            Ok::<_, Analysis2Error>(raw)
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-
-    // Assign ids in document / first-token order exactly as the previous
-    // single-threaded interner did; only the expensive tokenization runs in
-    // parallel.
-    progress.begin_phase("metadata_terms", Some(raw_documents.len() as u64));
     let mut term_ids = AHashMap::<&str, u32>::new();
-    let mut pending_progress = 0_u64;
-    for raw in &raw_documents {
-        for &(term, _) in &raw.terms {
-            if !term_ids.contains_key(term) {
-                let id = u32::try_from(term_ids.len())
-                    .map_err(|_| Analysis2Error::invalid("too many BM25 terms for u32"))?;
-                term_ids.insert(term, id);
+    let mut documents = Vec::with_capacity(canonical_documents.len());
+    let mut terms = Vec::new();
+    let mut document_frequency = Vec::<u32>::new();
+    for canonical_batch in canonical_documents.chunks(TOKENIZE_BATCH) {
+        progress.check_cancelled()?;
+        let raw_batch = canonical_batch
+            .par_iter()
+            .map(|&canonical| tokenize_metadata_document(canonical))
+            .collect::<Vec<_>>();
+        for raw in raw_batch {
+            let mut document_terms = Vec::with_capacity(raw.terms.len());
+            for (term, frequency) in raw.terms {
+                let term_id = if let Some(&id) = term_ids.get(term) {
+                    id
+                } else {
+                    let id = u32::try_from(term_ids.len())
+                        .map_err(|_| Analysis2Error::invalid("too many BM25 terms for u32"))?;
+                    term_ids.insert(term, id);
+                    document_frequency.push(0);
+                    id
+                };
+                document_terms.push((term_id, frequency));
             }
+            document_terms.sort_unstable_by_key(|&(term, _)| term);
+            let mut document = PreparedDocument::from_compact_terms(&document_terms);
+            let term_start = u32::try_from(terms.len())
+                .map_err(|_| Analysis2Error::invalid("too many metadata terms for u32"))?;
+            document.set_term_start(term_start);
+            for &(term, _) in &document_terms {
+                document_frequency[term as usize] =
+                    document_frequency[term as usize].saturating_add(1);
+            }
+            terms.extend(document_terms);
+            documents.push(document);
         }
-        pending_progress += 1;
-        if pending_progress as usize == PROGRESS_BATCH {
-            progress.check_cancelled()?;
-            progress.add_completed(pending_progress);
-            pending_progress = 0;
-        }
+        progress.add_completed(canonical_batch.len() as u64);
     }
-    if pending_progress > 0 {
-        progress.add_completed(pending_progress);
-    }
-
-    progress.begin_phase("metadata_documents", Some(raw_documents.len() as u64));
-    let prepared = raw_documents
-        .par_iter()
-        .map(|raw| {
-            progress.check_cancelled()?;
-            let mut terms = raw
-                .terms
-                .iter()
-                .map(|&(term, frequency)| {
-                    (
-                        *term_ids
-                            .get(term)
-                            .expect("all tokenized terms are catalogued"),
-                        frequency,
-                    )
-                })
-                .collect::<Vec<_>>();
-            terms.sort_unstable_by_key(|&(term, _)| term);
-            let document = PreparedDocument::from_compact_terms(&terms);
-            progress.add_completed(1);
-            Ok::<_, Analysis2Error>((document, terms))
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-    let term_count = term_ids.len();
     drop(term_ids);
-    drop(raw_documents);
     drop(canonical_documents);
-
-    let total_terms = prepared.iter().map(|(_, terms)| terms.len()).sum();
-    let mut documents = Vec::with_capacity(prepared.len());
-    let mut terms = Vec::with_capacity(total_terms);
-    let mut document_frequency = vec![0_u32; term_count];
-    for (mut document, document_terms) in prepared {
-        let term_start = u32::try_from(terms.len())
-            .map_err(|_| Analysis2Error::invalid("too many metadata terms for u32"))?;
-        document.set_term_start(term_start);
-        for &(term, _) in &document_terms {
-            document_frequency[term as usize] = document_frequency[term as usize].saturating_add(1);
-        }
-        terms.extend(document_terms);
-        documents.push(document);
-    }
 
     progress.begin_phase("metadata_postings", Some(documents.len() as u64));
     let term_postings = build_term_postings(
@@ -391,38 +354,9 @@ fn build_term_postings(
         );
     }
 
-    if documents.len() >= progress_batch && rayon::current_num_threads() > 1 {
-        let cursors = offsets[..document_frequency.len()]
-            .iter()
-            .map(|&offset| AtomicU32::new(offset))
-            .collect::<Vec<_>>();
-        let values = (0..total).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
-        documents
-            .par_chunks(progress_batch)
-            .enumerate()
-            .try_for_each(|(chunk_index, chunk)| {
-                progress.check_cancelled()?;
-                let document_start = chunk_index * progress_batch;
-                for (offset, document) in chunk.iter().enumerate() {
-                    let document_id = u32::try_from(document_start + offset).map_err(|_| {
-                        Analysis2Error::invalid("too many metadata documents for u32")
-                    })?;
-                    for &(term, _) in document.terms(terms) {
-                        let position =
-                            cursors[term as usize].fetch_add(1, Ordering::Relaxed) as usize;
-                        values[position].store(document_id, Ordering::Relaxed);
-                    }
-                }
-                progress.add_completed(chunk.len() as u64);
-                Ok::<_, Analysis2Error>(())
-            })?;
-        return Ok(CsrIndex {
-            keys: (0..term_count).collect(),
-            offsets,
-            values: values.into_iter().map(AtomicU32::into_inner).collect(),
-        });
-    }
-
+    // Fill the final u32 buffer directly. The former parallel path first
+    // allocated an equally large Vec<AtomicU32> and then allocated Vec<u32>
+    // during conversion, briefly doubling the complete postings payload.
     let mut values = vec![0_u32; total as usize];
     let mut cursors = offsets[..document_frequency.len()].to_vec();
     let mut pending_progress = 0_u64;
