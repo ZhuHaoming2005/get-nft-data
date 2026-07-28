@@ -600,8 +600,12 @@ fn query_seeds_staged(
     Ok(finish_seed_batch(states, failures))
 }
 
-/// Overlap pass-2 Parquet I/O with URI seed queries, then finish name/metadata.
-fn query_seeds_with_pass2_overlap(
+/// Finish URI queries and release their indexes before collecting pass-2 metadata.
+///
+/// Both phases can be large on production snapshots. Overlapping them retains
+/// URI postings, seed hit graphs, and pass-2 metadata anchors at the same time,
+/// creating a short-lived RSS peak near the end of `uri_seeds`.
+fn query_seeds_with_staged_pass2(
     store: &mut ResidentStore,
     pending: PendingDedupLoad,
     seeds: &[SeedRecord],
@@ -615,27 +619,17 @@ fn query_seeds_with_pass2_overlap(
     let quiet = CancellationOnlyProgress { inner: progress };
     let chain_count = store.chains.len();
 
-    // URI queries only read URI CSR + identity; pass-2 collect never touches the
-    // store. Overlapping them hides a full Parquet metadata scan behind URI work.
-    let (uri_result, anchors_result) = rayon::join(
-        || {
-            run_seed_stage(
-                &mut states,
-                "uri_seeds",
-                progress,
-                || UriQueryScratch::for_chain_count(chain_count),
-                |scratch, seed, graph| {
-                    query_uri_for_seed_with_scratch(store, seed, graph, &quiet, scratch)
-                },
-            )
-        },
-        || pending.collect_pass2(&quiet),
-    );
-    uri_result?;
-    let anchors = anchors_result?;
+    run_seed_stage(
+        &mut states,
+        "uri_seeds",
+        progress,
+        || UriQueryScratch::for_chain_count(chain_count),
+        |scratch, seed, graph| query_uri_for_seed_with_scratch(store, seed, graph, &quiet, scratch),
+    )?;
     store.drop_uri_indexes();
 
     progress.set_stage("load");
+    let anchors = pending.collect_pass2(progress)?;
     let overlay_result = pending.finish_with_metadata_overlay(store, anchors, progress, |store| {
         apply_seed_nft_metadata(store, seed_nft_caches)
     });
@@ -680,7 +674,7 @@ fn run_dedup_inner(
         progress,
     )?;
     let seed_batch = match pending {
-        Some(pending) => query_seeds_with_pass2_overlap(
+        Some(pending) => query_seeds_with_staged_pass2(
             &mut store,
             pending,
             &seeds,
@@ -1065,7 +1059,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         load_seed_batch_from_cache(&store, &cache, &cache_path, progress)?
     } else {
         let batch = match pending {
-            Some(pending) => query_seeds_with_pass2_overlap(
+            Some(pending) => query_seeds_with_staged_pass2(
                 &mut store,
                 pending,
                 &seeds,
@@ -1830,6 +1824,18 @@ mod tests {
         let phases = progress.phases.lock().unwrap();
         assert!(!phases.iter().any(|phase| phase.starts_with("name_")));
         assert!(phases.iter().any(|phase| phase == "metadata_seeds"));
+        let uri_position = phases
+            .iter()
+            .position(|phase| phase == "uri_seeds")
+            .expect("URI seed phase");
+        let pass2_position = phases
+            .iter()
+            .position(|phase| phase == "pass2_metadata")
+            .expect("pass-2 metadata phase");
+        assert!(
+            uri_position < pass2_position,
+            "pass-2 metadata must start only after URI seed queries release their indexes"
+        );
         drop(phases);
 
         let manifest: Value = serde_json::from_str(
