@@ -88,8 +88,8 @@ fn normalize_chain_set(chains: impl IntoIterator<Item = String>) -> AHashSet<Str
 
 /// Remaining work after pass-1 identity + URI CSR are ready for seed URI queries.
 ///
-/// Pass-2 Parquet I/O does not need the store, so the CLI can overlap it with
-/// URI seed queries before name/metadata finalize.
+/// The CLI runs pass-2 after URI seed queries so their two resident working
+/// sets cannot create a combined RSS peak.
 pub struct PendingDedupLoad {
     validated: Vec<validate::ValidatedInput>,
     options: LoadOptions,
@@ -101,13 +101,26 @@ impl PendingDedupLoad {
         self.total_rows
     }
 
-    /// Heavy pass-2 scan (no store mutation). Safe to run beside URI queries.
+    /// Heavy pass-2 scan retaining every configured metadata anchor.
     pub fn collect_pass2(
         &self,
         progress: &dyn ProgressObserver,
     ) -> Result<pass2::CollectedPass2Anchors, Analysis2Error> {
         progress.begin_phase("pass2_metadata", Some(self.total_rows));
-        pass2::collect_pass2_anchors(&self.validated, &self.options, progress)
+        pass2::collect_pass2_anchors(&self.validated, &self.options, progress, None)
+    }
+
+    /// Heavy pass-2 scan retaining only metadata that can participate in a
+    /// seed-scoped alignment decision.
+    pub fn collect_pass2_for_seeds(
+        &self,
+        store: &ResidentStore,
+        seeds: &[crate::entity::ContractId],
+        progress: &dyn ProgressObserver,
+    ) -> Result<pass2::CollectedPass2Anchors, Analysis2Error> {
+        progress.begin_phase("pass2_metadata", Some(self.total_rows));
+        let selection = pass2::MetadataQuerySelection::new(store, seeds);
+        pass2::collect_pass2_anchors(&self.validated, &self.options, progress, Some(&selection))
     }
 
     /// Apply pass-2 anchors and build Name + Metadata indexes.
@@ -151,7 +164,7 @@ impl PendingDedupLoad {
     }
 }
 
-/// Pass-1 + URI CSR only. Pair with [`PendingDedupLoad`] for overlapped URI/pass2.
+/// Pass-1 + URI CSR only. Pair with [`PendingDedupLoad`] for staged URI/pass2.
 pub fn load_resident_store_uri_ready(
     inputs: &[PathBuf],
     options: &LoadOptions,

@@ -27,7 +27,6 @@ pub struct ChainTotals {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MetadataRecord {
     pub token_id: String,
-    pub json: String,
     pub canonical_json: String,
     pub source_order: SourceOrder,
 }
@@ -66,6 +65,21 @@ pub fn normalized_evm_token(token: &str) -> String {
     match BigUint::parse_bytes(trimmed.as_bytes(), 10) {
         Some(n) => n.to_string(),
         None => token.to_owned(),
+    }
+}
+
+/// Borrowed canonical decimal token id used by hot-path equality indexes.
+/// Non-decimal values retain their original spelling.
+pub fn normalized_evm_token_slice(token: &str) -> &str {
+    let trimmed = token.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return token;
+    }
+    let without_zeroes = trimmed.trim_start_matches('0');
+    if without_zeroes.is_empty() {
+        &trimmed[trimmed.len() - 1..]
+    } else {
+        without_zeroes
     }
 }
 

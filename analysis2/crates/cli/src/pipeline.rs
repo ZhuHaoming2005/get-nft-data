@@ -356,7 +356,6 @@ fn apply_seed_nft_metadata(
             let canonical = record.metadata_json.clone();
             records.push(MetadataRecord {
                 token_id: record.token_id,
-                json: record.metadata_json,
                 canonical_json: canonical,
                 source_order: SourceOrder {
                     file_ordinal: u32::MAX,
@@ -629,7 +628,8 @@ fn query_seeds_with_staged_pass2(
     store.drop_uri_indexes();
 
     progress.set_stage("load");
-    let anchors = pending.collect_pass2(progress)?;
+    let seed_ids = states.iter().map(|state| state.seed_id).collect::<Vec<_>>();
+    let anchors = pending.collect_pass2_for_seeds(store, &seed_ids, progress)?;
     let overlay_result = pending.finish_with_metadata_overlay(store, anchors, progress, |store| {
         apply_seed_nft_metadata(store, seed_nft_caches)
     });

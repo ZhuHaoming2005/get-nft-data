@@ -20,7 +20,7 @@ use rayon::prelude::*;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::dedup::hits::{Dimension, HitEdge, HitGraph};
-use crate::entity::{ChainId, ContractId, CsrIndex, ResidentStore};
+use crate::entity::{ChainId, ContractId, CsrIndex, ResidentStore, normalized_evm_token_slice};
 use crate::error::Analysis2Error;
 use crate::progress::{NoopProgress, ProgressObserver};
 
@@ -371,19 +371,6 @@ pub fn finalize_metadata_index_with_progress(
     Ok(())
 }
 
-fn normalized_evm_token_slice(token: &str) -> &str {
-    let trimmed = token.trim();
-    if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
-        return token;
-    }
-    let without_zeroes = trimmed.trim_start_matches('0');
-    if without_zeroes.is_empty() {
-        &trimmed[trimmed.len() - 1..]
-    } else {
-        without_zeroes
-    }
-}
-
 fn build_term_postings(
     documents: &[PreparedDocument],
     terms: &[(u32, u32)],
@@ -694,7 +681,6 @@ mod tests {
                 chain,
                 contract,
                 token,
-                canonical.to_owned(),
                 canonical.to_owned(),
                 SourceOrder {
                     file_ordinal: 0,

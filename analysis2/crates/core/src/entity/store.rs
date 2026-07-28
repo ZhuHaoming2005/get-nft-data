@@ -298,7 +298,6 @@ impl ResidentStore {
         chain: &str,
         contract_address: &str,
         token_id: &str,
-        json: String,
         canonical_json: String,
         source_order: SourceOrder,
     ) -> Result<(), Analysis2Error> {
@@ -318,7 +317,6 @@ impl ResidentStore {
             contract_id,
             chain,
             token_id.to_owned(),
-            json,
             canonical_json,
             source_order,
         );
@@ -339,7 +337,6 @@ impl ResidentStore {
                     chain,
                     contract_address,
                     &record.token_id,
-                    record.json,
                     record.canonical_json,
                     record.source_order,
                 )?;
@@ -373,7 +370,6 @@ impl ResidentStore {
         contract_id: ContractId,
         chain: &str,
         token_id: String,
-        json: String,
         canonical_json: String,
         source_order: SourceOrder,
     ) {
@@ -399,7 +395,6 @@ impl ResidentStore {
             insert_at,
             MetadataRecord {
                 token_id,
-                json,
                 canonical_json,
                 source_order,
             },
@@ -614,7 +609,6 @@ impl ResidentStore {
                     contract_id,
                     &chain_name,
                     record.token_id,
-                    record.json,
                     record.canonical_json,
                     record.source_order,
                 );
@@ -800,7 +794,6 @@ mod tests {
                     "ethereum",
                     "0xaaa",
                     token,
-                    format!(r#"{{"name":"{token}"}}"#),
                     format!(r#"{{"name":"{token}"}}"#),
                     SourceOrder {
                         file_ordinal: 0,
