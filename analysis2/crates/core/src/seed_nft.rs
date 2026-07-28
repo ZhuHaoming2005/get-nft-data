@@ -429,13 +429,16 @@ async fn download_helius(
         let result = payload
             .get("result")
             .ok_or_else(|| Analysis2Error::http("Helius getAssetsByGroup omitted result"))?;
-        if let Some(total) = json_usize(result.get("total")) {
-            provider_total = Some(total);
-        }
         let rows = result
             .get("items")
             .and_then(Value::as_array)
             .ok_or_else(|| Analysis2Error::http("Helius getAssetsByGroup omitted items"))?;
+        if page == 1
+            && let Some(total) = json_usize(result.get("total"))
+            && (total > 0 || rows.is_empty())
+        {
+            provider_total = Some(total);
+        }
         for row in rows {
             let record = parse_helius_nft(row)
                 .ok_or_else(|| Analysis2Error::http("Helius getAssetsByGroup item omitted id"))?;
