@@ -392,7 +392,6 @@ async fn download_helius(
     let url = with_api_key(&options.endpoints.helius, key);
     let mut writer = CacheStreamWriter::create(path, seed)?;
     let mut page = 1usize;
-    let mut provider_total = None;
     let mut has_more;
     let mut seen_tokens = AHashSet::new();
     let mut resident_records = Vec::new();
@@ -416,7 +415,7 @@ async fn download_helius(
                 "options": {
                     "showUnverifiedCollections": false,
                     "showCollectionMetadata": false,
-                    "showGrandTotal": page == 1
+                    "showGrandTotal": false
                 }
             }
         });
@@ -433,12 +432,6 @@ async fn download_helius(
             .get("items")
             .and_then(Value::as_array)
             .ok_or_else(|| Analysis2Error::http("Helius getAssetsByGroup omitted items"))?;
-        if page == 1
-            && let Some(total) = json_usize(result.get("total"))
-            && (total > 0 || rows.is_empty())
-        {
-            provider_total = Some(total);
-        }
         for row in rows {
             let record = parse_helius_nft(row)
                 .ok_or_else(|| Analysis2Error::http("Helius getAssetsByGroup item omitted id"))?;
@@ -457,18 +450,8 @@ async fn download_helius(
         page += 1;
     }
     let capped = writer.count >= MAX_SEED_NFTS_PER_CONTRACT;
-    if let Some(total) = provider_total
-        && (total < writer.count || (total > writer.count && !capped))
-    {
-        return Err(Analysis2Error::http(format!(
-            "Helius getAssetsByGroup total={total} disagrees with {} downloaded NFTs",
-            writer.count
-        )));
-    }
-    let truncated = provider_total
-        .map(|total| capped && total > writer.count)
-        .unwrap_or(capped && has_more);
-    let footer = writer.finish(provider_total, truncated)?;
+    let truncated = capped && has_more;
+    let footer = writer.finish(None, truncated)?;
     Ok(cache_ref(seed, path, footer, false, Some(resident_records)))
 }
 
