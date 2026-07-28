@@ -586,7 +586,7 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect::<AHashSet<_>>();
-        let mut store = ResidentStore::with_options(8, &evm);
+        let mut store = ResidentStore::with_options(Some(8), &evm);
         store
             .ingest_identity_row(IdentityRow {
                 chain: "ethereum".into(),

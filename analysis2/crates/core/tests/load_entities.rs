@@ -59,7 +59,7 @@ fn default_options() -> LoadOptions {
     LoadOptions::new(
         ["ethereum", "base", "solana"].map(str::to_owned),
         ["ethereum", "base"].map(str::to_owned),
-        2,
+        Some(2),
     )
 }
 
@@ -157,7 +157,7 @@ fn load_options_mixed_case_evm_chains_use_bigint_descending_anchors() {
     let options = LoadOptions::new(
         ["Ethereum", " Base ", "SOLANA"].map(str::to_owned),
         ["Ethereum", "BASE"].map(str::to_owned),
-        2,
+        Some(2),
     );
     assert!(options.allowed_chains.contains("ethereum"));
     assert!(options.evm_chains.contains("ethereum"));
@@ -184,7 +184,7 @@ fn identity_only_load_keeps_identity_without_dedup_strings() {
     let options = LoadOptions::identity_only(
         ["ethereum", "base", "solana"].map(str::to_owned),
         ["ethereum", "base"].map(str::to_owned),
-        2,
+        Some(2),
     );
     let store = load_resident_store(&[path], &options, &NoopProgress).expect("identity-only load");
 
@@ -210,7 +210,7 @@ fn conflicting_uri_same_logical_key_errors() {
     let options = LoadOptions::new(
         HashSet::from(["ethereum".to_owned()]),
         HashSet::from(["ethereum".to_owned()]),
-        8,
+        Some(8),
     );
     let err = load_resident_store(&[path], &options, &NoopProgress).unwrap_err();
     let msg = err.to_string();

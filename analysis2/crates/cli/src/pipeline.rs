@@ -11,24 +11,26 @@ use analysis2_core::{
     Analysis2Error, ApiKeys, CandidateAnalysis, CandidateRegistry, ContractId,
     DEFAULT_EVIDENCE_CACHE_BATCH, DedupCacheParams, DedupRunParams, EvidenceBundle,
     EvidenceCacheSink, EvidenceStatus, FailureRecord, HitGraph, HttpLimits, INTERMEDIATE_DIR,
-    LegitSignals, LoadOptions, MetadataQueryScratch, NameQueryScratch, PaperConfig,
+    LegitSignals, LoadOptions, MetadataQueryScratch, MetadataRecord, NameQueryScratch, PaperConfig,
     PendingDedupLoad, ProgressObserver, ResidentStore, ScopeAnalysisSets, SeedDedupReport,
-    SeedFullReport, SeedRecord, UriQueryScratch, analyze_candidate,
-    build_contract_nft_map_for_graphs, build_dedup_cache, build_evidence_cache,
-    build_seed_analysis_rollup, build_seed_dedup_report, candidate_json_rel_path,
-    default_dedup_cache_path, default_evidence_cache_path, enrich_candidates_with_hook,
-    evidence_cache_artifacts_present, evidence_cache_params, finalize_legit_signals,
-    load_dedup_cache, load_evidence_cache_resumable, load_resident_store_uri_ready,
-    load_seeds_json, query_metadata_for_seed_with_scratch, query_name_for_seed_with_scratch,
+    SeedFullReport, SeedNftCacheRef, SeedNftDownloadOptions, SeedRecord, SourceOrder,
+    UriQueryScratch, analyze_candidate, build_contract_nft_map_for_graphs, build_dedup_cache,
+    build_evidence_cache, build_seed_analysis_rollup, build_seed_dedup_report, cache_fingerprint,
+    candidate_json_rel_path, default_dedup_cache_path, default_evidence_cache_path,
+    enrich_candidates_with_hook, evidence_cache_artifacts_present, evidence_cache_params,
+    finalize_legit_signals, load_dedup_cache, load_evidence_cache_resumable,
+    load_resident_store_uri_ready, load_seeds_json, prepare_seed_nft_caches,
+    query_metadata_for_seed_with_scratch, query_name_for_seed_with_scratch,
     query_uri_for_seed_with_scratch, refresh_cached_evm_holders, refresh_cached_prices,
-    refresh_relation_legit, rematerialize_dedup_batch, rematerialize_evidence,
-    resolve_seed_contract, scopes_complete_for_seed, serialize_candidate_json,
-    validate_dedup_cache, validate_evidence_cache, write_candidate_json_bytes, write_dedup_cache,
-    write_dedup_outputs, write_evidence_cache, write_run_outputs,
+    refresh_relation_legit, release_resident_seed_nfts, rematerialize_dedup_batch,
+    rematerialize_evidence, resolve_seed_contract, scopes_complete_for_seed,
+    serialize_candidate_json, validate_dedup_cache, validate_evidence_cache,
+    write_candidate_json_bytes, write_dedup_cache, write_dedup_outputs, write_evidence_cache,
+    write_run_outputs,
 };
 use rayon::prelude::*;
 
-/// Configuration for the offline dedup pipeline.
+/// Configuration for the seed-snapshot + dedup pipeline.
 pub struct RunDedupConfig {
     pub inputs: Vec<PathBuf>,
     pub seeds: PathBuf,
@@ -37,8 +39,11 @@ pub struct RunDedupConfig {
     pub evm_chains: Vec<String>,
     pub name_threshold: Option<f64>,
     pub metadata_threshold: f64,
-    pub metadata_anchors: usize,
+    pub metadata_anchors: Option<usize>,
     pub rayon_threads: Option<usize>,
+    /// `None` is reserved for fixture tests; the CLI always enables complete
+    /// seed-NFT download/cache preparation.
+    pub seed_nft_download: Option<SeedNftDownloadOptions>,
 }
 
 /// Optional sync enrich override for fixture / unit tests (skips live HTTP).
@@ -188,7 +193,7 @@ pub struct RunConfig {
     pub evm_chains: Vec<String>,
     pub name_threshold: Option<f64>,
     pub metadata_threshold: f64,
-    pub metadata_anchors: usize,
+    pub metadata_anchors: Option<usize>,
     pub rayon_threads: Option<usize>,
     pub api_keys: ApiKeys,
     pub http_concurrency: usize,
@@ -199,6 +204,8 @@ pub struct RunConfig {
     pub dedup_cache_path: Option<PathBuf>,
     /// Path for durable evidence cache (`intermediate/evidence_cache.json` by default).
     pub evidence_cache_path: Option<PathBuf>,
+    /// `None` is reserved for fixture tests; the CLI enables this stage.
+    pub seed_nft_download: Option<SeedNftDownloadOptions>,
 }
 
 fn with_rayon_pool<T>(
@@ -222,6 +229,147 @@ where
         .build()
         .map_err(|error| Analysis2Error::invalid(format!("rayon pool: {error}")))?;
     pool.install(run)
+}
+
+fn load_with_seed_nft_pipeline(
+    inputs: &[PathBuf],
+    options: &LoadOptions,
+    seeds: &[SeedRecord],
+    download: Option<&SeedNftDownloadOptions>,
+    progress: &dyn ProgressObserver,
+) -> Result<
+    (
+        ResidentStore,
+        Option<PendingDedupLoad>,
+        Vec<SeedNftCacheRef>,
+    ),
+    Analysis2Error,
+> {
+    let Some(download) = download else {
+        let (store, pending) = load_resident_store_uri_ready(inputs, options, progress)?;
+        return Ok((store, pending, Vec::new()));
+    };
+    if !options.allowed_chains.is_empty()
+        && let Some(seed) = seeds
+            .iter()
+            .find(|seed| !options.allowed_chains.contains(&seed.chain))
+    {
+        return Err(Analysis2Error::invalid(format!(
+            "seed chain {} is not enabled by --chains",
+            seed.chain
+        )));
+    }
+
+    // Network pagination/zstd writes and Parquet scan/index construction use
+    // independent executors and overlap. Decoded rows stay resident for the
+    // immediate identity/metadata overlays and are explicitly released after
+    // their final consumer.
+    let (loaded, downloaded) = thread::scope(|scope| {
+        let handle = scope.spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .map_err(|e| Analysis2Error::http(format!("seed NFT runtime: {e}")))?;
+            runtime.block_on(prepare_seed_nft_caches(seeds, download))
+        });
+        let loaded = load_resident_store_uri_ready(inputs, options, progress);
+        let downloaded = handle
+            .join()
+            .map_err(|_| Analysis2Error::invalid("seed NFT download worker panicked"))?;
+        Ok::<_, Analysis2Error>((loaded, downloaded))
+    })?;
+    let (mut store, pending) = loaded?;
+    let caches = downloaded?;
+    apply_seed_nft_identities(&mut store, &caches, progress)?;
+    Ok((store, pending, caches))
+}
+
+fn apply_seed_nft_identities(
+    store: &mut ResidentStore,
+    caches: &[SeedNftCacheRef],
+    progress: &dyn ProgressObserver,
+) -> Result<(), Analysis2Error> {
+    if caches.is_empty() {
+        return Ok(());
+    }
+    let total = caches.iter().map(|cache| cache.item_count as u64).sum();
+    progress.set_stage("seed_nfts");
+    progress.begin_phase("overlay_identity", Some(total));
+    let seeds = caches
+        .iter()
+        .map(|cache| (cache.seed.chain.clone(), cache.seed.address.clone()))
+        .collect::<Vec<_>>();
+    store.remove_seed_contract_nfts(&seeds);
+    let mut row_number = 0_u64;
+    for cache in caches {
+        if cache.truncated {
+            eprintln!(
+                "seed NFTs: capped {} / {} at {} records (provider_total={:?})",
+                cache.seed.chain, cache.seed.address, cache.item_count, cache.provider_total
+            );
+        } else {
+            eprintln!(
+                "seed NFTs: {} {} / {} ({} records, cache={})",
+                if cache.reused { "reused" } else { "downloaded" },
+                cache.seed.chain,
+                cache.seed.address,
+                cache.item_count,
+                cache.path.display()
+            );
+        }
+        cache.for_each_nft(|record| {
+            store.ingest_identity_strs(
+                &cache.seed.chain,
+                &cache.seed.address,
+                &record.token_id,
+                &record.name_norm,
+                &record.token_uri_norm,
+                &record.image_uri_norm,
+                SourceOrder {
+                    file_ordinal: u32::MAX,
+                    file_row_number: row_number,
+                },
+            )?;
+            row_number = row_number.saturating_add(1);
+            progress.add_completed(1);
+            Ok(())
+        })?;
+    }
+    // One rebuild after all streaming overlays avoids O(seeds × snapshot) work.
+    store.rebuild_uri_csr();
+    Ok(())
+}
+
+fn apply_seed_nft_metadata(
+    store: &mut ResidentStore,
+    caches: &mut [SeedNftCacheRef],
+) -> Result<(), Analysis2Error> {
+    let mut row_number = 0_u64;
+    for cache in caches {
+        let chain = cache.seed.chain.clone();
+        let address = cache.seed.address.clone();
+        let mut records = Vec::with_capacity(cache.item_count);
+        cache.consume_nfts(|record| {
+            if record.metadata_json.is_empty() {
+                return Ok(());
+            }
+            let canonical = record.metadata_json.clone();
+            records.push(MetadataRecord {
+                token_id: record.token_id,
+                json: record.metadata_json,
+                canonical_json: canonical,
+                source_order: SourceOrder {
+                    file_ordinal: u32::MAX,
+                    file_row_number: row_number,
+                },
+            });
+            row_number = row_number.saturating_add(1);
+            Ok(())
+        })?;
+        store.clear_contract_metadata(&chain, &address);
+        store.ingest_metadata_records(&chain, &address, records)?;
+    }
+    Ok(())
 }
 
 /// Preserve cancellation checks inside parallel seed queries without letting
@@ -457,6 +605,7 @@ fn query_seeds_with_pass2_overlap(
     store: &mut ResidentStore,
     pending: PendingDedupLoad,
     seeds: &[SeedRecord],
+    seed_nft_caches: &mut [SeedNftCacheRef],
     name_threshold: Option<f64>,
     metadata_threshold: f64,
     progress: &dyn ProgressObserver,
@@ -487,7 +636,11 @@ fn query_seeds_with_pass2_overlap(
     store.drop_uri_indexes();
 
     progress.set_stage("load");
-    pending.finish(store, anchors, progress)?;
+    let overlay_result = pending.finish_with_metadata_overlay(store, anchors, progress, |store| {
+        apply_seed_nft_metadata(store, seed_nft_caches)
+    });
+    release_resident_seed_nfts(seed_nft_caches);
+    overlay_result?;
 
     progress.set_stage("dedup");
     query_name_and_metadata_stages(
@@ -500,7 +653,7 @@ fn query_seeds_with_pass2_overlap(
     Ok(finish_seed_batch(states, failures))
 }
 
-/// Load snapshot → query URI/Name/Metadata per seed → write offline reports.
+/// Load snapshot + complete seed caches → query URI/Name/Metadata → write reports.
 pub fn run_dedup(
     config: &RunDedupConfig,
     progress: &dyn ProgressObserver,
@@ -519,12 +672,19 @@ fn run_dedup_inner(
     );
     options.build_name_index = config.name_threshold.is_some();
     let seeds = load_seeds_json(&config.seeds)?;
-    let (mut store, pending) = load_resident_store_uri_ready(&config.inputs, &options, progress)?;
+    let (mut store, pending, mut seed_nft_caches) = load_with_seed_nft_pipeline(
+        &config.inputs,
+        &options,
+        &seeds,
+        config.seed_nft_download.as_ref(),
+        progress,
+    )?;
     let seed_batch = match pending {
         Some(pending) => query_seeds_with_pass2_overlap(
             &mut store,
             pending,
             &seeds,
+            &mut seed_nft_caches,
             config.name_threshold,
             config.metadata_threshold,
             progress,
@@ -537,6 +697,7 @@ fn run_dedup_inner(
             progress,
         )?,
     };
+    release_resident_seed_nfts(&mut seed_nft_caches);
     let contract_nfts = build_contract_nft_map_for_graphs(
         &store,
         seed_batch.completed.iter().map(|(_, _, graph)| graph),
@@ -610,7 +771,11 @@ fn evidence_cache_path(config: &RunConfig) -> PathBuf {
     primary
 }
 
-fn make_dedup_cache_params(config: &RunConfig, seeds: &[SeedRecord]) -> DedupCacheParams {
+fn make_dedup_cache_params(
+    config: &RunConfig,
+    seeds: &[SeedRecord],
+    seed_nft_fingerprint: String,
+) -> DedupCacheParams {
     DedupCacheParams {
         inputs: config
             .inputs
@@ -622,6 +787,7 @@ fn make_dedup_cache_params(config: &RunConfig, seeds: &[SeedRecord]) -> DedupCac
         name_threshold: config.name_threshold,
         metadata_threshold: config.metadata_threshold,
         metadata_anchors: config.metadata_anchors,
+        seed_nft_fingerprint,
         seeds_path: config.seeds.display().to_string(),
         seeds: seeds.to_vec(),
     }
@@ -788,25 +954,29 @@ fn load_seed_batch_from_cache(
     })
 }
 
-/// Try to open + validate a dedup cache before choosing load options.
-///
-/// Cache present + params match → `Ok(Some(cache))`; otherwise log and fall
-/// through to the full query automatically.
-fn try_load_validated_dedup_cache(
+/// Preflight every dedup-cache parameter except the seed-snapshot fingerprint.
+/// The real fingerprint is checked after seed cache preparation; copying the
+/// cached value here only lets a likely hit choose the identity-only loader.
+fn try_load_dedup_cache_preflight(
     cache_path: &Path,
-    expected: &DedupCacheParams,
+    config: &RunConfig,
+    seeds: &[SeedRecord],
 ) -> Result<Option<analysis2_core::DedupCacheFile>, Analysis2Error> {
     if !cache_path.is_file() {
         return Ok(None);
     }
     match load_dedup_cache(cache_path) {
-        Ok(cache) => match validate_dedup_cache(&cache, expected) {
-            Ok(()) => Ok(Some(cache)),
-            Err(e) => {
-                eprintln!("dedup: ignoring incompatible cache: {e}");
-                Ok(None)
+        Ok(cache) => {
+            let expected =
+                make_dedup_cache_params(config, seeds, cache.params.seed_nft_fingerprint.clone());
+            match validate_dedup_cache(&cache, &expected) {
+                Ok(()) => Ok(Some(cache)),
+                Err(e) => {
+                    eprintln!("dedup: ignoring incompatible cache: {e}");
+                    Ok(None)
+                }
             }
-        },
+        }
         Err(e) => {
             eprintln!("dedup: ignoring unreadable cache ({e})");
             Ok(None)
@@ -818,29 +988,9 @@ fn try_load_validated_dedup_cache(
 fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), Analysis2Error> {
     let seeds = load_seeds_json(&config.seeds)?;
     let cache_path = dedup_cache_path(config);
-    let cache_params = make_dedup_cache_params(config, &seeds);
-
-    // Resolve dedup reuse before Parquet load so a compatible cache skips index
-    // build. Missing/incompatible caches automatically fall through.
-    let dedup_cache = try_load_validated_dedup_cache(&cache_path, &cache_params)?;
-    if dedup_cache.is_some() {
-        eprintln!(
-            "dedup: will reuse {} (identity-only Parquet load)",
-            cache_path.display()
-        );
-    } else if cache_path.is_file() {
-        eprintln!(
-            "dedup: cache present but not reused; running full query ({})",
-            cache_path.display()
-        );
-    } else {
-        eprintln!(
-            "dedup: no cache at {}; running full Name/URI/Metadata query",
-            cache_path.display()
-        );
-    }
-
-    let options = if dedup_cache.is_some() {
+    let preflight_cache = try_load_dedup_cache_preflight(&cache_path, config, &seeds)?;
+    let preflight_hit = preflight_cache.is_some();
+    let mut options = if preflight_hit {
         LoadOptions::identity_only(
             config.chains.clone(),
             config.evm_chains.clone(),
@@ -855,11 +1005,63 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         options.build_name_index = config.name_threshold.is_some();
         options
     };
-    let (mut store, pending) = load_resident_store_uri_ready(&config.inputs, &options, progress)?;
+    let (mut store, mut pending, mut seed_nft_caches) = load_with_seed_nft_pipeline(
+        &config.inputs,
+        &options,
+        &seeds,
+        config.seed_nft_download.as_ref(),
+        progress,
+    )?;
+    let seed_nft_fingerprint = cache_fingerprint(&seed_nft_caches)?;
+    let cache_params = make_dedup_cache_params(config, &seeds, seed_nft_fingerprint);
+
+    // The compressed seed snapshots are part of the cache identity. Validate
+    // after the download/cache pipeline has atomically published them.
+    let dedup_cache = preflight_cache.and_then(|cache| {
+        if let Err(error) = validate_dedup_cache(&cache, &cache_params) {
+            eprintln!("dedup: seed snapshot invalidated compatible cache: {error}");
+            None
+        } else {
+            Some(cache)
+        }
+    });
+    if preflight_hit && dedup_cache.is_none() {
+        // The likely-hit identity load was intentionally cheap. A refreshed or
+        // replaced seed snapshot now needs the complete dedup indexes.
+        options = LoadOptions::new(
+            config.chains.clone(),
+            config.evm_chains.clone(),
+            config.metadata_anchors,
+        );
+        options.build_name_index = config.name_threshold.is_some();
+        let (mut full_store, full_pending) =
+            load_resident_store_uri_ready(&config.inputs, &options, progress)?;
+        apply_seed_nft_identities(&mut full_store, &seed_nft_caches, progress)?;
+        store = full_store;
+        pending = full_pending;
+    }
+    if dedup_cache.is_some() {
+        eprintln!(
+            "dedup: will reuse {} (seed snapshot fingerprint matched)",
+            cache_path.display()
+        );
+    } else if cache_path.is_file() {
+        eprintln!(
+            "dedup: cache present but not reused; running full query ({})",
+            cache_path.display()
+        );
+    } else {
+        eprintln!(
+            "dedup: no cache at {}; running full Name/URI/Metadata query",
+            cache_path.display()
+        );
+    }
 
     let seed_batch = if let Some(cache) = dedup_cache {
-        // Identity-only load leaves no pending pass-2 work.
+        // Pass-2 metadata was not collected yet; URI memory can be released.
         let _ = pending;
+        store.drop_uri_indexes();
+        release_resident_seed_nfts(&mut seed_nft_caches);
         load_seed_batch_from_cache(&store, &cache, &cache_path, progress)?
     } else {
         let batch = match pending {
@@ -867,6 +1069,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 &mut store,
                 pending,
                 &seeds,
+                &mut seed_nft_caches,
                 config.name_threshold,
                 config.metadata_threshold,
                 progress,
@@ -892,6 +1095,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         );
         batch
     };
+    release_resident_seed_nfts(&mut seed_nft_caches);
 
     let mut failures = seed_batch.failures;
     let contract_nfts = build_contract_nft_map_for_graphs(
@@ -1615,8 +1819,9 @@ mod tests {
                 evm_chains: vec!["ethereum".into(), "base".into()],
                 name_threshold: None,
                 metadata_threshold: DEFAULT_METADATA_THRESHOLD,
-                metadata_anchors: 8,
+                metadata_anchors: Some(8),
                 rayon_threads: None,
+                seed_nft_download: None,
             },
             &progress,
         )
@@ -1701,8 +1906,9 @@ mod tests {
                 evm_chains: vec!["ethereum".into(), "base".into()],
                 name_threshold: Some(DEFAULT_NAME_THRESHOLD),
                 metadata_threshold: DEFAULT_METADATA_THRESHOLD,
-                metadata_anchors: 8,
+                metadata_anchors: Some(8),
                 rayon_threads: None,
+                seed_nft_download: None,
             },
             &progress,
         )
@@ -1794,7 +2000,7 @@ mod tests {
                 evm_chains: vec!["ethereum".into(), "base".into()],
                 name_threshold: Some(DEFAULT_NAME_THRESHOLD),
                 metadata_threshold: DEFAULT_METADATA_THRESHOLD,
-                metadata_anchors: 8,
+                metadata_anchors: Some(8),
                 rayon_threads: Some(2),
                 api_keys: ApiKeys::default(),
                 http_concurrency: 4,
@@ -1805,6 +2011,7 @@ mod tests {
                 enrich_override: Some(enrich),
                 dedup_cache_path: None,
                 evidence_cache_path: None,
+                seed_nft_download: None,
             },
             &analysis2_core::NoopProgress,
         )
@@ -1992,7 +2199,7 @@ mod tests {
                 evm_chains: vec!["ethereum".into(), "base".into()],
                 name_threshold: Some(DEFAULT_NAME_THRESHOLD),
                 metadata_threshold: DEFAULT_METADATA_THRESHOLD,
-                metadata_anchors: 8,
+                metadata_anchors: Some(8),
                 rayon_threads: Some(2),
                 api_keys: ApiKeys::default(),
                 http_concurrency: 4,
@@ -2000,6 +2207,7 @@ mod tests {
                 enrich_override: Some(enrich),
                 dedup_cache_path: None,
                 evidence_cache_path: None,
+                seed_nft_download: None,
             },
             &CancelOnEnrich,
         )
@@ -2055,7 +2263,7 @@ mod tests {
             evm_chains: vec!["ethereum".into(), "base".into()],
             name_threshold: Some(DEFAULT_NAME_THRESHOLD),
             metadata_threshold: DEFAULT_METADATA_THRESHOLD,
-            metadata_anchors: 8,
+            metadata_anchors: Some(8),
             rayon_threads: Some(2),
             api_keys: ApiKeys::default(),
             http_concurrency: 4,
@@ -2066,6 +2274,7 @@ mod tests {
             enrich_override: Some(enrich.clone()),
             dedup_cache_path: Some(cache_path.clone()),
             evidence_cache_path: Some(evidence_path.clone()),
+            seed_nft_download: None,
         };
 
         run(&base_config(), &analysis2_core::NoopProgress).expect("first run");
@@ -2130,7 +2339,7 @@ mod tests {
                 evm_chains: vec!["ethereum".into(), "base".into()],
                 name_threshold: Some(DEFAULT_NAME_THRESHOLD),
                 metadata_threshold: DEFAULT_METADATA_THRESHOLD,
-                metadata_anchors: 8,
+                metadata_anchors: Some(8),
                 rayon_threads: Some(2),
                 api_keys: ApiKeys::default(),
                 http_concurrency: 4,
@@ -2138,6 +2347,7 @@ mod tests {
                 enrich_override: Some(enrich),
                 dedup_cache_path: None,
                 evidence_cache_path: None,
+                seed_nft_download: None,
             },
             &analysis2_core::NoopProgress,
         )

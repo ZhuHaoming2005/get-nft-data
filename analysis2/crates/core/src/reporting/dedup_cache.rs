@@ -17,7 +17,7 @@ use crate::error::Analysis2Error;
 use crate::reporting::json::SeedRecord;
 use crate::reporting::manifest::FailureRecord;
 
-pub const DEDUP_CACHE_VERSION: u32 = 1;
+pub const DEDUP_CACHE_VERSION: u32 = 2;
 pub const DEFAULT_DEDUP_CACHE_FILE: &str = "dedup_cache.json";
 
 /// Parameters that must match between the producing and reusing runs.
@@ -28,7 +28,10 @@ pub struct DedupCacheParams {
     pub evm_chains: Vec<String>,
     pub name_threshold: Option<f64>,
     pub metadata_threshold: f64,
-    pub metadata_anchors: usize,
+    pub metadata_anchors: Option<usize>,
+    /// SHA-256 over the ordered compressed seed-NFT cache files.
+    #[serde(default)]
+    pub seed_nft_fingerprint: String,
     /// Absolute or display path of the seeds file used when the cache was built.
     pub seeds_path: String,
     /// Seeds embedded for exact list comparison on reuse.
@@ -205,6 +208,11 @@ pub fn validate_dedup_cache(
             "dedup cache seeds list does not match current --seeds file",
         ));
     }
+    if got.seed_nft_fingerprint != expected.seed_nft_fingerprint {
+        return Err(Analysis2Error::invalid(
+            "dedup cache seed NFT snapshots do not match current compressed caches",
+        ));
+    }
     Ok(())
 }
 
@@ -332,7 +340,8 @@ mod tests {
             evm_chains: vec!["ethereum".into(), "base".into()],
             name_threshold: Some(0.98),
             metadata_threshold: 0.6,
-            metadata_anchors: 8,
+            metadata_anchors: Some(8),
+            seed_nft_fingerprint: "fixture".into(),
             seeds_path: "seeds.json".into(),
             seeds: vec![seed.clone()],
         };

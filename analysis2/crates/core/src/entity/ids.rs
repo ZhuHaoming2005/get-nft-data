@@ -41,7 +41,7 @@ pub struct Contract {
     pub nft_count: u64,
     /// EVM representative Name (filled by name finalize); Solana leaves this unset.
     pub name_id: Option<StringId>,
-    /// First `k` valid metadata records by token id descending.
+    /// Valid metadata records by token id descending.
     pub metadata_by_token: Vec<MetadataRecord>,
 }
 

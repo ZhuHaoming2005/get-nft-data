@@ -771,7 +771,7 @@ mod tests {
 
     fn prepared(evm: &[&str], rows: impl IntoIterator<Item = IdentityRow>) -> ResidentStore {
         let evm_set = evm.iter().map(|c| (*c).to_owned()).collect::<AHashSet<_>>();
-        let mut store = ResidentStore::with_options(8, &evm_set);
+        let mut store = ResidentStore::with_options(Some(8), &evm_set);
         for r in rows {
             store.ingest_identity_row(r).unwrap();
         }

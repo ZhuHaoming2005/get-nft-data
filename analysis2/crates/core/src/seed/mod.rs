@@ -1,7 +1,7 @@
 //! Seed selection (`select-seeds`) and seed manifest writers.
 
 pub(crate) mod address;
-mod magic_eden;
+mod nftscan;
 mod select;
 
 pub use select::{

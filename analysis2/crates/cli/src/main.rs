@@ -1,8 +1,8 @@
 use analysis2_cli::pipeline::{RunConfig, RunDedupConfig, run as run_pipeline, run_dedup};
 use analysis2_cli::progress::{ProgressMode, ProgressReporter};
 use analysis2_core::{
-    Analysis2Error, ApiKeys, PaperConfig, ProgressObserver, SelectSeedsOptions, select_seeds,
-    write_seed_outputs,
+    Analysis2Error, ApiKeys, INTERMEDIATE_DIR, PaperConfig, ProgressObserver, ProviderEndpoints,
+    SeedNftDownloadOptions, SelectSeedsOptions, select_seeds, write_seed_outputs,
 };
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -51,11 +51,7 @@ struct RunArgs {
     #[arg(long, default_value_t = 0.6)]
     metadata_threshold: f64,
 
-    /// Metadata anchors per contract, default 8.
-    #[arg(long, default_value_t = 8)]
-    metadata_anchors: usize,
-
-    /// Alchemy API key (optional; missing → not_requested for dependent evidence).
+    /// Alchemy API key (required for uncached EVM seed snapshots; otherwise optional).
     #[arg(long)]
     alchemy_api_key: Option<String>,
 
@@ -63,7 +59,7 @@ struct RunArgs {
     #[arg(long)]
     etherscan_api_key: Option<String>,
 
-    /// Helius API key (optional).
+    /// Helius API key (required for uncached Solana seed snapshots; otherwise optional).
     #[arg(long)]
     helius_api_key: Option<String>,
 
@@ -92,6 +88,15 @@ struct RunArgs {
     #[arg(long)]
     evidence_cache: Option<PathBuf>,
 
+    /// Compressed complete seed-NFT cache directory (default:
+    /// `<output-dir>/intermediate/seed_nfts`).
+    #[arg(long)]
+    seed_nft_cache_dir: Option<PathBuf>,
+
+    /// Ignore reusable compressed seed-NFT caches and download again.
+    #[arg(long)]
+    refresh_seed_nfts: bool,
+
     /// Progress reporter mode.
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
@@ -115,9 +120,9 @@ struct SelectSeedsArgs {
     #[arg(long)]
     opensea_api_key: Option<String>,
 
-    /// Helius API key (optional; Solana collection resolve).
+    /// NFTScan API key (required for Solana 30-day ranking).
     #[arg(long)]
-    helius_api_key: Option<String>,
+    nftscan_api_key: Option<String>,
 
     /// Per-provider HTTP concurrency (independent pools for each API provider).
     #[arg(long, default_value_t = 32)]
@@ -177,7 +182,7 @@ fn run() -> Result<(), Analysis2Error> {
                 chains: chains.clone(),
                 seeds_per_chain: args.seeds_per_chain,
                 opensea_api_key: args.opensea_api_key.clone(),
-                helius_api_key: args.helius_api_key.clone(),
+                nftscan_api_key: args.nftscan_api_key.clone(),
                 http_concurrency: args.http_concurrency,
                 ..SelectSeedsOptions::default()
             })?;
@@ -191,6 +196,23 @@ fn run() -> Result<(), Analysis2Error> {
             Ok(())
         }),
         Command::Run(args) => with_progress(args.progress, |progress| {
+            let api_keys = ApiKeys {
+                alchemy: args.alchemy_api_key.clone(),
+                etherscan: args.etherscan_api_key.clone(),
+                helius: args.helius_api_key.clone(),
+                opensea: args.opensea_api_key.clone(),
+            };
+            let seed_nft_download = SeedNftDownloadOptions {
+                cache_dir: args
+                    .seed_nft_cache_dir
+                    .clone()
+                    .unwrap_or_else(|| args.output_dir.join(INTERMEDIATE_DIR).join("seed_nfts")),
+                api_keys: api_keys.clone(),
+                endpoints: ProviderEndpoints::default(),
+                concurrency: args.http_concurrency,
+                retries: 3,
+                refresh: args.refresh_seed_nfts,
+            };
             run_pipeline(
                 &RunConfig {
                     inputs: args.inputs,
@@ -200,24 +222,37 @@ fn run() -> Result<(), Analysis2Error> {
                     evm_chains: args.evm_chains,
                     name_threshold: args.name_threshold,
                     metadata_threshold: args.metadata_threshold,
-                    metadata_anchors: args.metadata_anchors,
+                    metadata_anchors: None,
                     rayon_threads: args.rayon_threads,
-                    api_keys: ApiKeys {
-                        alchemy: args.alchemy_api_key,
-                        etherscan: args.etherscan_api_key,
-                        helius: args.helius_api_key,
-                        opensea: args.opensea_api_key,
-                    },
+                    api_keys,
                     http_concurrency: args.http_concurrency,
                     paper: PaperConfig::default(),
                     enrich_override: None,
                     dedup_cache_path: args.dedup_cache,
                     evidence_cache_path: args.evidence_cache,
+                    seed_nft_download: Some(seed_nft_download),
                 },
                 progress,
             )
         }),
         Command::RunDedup(args) => with_progress(args.progress, |progress| {
+            let api_keys = ApiKeys {
+                alchemy: args.alchemy_api_key.clone(),
+                etherscan: args.etherscan_api_key.clone(),
+                helius: args.helius_api_key.clone(),
+                opensea: args.opensea_api_key.clone(),
+            };
+            let seed_nft_download = SeedNftDownloadOptions {
+                cache_dir: args
+                    .seed_nft_cache_dir
+                    .clone()
+                    .unwrap_or_else(|| args.output_dir.join(INTERMEDIATE_DIR).join("seed_nfts")),
+                api_keys,
+                endpoints: ProviderEndpoints::default(),
+                concurrency: args.http_concurrency,
+                retries: 3,
+                refresh: args.refresh_seed_nfts,
+            };
             run_dedup(
                 &RunDedupConfig {
                     inputs: args.inputs,
@@ -227,8 +262,9 @@ fn run() -> Result<(), Analysis2Error> {
                     evm_chains: args.evm_chains,
                     name_threshold: args.name_threshold,
                     metadata_threshold: args.metadata_threshold,
-                    metadata_anchors: args.metadata_anchors,
+                    metadata_anchors: None,
                     rayon_threads: args.rayon_threads,
+                    seed_nft_download: Some(seed_nft_download),
                 },
                 progress,
             )
@@ -276,5 +312,8 @@ mod tests {
                 "{flag} must no longer be accepted"
             );
         }
+        let mut argv = required_run_args();
+        argv.extend(["--metadata-anchors", "8"]);
+        assert!(RunArgs::try_parse_from(argv).is_err());
     }
 }

@@ -711,7 +711,7 @@ mod tests {
         anchors: impl IntoIterator<Item = (&'static str, &'static str, &'static str, &'static str, u64)>,
     ) -> ResidentStore {
         let evm_set = evm.iter().map(|c| (*c).to_owned()).collect::<AHashSet<_>>();
-        let mut store = ResidentStore::with_options(k, &evm_set);
+        let mut store = ResidentStore::with_options(Some(k), &evm_set);
         for r in rows {
             store.ingest_identity_row(r).unwrap();
         }
@@ -1082,7 +1082,7 @@ mod tests {
                 .unwrap();
             pool.install(|| {
                 let evm = ["ethereum".to_owned()].into_iter().collect::<AHashSet<_>>();
-                let mut store = ResidentStore::with_options(1, &evm);
+                let mut store = ResidentStore::with_options(Some(1), &evm);
                 // Exceeds both the candidate-chunk and posting-build
                 // thresholds, covering parallel finalize and query.
                 for index in 0..1_050_u64 {

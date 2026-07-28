@@ -14,7 +14,7 @@ use super::ids::{
 };
 use super::string_pool::StringPool;
 
-/// Fully-resident snapshot: identity + string pool + CSR indexes + anchors.
+/// Fully-resident snapshot: identity + string pool + CSR indexes + metadata records.
 #[derive(Clone, Debug)]
 pub struct ResidentStore {
     pub chains: Vec<String>,
@@ -54,13 +54,13 @@ pub struct ResidentStore {
     pub metadata_index: MetadataIndex,
     pub totals: AHashMap<ChainId, ChainTotals>,
     pub rows_loaded: u64,
-    metadata_anchor_limit: usize,
+    metadata_anchor_limit: Option<usize>,
     evm_chains: AHashSet<String>,
 }
 
 impl Default for ResidentStore {
     fn default() -> Self {
-        Self::with_options(8, &AHashSet::default())
+        Self::with_options(None, &AHashSet::default())
     }
 }
 
@@ -69,7 +69,10 @@ impl ResidentStore {
         Self::default()
     }
 
-    pub fn with_options(metadata_anchor_limit: usize, evm_chains: &AHashSet<String>) -> Self {
+    pub fn with_options(
+        metadata_anchor_limit: Option<usize>,
+        evm_chains: &AHashSet<String>,
+    ) -> Self {
         Self {
             chains: Vec::new(),
             chain_ids: AHashMap::new(),
@@ -99,7 +102,7 @@ impl ResidentStore {
         }
     }
 
-    pub fn metadata_anchor_limit(&self) -> usize {
+    pub fn metadata_anchor_limit(&self) -> Option<usize> {
         self.metadata_anchor_limit
     }
 
@@ -288,7 +291,8 @@ impl ResidentStore {
         Ok(self.strings.intern_nonempty(incoming))
     }
 
-    /// Pass-2 metadata anchor insert (descending token id, first k valid).
+    /// Pass-2 metadata record insert (descending token id). A limit of
+    /// `None` retains every valid NFT metadata record.
     pub fn ingest_metadata_anchor(
         &mut self,
         chain: &str,
@@ -298,7 +302,7 @@ impl ResidentStore {
         canonical_json: String,
         source_order: SourceOrder,
     ) -> Result<(), Analysis2Error> {
-        if self.metadata_anchor_limit == 0 {
+        if self.metadata_anchor_limit == Some(0) {
             return Ok(());
         }
         let Some(&chain_id) = self.chain_ids.get(chain) else {
@@ -321,6 +325,49 @@ impl ResidentStore {
         Ok(())
     }
 
+    /// Bulk metadata ingest. Unlimited retention sorts and de-duplicates once,
+    /// avoiding quadratic ordered insertion for large contracts.
+    pub fn ingest_metadata_records(
+        &mut self,
+        chain: &str,
+        contract_address: &str,
+        mut records: Vec<MetadataRecord>,
+    ) -> Result<(), Analysis2Error> {
+        if self.metadata_anchor_limit.is_some() {
+            for record in records {
+                self.ingest_metadata_anchor(
+                    chain,
+                    contract_address,
+                    &record.token_id,
+                    record.json,
+                    record.canonical_json,
+                    record.source_order,
+                )?;
+            }
+            return Ok(());
+        }
+        let Some(&chain_id) = self.chain_ids.get(chain) else {
+            return Ok(());
+        };
+        let Some(address_id) = self.strings.lookup(contract_address) else {
+            return Ok(());
+        };
+        let Some(&contract_id) = self.contract_index.get(&(chain_id, address_id)) else {
+            return Ok(());
+        };
+        let is_evm = self.is_evm_chain(chain);
+        let anchors = &mut self.contracts[contract_id as usize].metadata_by_token;
+        anchors.append(&mut records);
+        anchors.par_sort_unstable_by(|left, right| {
+            compare_token_ids_desc(&left.token_id, &right.token_id, is_evm)
+                .then_with(|| left.token_id.cmp(&right.token_id))
+                .then_with(|| left.source_order.cmp(&right.source_order))
+        });
+        // Equal token ids are adjacent and earliest source order sorts first.
+        anchors.dedup_by(|later, earlier| later.token_id == earlier.token_id);
+        Ok(())
+    }
+
     fn insert_metadata_anchor(
         &mut self,
         contract_id: ContractId,
@@ -330,7 +377,7 @@ impl ResidentStore {
         canonical_json: String,
         source_order: SourceOrder,
     ) {
-        if self.metadata_anchor_limit == 0 {
+        if self.metadata_anchor_limit == Some(0) {
             return;
         }
         let is_evm = self.is_evm_chain(chain);
@@ -342,7 +389,10 @@ impl ResidentStore {
         let insert_at = anchors
             .binary_search_by(|record| compare_token_ids_desc(&record.token_id, &token_id, is_evm))
             .unwrap_or_else(|position| position);
-        if insert_at >= self.metadata_anchor_limit && anchors.len() >= self.metadata_anchor_limit {
+        if let Some(limit) = self.metadata_anchor_limit
+            && insert_at >= limit
+            && anchors.len() >= limit
+        {
             return;
         }
         anchors.insert(
@@ -354,7 +404,9 @@ impl ResidentStore {
                 source_order,
             },
         );
-        if anchors.len() > self.metadata_anchor_limit {
+        if let Some(limit) = self.metadata_anchor_limit
+            && anchors.len() > limit
+        {
             anchors.pop();
         }
     }
@@ -376,6 +428,53 @@ impl ResidentStore {
 
     pub(crate) fn rebuild_contract_nft_csr(&mut self) {
         self.contract_nft_csr = build_contract_nft_csr(&self.nfts);
+    }
+
+    /// Remove all resident NFT rows for the named seed contracts before their
+    /// provider-complete snapshots are streamed in. Contract ids remain stable.
+    pub fn remove_seed_contract_nfts(&mut self, seeds: &[(String, String)]) {
+        let removed: AHashSet<ContractId> = seeds
+            .iter()
+            .filter_map(|(chain, address)| self.contract_id(chain, address))
+            .collect();
+        if removed.is_empty() {
+            return;
+        }
+        self.nfts.retain(|nft| !removed.contains(&nft.contract_id));
+        self.rebuild_nft_identity_after_filter();
+    }
+
+    fn rebuild_nft_identity_after_filter(&mut self) {
+        self.nft_index.clear();
+        for contract in &mut self.contracts {
+            contract.nft_count = 0;
+        }
+        for totals in self.totals.values_mut() {
+            totals.nfts = 0;
+        }
+        for (index, nft) in self.nfts.iter_mut().enumerate() {
+            nft.id = index as NftId;
+            let token_sid = self
+                .strings
+                .lookup(&nft.token_id)
+                .expect("resident NFT token id must remain interned");
+            self.nft_index.insert((nft.contract_id, token_sid), nft.id);
+            let contract = &mut self.contracts[nft.contract_id as usize];
+            contract.nft_count += 1;
+            self.totals.entry(contract.chain_id).or_default().nfts += 1;
+        }
+        self.rows_loaded = self.nfts.len() as u64;
+        self.rebuild_contract_nft_csr();
+    }
+
+    /// Remove Parquet metadata for a seed contract immediately before applying
+    /// the provider-complete metadata stream.
+    pub fn clear_contract_metadata(&mut self, chain: &str, address: &str) {
+        if let Some(contract_id) = self.contract_id(chain, address) {
+            self.contracts[contract_id as usize]
+                .metadata_by_token
+                .clear();
+        }
     }
 
     /// NFT ids for a contract (CSR slice; empty when missing).
@@ -680,7 +779,7 @@ mod tests {
     #[test]
     fn descending_evm_anchors_keep_largest_token_ids() {
         let evm = ["ethereum".to_owned()].into_iter().collect::<AHashSet<_>>();
-        let mut store = ResidentStore::with_options(2, &evm);
+        let mut store = ResidentStore::with_options(Some(2), &evm);
         for token in ["1", "10", "2"] {
             store
                 .ingest_identity_row(IdentityRow {

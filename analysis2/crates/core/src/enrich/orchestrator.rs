@@ -1780,7 +1780,7 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect::<AHashSet<_>>();
-        let mut store = ResidentStore::with_options(2, &evm);
+        let mut store = ResidentStore::with_options(Some(2), &evm);
         store
             .ingest_identity_row(identity(chain, "0xseed", "1", 1))
             .unwrap();
@@ -2442,7 +2442,7 @@ mod tests {
     #[tokio::test]
     async fn solana_missing_helius_is_not_requested() {
         let evm = ["ethereum"].into_iter().map(str::to_owned).collect();
-        let mut store = ResidentStore::with_options(2, &evm);
+        let mut store = ResidentStore::with_options(Some(2), &evm);
         store
             .ingest_identity_row(identity(
                 "solana",
@@ -2492,7 +2492,7 @@ mod tests {
             })
             .await;
         let evm = ["ethereum"].into_iter().map(str::to_owned).collect();
-        let mut store = ResidentStore::with_options(2, &evm);
+        let mut store = ResidentStore::with_options(Some(2), &evm);
         store
             .ingest_identity_row(identity(
                 "solana",
@@ -2587,7 +2587,7 @@ mod tests {
             .await;
 
         let evm = ["ethereum"].into_iter().map(str::to_owned).collect();
-        let mut store = ResidentStore::with_options(2, &evm);
+        let mut store = ResidentStore::with_options(Some(2), &evm);
         store
             .ingest_identity_row(identity(
                 "solana",
@@ -2737,7 +2737,7 @@ mod tests {
             .await;
 
         let evm = ["ethereum"].into_iter().map(str::to_owned).collect();
-        let mut store = ResidentStore::with_options(2, &evm);
+        let mut store = ResidentStore::with_options(Some(2), &evm);
         store
             .ingest_identity_row(identity(
                 "solana",
@@ -2872,7 +2872,7 @@ mod tests {
             .await;
 
         let evm = ["ethereum"].into_iter().map(str::to_owned).collect();
-        let mut store = ResidentStore::with_options(2, &evm);
+        let mut store = ResidentStore::with_options(Some(2), &evm);
         store
             .ingest_identity_row(identity(
                 "solana",
@@ -3005,7 +3005,7 @@ mod tests {
             .await;
 
         let evm = ["ethereum"].into_iter().map(str::to_owned).collect();
-        let mut store = ResidentStore::with_options(2, &evm);
+        let mut store = ResidentStore::with_options(Some(2), &evm);
         store
             .ingest_identity_row(identity(
                 "solana",

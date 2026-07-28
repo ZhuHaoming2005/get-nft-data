@@ -12,7 +12,7 @@ use crate::enrich::opensea::{self, OpenSeaRankedItem};
 use crate::error::Analysis2Error;
 
 use super::address::is_evm_chain;
-use super::magic_eden::{self, MagicEdenCollection};
+use super::nftscan::{self, NftScanRankedCollection};
 
 /// Selected seed row written to `seeds.json` (compatible with run-dedup reader).
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -33,14 +33,12 @@ pub struct SelectSeedsOptions {
     pub chains: Vec<String>,
     pub seeds_per_chain: usize,
     pub opensea_api_key: Option<String>,
-    pub helius_api_key: Option<String>,
+    pub nftscan_api_key: Option<String>,
     pub http_concurrency: usize,
     /// Override OpenSea base URL (tests / mirrors).
     pub opensea_base_url: Option<String>,
-    /// Override Magic Eden base URL.
-    pub magic_eden_base_url: Option<String>,
-    /// Override Helius RPC URL.
-    pub helius_base_url: Option<String>,
+    /// Override NFTScan Solana API base URL.
+    pub nftscan_base_url: Option<String>,
 }
 
 impl Default for SelectSeedsOptions {
@@ -54,11 +52,10 @@ impl Default for SelectSeedsOptions {
             ],
             seeds_per_chain: 25,
             opensea_api_key: None,
-            helius_api_key: None,
+            nftscan_api_key: None,
             http_concurrency: 32,
             opensea_base_url: None,
-            magic_eden_base_url: None,
-            helius_base_url: None,
+            nftscan_base_url: None,
         }
     }
 }
@@ -191,105 +188,53 @@ async fn select_solana_chain(
     requested: usize,
     collected_at: DateTime<Utc>,
 ) -> Result<(Vec<SeedRecord>, Value), Analysis2Error> {
-    let me_base = opts
-        .magic_eden_base_url
+    let Some(api_key) = opts
+        .nftscan_api_key
         .as_deref()
-        .unwrap_or(magic_eden::default_base_url());
-    let helius_rpc = opts
-        .helius_base_url
+        .map(str::trim)
+        .filter(|key| !key.is_empty())
+    else {
+        return Ok((
+            Vec::new(),
+            incomplete_status(requested, 0, "missing_nftscan_api_key"),
+        ));
+    };
+    let base = opts
+        .nftscan_base_url
         .as_deref()
-        .unwrap_or(crate::enrich::helius::default_rpc_url());
-    let helius_key = opts.helius_api_key.as_deref();
-
-    let collections = match magic_eden::fetch_popular_collections(client, me_base).await {
+        .unwrap_or(nftscan::default_base_url());
+    let collections = match nftscan::fetch_top_collections(client, base, api_key).await {
         Ok(items) => items,
         Err(error) => {
             crate::enrich::print_provider_error(
-                "magic_eden",
-                "select_seeds_popular_collections",
+                "nftscan",
+                "select_seeds_trade_ranking",
                 &error.to_string(),
             );
             return Ok((
                 Vec::new(),
-                incomplete_status(requested, 0, format!("magic_eden_error: {error}")),
+                incomplete_status(requested, 0, format!("nftscan_error: {error}")),
             ));
         }
     };
-
-    let mut seeds = Vec::new();
-    let mut seen = std::collections::BTreeSet::new();
-    let mut missing_helius_api_key = false;
-    let mut resolve_errors: Vec<String> = Vec::new();
-    for collection in collections {
-        if seeds.len() >= requested {
-            break;
-        }
-        let address = match magic_eden::resolve_collection_address(
-            client,
-            me_base,
-            helius_rpc,
-            helius_key,
-            &collection,
-        )
-        .await
-        {
-            Ok(Some(address)) => address,
-            Ok(None) => continue,
-            Err(error) => {
-                match &error {
-                    Analysis2Error::Invalid(message) if message == "missing_helius_api_key" => {
-                        missing_helius_api_key = true;
-                    }
-                    _ if resolve_errors.len() < 5 => {
-                        resolve_errors.push(error.to_string());
-                    }
-                    _ => {}
-                }
-                continue;
-            }
-        };
-        if !seen.insert(address.clone()) {
-            continue;
-        }
-        seeds.push(solana_seed(
-            &collection,
-            &address,
-            seeds.len() as u32 + 1,
-            collected_at,
-        ));
-    }
+    let seeds = collections
+        .into_iter()
+        .take(requested)
+        .enumerate()
+        .map(|(index, collection)| solana_seed(collection, (index + 1) as u32, collected_at))
+        .collect::<Vec<_>>();
 
     let collected = seeds.len();
     let status = if collected >= requested {
         complete_status(requested, collected)
     } else {
-        let reason = solana_incomplete_reason(
+        incomplete_status(
             requested,
             collected,
-            missing_helius_api_key,
-            &resolve_errors,
-        );
-        incomplete_status(requested, collected, reason)
+            format!("collected {collected} of {requested}"),
+        )
     };
     Ok((seeds, status))
-}
-
-fn solana_incomplete_reason(
-    requested: usize,
-    collected: usize,
-    missing_helius_api_key: bool,
-    resolve_errors: &[String],
-) -> String {
-    if missing_helius_api_key {
-        return "missing_helius_api_key".into();
-    }
-    if !resolve_errors.is_empty() {
-        return format!(
-            "collected {collected} of {requested}; {}",
-            resolve_errors.join("; ")
-        );
-    }
-    format!("collected {collected} of {requested}")
 }
 
 fn evm_seed(item: OpenSeaRankedItem, rank: u32, collected_at: DateTime<Utc>) -> SeedRecord {
@@ -306,19 +251,18 @@ fn evm_seed(item: OpenSeaRankedItem, rank: u32, collected_at: DateTime<Utc>) -> 
 }
 
 fn solana_seed(
-    collection: &MagicEdenCollection,
-    address: &str,
+    collection: NftScanRankedCollection,
     rank: u32,
     collected_at: DateTime<Utc>,
 ) -> SeedRecord {
     SeedRecord {
         chain: "solana".into(),
-        address: address.to_owned(),
+        address: collection.address,
         rank,
-        name: collection.name.clone(),
-        metric: "magic_eden_30d_popularity".into(),
+        name: collection.name,
+        metric: "thirty_days_volume".into(),
         window: "30d".into(),
-        source: "magic_eden".into(),
+        source: "nftscan".into(),
         collected_at,
     }
 }
@@ -409,25 +353,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_helius_key_when_resolve_needed_records_audit_reason() {
-        let server = MockServer::start_async().await;
-        let _me_popular = server
-            .mock_async(|when, then| {
-                when.method(GET)
-                    .path("/marketplace/popular_collections")
-                    .query_param("timeRange", "30d");
-                then.status(200).json_body(json!([{
-                    "symbol": "needs-resolve",
-                    "name": "Needs Resolve"
-                }]));
-            })
-            .await;
-
+    async fn missing_nftscan_key_records_audit_reason() {
         let (seeds, audit) = select_seeds_async(&SelectSeedsOptions {
             chains: vec!["solana".into()],
             seeds_per_chain: 1,
-            helius_api_key: None,
-            magic_eden_base_url: Some(server.base_url()),
+            nftscan_api_key: None,
             ..SelectSeedsOptions::default()
         })
         .await
@@ -437,44 +367,28 @@ mod tests {
         assert_eq!(audit["chains"]["solana"]["complete"], false);
         assert_eq!(
             audit["chains"]["solana"]["reason"],
-            "missing_helius_api_key"
+            "missing_nftscan_api_key"
         );
     }
 
     #[tokio::test]
-    async fn solana_resolve_http_error_surfaces_in_audit_reason() {
+    async fn nftscan_application_error_surfaces_in_audit_reason() {
         let server = MockServer::start_async().await;
-        let _me_popular = server
+        let _nftscan = server
             .mock_async(|when, then| {
                 when.method(GET)
-                    .path("/marketplace/popular_collections")
-                    .query_param("timeRange", "30d");
-                then.status(200).json_body(json!([{
-                    "symbol": "needs-resolve",
-                    "name": "Needs Resolve"
-                }]));
-            })
-            .await;
-        let _me_listings = server
-            .mock_async(|when, then| {
-                when.method(GET).path("/collections/needs-resolve/listings");
-                then.status(500).body("boom");
-            })
-            .await;
-        let _me_activities = server
-            .mock_async(|when, then| {
-                when.method(GET)
-                    .path("/collections/needs-resolve/activities");
-                then.status(500).body("boom");
+                    .path("/api/sol/statistics/ranking/trade")
+                    .header("x-api-key", "nftscan-key");
+                then.status(200)
+                    .json_body(json!({"code": 401, "msg": "Unauthorized"}));
             })
             .await;
 
         let (_, audit) = select_seeds_async(&SelectSeedsOptions {
             chains: vec!["solana".into()],
             seeds_per_chain: 1,
-            helius_api_key: Some("helius-key".into()),
-            magic_eden_base_url: Some(server.base_url()),
-            helius_base_url: Some(format!("{}/", server.base_url())),
+            nftscan_api_key: Some("nftscan-key".into()),
+            nftscan_base_url: Some(server.base_url()),
             ..SelectSeedsOptions::default()
         })
         .await
@@ -482,14 +396,12 @@ mod tests {
 
         assert_eq!(audit["chains"]["solana"]["complete"], false);
         let reason = audit["chains"]["solana"]["reason"].as_str().unwrap();
-        assert!(
-            reason.contains("magic_eden_listing_error") || reason.contains("http"),
-            "expected resolve/HTTP error in audit reason, got {reason}"
-        );
+        assert!(reason.contains("nftscan_error"), "reason={reason}");
+        assert!(reason.contains("Unauthorized"), "reason={reason}");
     }
 
     #[tokio::test]
-    async fn http_mock_opensea_ranking_and_solana_resolve() {
+    async fn http_mock_opensea_and_nftscan_rankings() {
         let server = MockServer::start_async().await;
 
         let _opensea = server
@@ -532,47 +444,28 @@ mod tests {
             })
             .await;
 
-        let _me_popular = server
+        let _nftscan = server
             .mock_async(|when, then| {
                 when.method(GET)
-                    .path("/marketplace/popular_collections")
-                    .query_param("timeRange", "30d");
-                then.status(200).json_body(json!([
-                    {
-                        "symbol": "needs-resolve",
-                        "name": "Needs Resolve"
-                    },
-                    {
-                        "symbol": "direct",
-                        "name": "Direct",
-                        "onChainCollectionAddress": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
-                    }
-                ]));
-            })
-            .await;
-
-        let _me_listings = server
-            .mock_async(|when, then| {
-                when.method(GET).path("/collections/needs-resolve/listings");
-                then.status(200).json_body(json!([{
-                    "mintAddress": "So11111111111111111111111111111111111111112"
-                }]));
-            })
-            .await;
-
-        let _helius = server
-            .mock_async(|when, then| {
-                when.method(POST).path("/");
+                    .path("/api/sol/statistics/ranking/trade")
+                    .query_param("time", "30d")
+                    .query_param("sort_field", "volume")
+                    .query_param("sort_direction", "desc")
+                    .header("x-api-key", "nftscan-key");
                 then.status(200).json_body(json!({
-                    "jsonrpc": "2.0",
-                    "id": "seed-collection-So11111111111111111111111111111111111111112",
-                    "result": {
-                        "id": "So11111111111111111111111111111111111111112",
-                        "grouping": [{
-                            "group_key": "collection",
-                            "group_value": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
-                        }]
-                    }
+                    "code": 200,
+                    "data": [
+                        {
+                            "project_address": "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263",
+                            "project_name": "NFTScan One",
+                            "volume": "99.5"
+                        },
+                        {
+                            "collection_address": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                            "collection_name": "NFTScan Two",
+                            "trade_volume": 50
+                        }
+                    ]
                 }));
             })
             .await;
@@ -582,11 +475,10 @@ mod tests {
             chains: vec!["ethereum".into(), "polygon".into(), "solana".into()],
             seeds_per_chain: 2,
             opensea_api_key: Some("os-key".into()),
-            helius_api_key: Some("helius-key".into()),
+            nftscan_api_key: Some("nftscan-key".into()),
             http_concurrency: 4,
             opensea_base_url: Some(base.clone()),
-            magic_eden_base_url: Some(base.clone()),
-            helius_base_url: Some(format!("{base}/")),
+            nftscan_base_url: Some(base),
         })
         .await
         .unwrap();
@@ -613,7 +505,9 @@ mod tests {
             sol[0].address,
             "DezXAZ8z7PnrnRJjz3wXBoRgixCa6xjnB7YaB1pPB263"
         );
-        assert_eq!(sol[0].source, "magic_eden");
+        assert_eq!(sol[0].source, "nftscan");
+        assert_eq!(sol[0].metric, "thirty_days_volume");
+        assert_eq!(sol[0].window, "30d");
         assert_eq!(
             sol[1].address,
             "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"

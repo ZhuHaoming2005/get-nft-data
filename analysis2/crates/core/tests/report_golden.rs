@@ -43,7 +43,7 @@ fn report_golden_duplicate_scale_fields_and_ratios() {
     let options = LoadOptions::new(
         ["ethereum", "base", "solana"].map(str::to_owned),
         ["ethereum", "base"].map(str::to_owned),
-        8,
+        Some(8),
     );
     let store = load_resident_store(&[parquet], &options, &NoopProgress).expect("load");
     let seeds = load_seeds_json(&seeds_path).expect("seeds");
@@ -127,7 +127,7 @@ fn report_golden_duplicate_scale_fields_and_ratios() {
         evm_chains: vec!["ethereum".into(), "base".into()],
         name_threshold: Some(DEFAULT_NAME_THRESHOLD),
         metadata_threshold: DEFAULT_METADATA_THRESHOLD,
-        metadata_anchors: 8,
+        metadata_anchors: Some(8),
     };
     write_dedup_outputs(
         &out,

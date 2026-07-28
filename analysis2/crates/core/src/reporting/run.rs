@@ -3022,7 +3022,7 @@ mod tests {
             .into_iter()
             .map(str::to_owned)
             .collect();
-        let store = ResidentStore::with_options(2, &evm);
+        let store = ResidentStore::with_options(Some(2), &evm);
         let excluded = AHashSet::from(["base:0xcand".to_owned()]);
 
         let filtered = filter_non_nft_report(&store, &report, &excluded);

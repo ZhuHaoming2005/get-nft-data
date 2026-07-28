@@ -8,10 +8,12 @@ Business semantics: [`docs/analysis/REWRITE_DESIGN.md`](../docs/analysis/REWRITE
 
 ## Hardware
 
-Target research host: **128 vCPU / 512 GiB RAM** (Linux preferred). The pipeline keeps
-snapshot indexes + evidence in process memory; there is no disk spill. Memory exhaustion
-fails the process (no approximate fallback). Prefer `--rayon-threads` near core count and
-`--http-concurrency` around 32 unless provider rate limits force lower.
+Target research host: **128 vCPU / 512 GiB RAM** (Linux preferred). Dedup indexes,
+evidence, and decoded seed NFT download batches remain in process memory while each seed
+population is also persisted to a compressed durable cache. Seed download memory is released
+after the identity and metadata overlays consume it. Memory exhaustion still fails the process
+(no approximate fallback). Prefer `--rayon-threads` near core count
+and `--http-concurrency` around 32 unless provider rate limits force lower.
 
 ## Build
 
@@ -43,15 +45,15 @@ cargo run --manifest-path analysis2/Cargo.toml --release -- select-seeds `
   --chains ethereum,base,polygon,solana `
   --seeds-per-chain 25 `
   --opensea-api-key $env:OPENSEA_API_KEY `
-  --helius-api-key $env:HELIUS_API_KEY `
+  --nftscan-api-key $env:NFTSCAN_API_KEY `
   --progress auto
 ```
 
-EVM ranking uses OpenSea `thirty_days_volume` (API key required). Solana uses Magic Eden
-`popular_collections?timeRange=30d` plus Helius DAS resolve when on-chain address is missing.
+EVM ranking uses OpenSea `thirty_days_volume` (API key required). Solana uses NFTScan's
+30-day trade ranking (API key required) and accepts only valid Solana collection addresses.
 Incomplete chains are recorded in `seeds.audit.json` and are not backfilled from other chains.
 
-## Phase A — offline `run-dedup`
+## Phase A — complete seed snapshots + `run-dedup`
 
 Materialize the golden Parquet once (writes `testdata/report_golden.parquet`):
 
@@ -59,20 +61,41 @@ Materialize the golden Parquet once (writes `testdata/report_golden.parquet`):
 cargo test --manifest-path analysis2/Cargo.toml -p analysis2_core --test report_golden
 ```
 
-Then:
+The golden fixture is exercised by tests and deliberately does not contact live providers.
+For real seeds, `run-dedup` first downloads the complete seed-contract NFT population
+(up to 50,000 NFTs per contract), then deduplicates it against the input snapshot:
 
 ```powershell
 cargo run --manifest-path analysis2/Cargo.toml --release -- run-dedup `
-  --input analysis2/crates/core/testdata/report_golden.parquet `
-  --seeds analysis2/crates/core/testdata/report_golden_seeds.json `
-  --output-dir analysis2/crates/core/testdata/report_golden_cli_out `
-  --chains ethereum,base,solana `
-  --evm-chains ethereum,base `
+  --input ./data/base.parquet `
+  --input ./data/ethereum.parquet `
+  --input ./data/polygon.parquet `
+  --input ./data/solana.parquet `
+  --seeds ./out/seeds/seeds.json `
+  --output-dir ./out/dedup `
+  --chains ethereum,base,polygon,solana `
+  --evm-chains ethereum,base,polygon `
+  --alchemy-api-key $env:ALCHEMY_API_KEY `
+  --helius-api-key $env:HELIUS_API_KEY `
   --progress off
 ```
 
 Name deduplication is disabled unless `--name-threshold VALUE` is supplied. URI and
 Metadata deduplication still run normally.
+
+Each completed seed snapshot is written to
+`intermediate/seed_nfts/<chain>__<digest>.jsonl.zst` and atomically published. A valid
+completed cache is reused automatically; use `--refresh-seed-nfts` to fetch it again or
+`--seed-nft-cache-dir PATH` to relocate it. Alchemy pages EVM contracts and Helius DAS
+pages Solana collections. Parquet scanning/index construction overlaps these downloads;
+decoded rows stay resident for faster identity and metadata overlays, while the compressed
+cache remains the durable reusable copy. The decoded batches are cleared immediately after
+their final overlay consumer, before Name and Metadata indexes are queried.
+
+Metadata has no anchor-count limit: every valid NFT metadata document is retained. The
+existing token alignment, exact-match fast path, candidate selection, and BM25 decision
+rules are unchanged. A provider population above 50,000 is explicitly marked capped and
+the first 50,000 records are used.
 
 Writes under `--output-dir` in three roots:
 
@@ -112,7 +135,6 @@ cargo run --manifest-path analysis2/Cargo.toml --release -- run `
   --evm-chains base,ethereum,polygon `
   --name-threshold 0.98 `
   --metadata-threshold 0.6 `
-  --metadata-anchors 8 `
   --alchemy-api-key $env:ALCHEMY_API_KEY `
   --etherscan-api-key $env:ETHERSCAN_API_KEY `
   --helius-api-key $env:HELIUS_API_KEY `
@@ -122,7 +144,9 @@ cargo run --manifest-path analysis2/Cargo.toml --release -- run `
   --progress auto
 ```
 
-API keys are optional per provider: missing keys mark dependent evidence `not_requested`
+Alchemy is required for an uncached EVM seed and Helius is required for an uncached
+Solana seed. Once the compressed seed cache exists those keys are not required for the
+seed-download stage. Other missing provider keys mark dependent evidence `not_requested`
 and the run continues. Ethereum/Polygon sales use Alchemy `getNFTSales` with OpenSea
 fallback, Base sales use OpenSea, and Solana sales are decoded from Helius histories.
 Cancel / OOM paths do **not** write
@@ -139,7 +163,9 @@ After URI/Name/Metadata queries finish, `run` always writes a portable checkpoin
 ```
 
 (override with `--dedup-cache PATH`). Edges are stored with stable chain/address/token
-identities (not process-local ids).
+identities (not process-local ids). The ordered compressed seed-cache fingerprint is part
+of compatibility validation, so replacing or refreshing a seed snapshot invalidates
+derived dedup results.
 
 ### Evidence cache (skip re-enrich / resume after interrupt)
 
@@ -177,7 +203,7 @@ cargo run --manifest-path analysis2/Cargo.toml --release -- run `
 
 A compatible dedup cache still loads Parquet identity (for candidate expansion +
 enrich), but skips Name/URI/Metadata index build and all seed queries. If inputs,
-chains, thresholds, anchors, or seeds do not match, the cache is ignored and the
+chains, thresholds, metadata retention mode, seed snapshots, or seeds do not match, the cache is ignored and the
 dedup stages run normally.
 
 ### Evidence depth (enrich → economics)
@@ -239,7 +265,7 @@ Additional outputs vs `run-dedup`:
 
 ```text
 analysis2 select-seeds ...   # seed ranking
-analysis2 run-dedup ...      # offline dedup + hit reports
+analysis2 run-dedup ...      # seed snapshot download/cache + dedup hit reports
 analysis2 run ...            # full enrich + analysis + reports
 ```
 

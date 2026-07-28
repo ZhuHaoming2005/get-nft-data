@@ -22,12 +22,12 @@ pub use fixture::{
 pub use metadata::validated_metadata;
 pub use pass2::CollectedPass2Anchors;
 
-/// Load-time chain filters and metadata anchor bound.
+/// Load-time chain filters and metadata retention policy.
 #[derive(Clone, Debug)]
 pub struct LoadOptions {
     pub allowed_chains: AHashSet<String>,
     pub evm_chains: AHashSet<String>,
-    pub metadata_anchors: usize,
+    pub metadata_anchors: Option<usize>,
     /// When false, skip URI/Name/Metadata index build (identity + contract→NFT CSR only).
     /// Used when replaying a dedup cache so load is much cheaper.
     pub build_dedup_indexes: bool,
@@ -40,7 +40,7 @@ impl Default for LoadOptions {
         Self {
             allowed_chains: AHashSet::default(),
             evm_chains: AHashSet::default(),
-            metadata_anchors: 8,
+            metadata_anchors: None,
             build_dedup_indexes: true,
             build_name_index: true,
         }
@@ -51,7 +51,7 @@ impl LoadOptions {
     pub fn new(
         allowed_chains: impl IntoIterator<Item = String>,
         evm_chains: impl IntoIterator<Item = String>,
-        metadata_anchors: usize,
+        metadata_anchors: Option<usize>,
     ) -> Self {
         Self {
             allowed_chains: normalize_chain_set(allowed_chains),
@@ -66,7 +66,7 @@ impl LoadOptions {
     pub fn identity_only(
         allowed_chains: impl IntoIterator<Item = String>,
         evm_chains: impl IntoIterator<Item = String>,
-        metadata_anchors: usize,
+        metadata_anchors: Option<usize>,
     ) -> Self {
         Self {
             allowed_chains: normalize_chain_set(allowed_chains),
@@ -119,6 +119,29 @@ impl PendingDedupLoad {
     ) -> Result<(), Analysis2Error> {
         progress.begin_phase("apply_pass2_anchors", Some(1));
         pass2::apply_pass2_anchors(store, anchors)?;
+        progress.add_completed(1);
+        if self.options.build_name_index {
+            finalize_name_index_with_progress(store, progress)?;
+        }
+        finalize_metadata_index_with_progress(store, progress)?;
+        Ok(())
+    }
+
+    /// Apply Parquet metadata, replace selected contracts through a streaming
+    /// overlay, then build the unchanged Name/Metadata indexes.
+    pub fn finish_with_metadata_overlay<F>(
+        self,
+        store: &mut ResidentStore,
+        anchors: pass2::CollectedPass2Anchors,
+        progress: &dyn ProgressObserver,
+        overlay: F,
+    ) -> Result<(), Analysis2Error>
+    where
+        F: FnOnce(&mut ResidentStore) -> Result<(), Analysis2Error>,
+    {
+        progress.begin_phase("apply_pass2_anchors", Some(1));
+        pass2::apply_pass2_anchors(store, anchors)?;
+        overlay(store)?;
         progress.add_completed(1);
         if self.options.build_name_index {
             finalize_name_index_with_progress(store, progress)?;

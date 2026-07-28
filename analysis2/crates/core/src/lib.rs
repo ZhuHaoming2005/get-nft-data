@@ -5,10 +5,12 @@ pub mod dedup;
 pub mod enrich;
 pub mod entity;
 pub mod error;
+mod normalize;
 pub mod parquet;
 pub mod progress;
 pub mod reporting;
 pub mod seed;
+pub mod seed_nft;
 
 pub use analysis::{
     AddressRole, BehaviorFacts, BehaviorInstance, BehaviorKind, CandidateAnalysis, LinkedLossEvent,
@@ -60,4 +62,8 @@ pub use reporting::{
 pub use seed::{
     SeedRecord as SelectedSeed, SelectSeedsOptions, select_seeds, select_seeds_async,
     write_seed_outputs,
+};
+pub use seed_nft::{
+    MAX_SEED_NFTS_PER_CONTRACT, SeedNftCacheRef, SeedNftDownloadOptions, SeedNftRecord,
+    cache_fingerprint, for_each_cached_nft, prepare_seed_nft_caches, release_resident_seed_nfts,
 };

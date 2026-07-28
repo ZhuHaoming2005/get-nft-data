@@ -41,7 +41,7 @@ pub struct DedupRunParams {
     pub evm_chains: Vec<String>,
     pub name_threshold: Option<f64>,
     pub metadata_threshold: f64,
-    pub metadata_anchors: usize,
+    pub metadata_anchors: Option<usize>,
 }
 
 /// One seed→candidate relation in the per-seed JSON report.

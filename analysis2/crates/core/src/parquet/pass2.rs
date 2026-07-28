@@ -14,7 +14,7 @@ use crate::parquet::pass1::{ProjectedUtf8Columns, normalize_chain};
 use crate::parquet::validate::{PASS2_COLUMNS, ValidatedInput};
 use crate::progress::ProgressObserver;
 
-/// Per-file bounded anchors: at most `k` records per contract (O(k × contracts)).
+/// Per-file metadata records. `metadata_anchors = None` keeps all valid rows.
 #[derive(Default)]
 struct ShardAnchors {
     by_contract: AHashMap<(String, String), Vec<MetadataRecord>>,
@@ -32,14 +32,20 @@ impl ShardAnchors {
         source_order: SourceOrder,
         options: &LoadOptions,
     ) {
-        if options.metadata_anchors == 0 {
+        let anchors = self
+            .by_contract
+            .entry((chain.clone(), contract_address))
+            .or_default();
+        if options.metadata_anchors.is_none() {
+            anchors.push(MetadataRecord {
+                token_id,
+                json,
+                canonical_json,
+                source_order,
+            });
             return;
         }
         let is_evm = options.evm_chains.contains(&chain);
-        let anchors = self
-            .by_contract
-            .entry((chain, contract_address))
-            .or_default();
         // Same token id: keep first valid in source order.
         if anchors.iter().any(|record| record.token_id == token_id) {
             return;
@@ -47,7 +53,10 @@ impl ShardAnchors {
         let insert_at = anchors
             .binary_search_by(|record| compare_token_ids_desc(&record.token_id, &token_id, is_evm))
             .unwrap_or_else(|position| position);
-        if insert_at >= options.metadata_anchors && anchors.len() >= options.metadata_anchors {
+        if let Some(limit) = options.metadata_anchors
+            && insert_at >= limit
+            && anchors.len() >= limit
+        {
             return;
         }
         anchors.insert(
@@ -59,21 +68,24 @@ impl ShardAnchors {
                 source_order,
             },
         );
-        if anchors.len() > options.metadata_anchors {
+        if let Some(limit) = options.metadata_anchors
+            && anchors.len() > limit
+        {
             anchors.pop();
         }
     }
 
     fn merge_ordered(&mut self, other: Self, options: &LoadOptions) {
         for ((chain, contract_address), records) in other.by_contract {
-            if options.metadata_anchors == 0 {
+            let anchors = self
+                .by_contract
+                .entry((chain.clone(), contract_address))
+                .or_default();
+            if options.metadata_anchors.is_none() {
+                anchors.extend(records);
                 continue;
             }
             let is_evm = options.evm_chains.contains(&chain);
-            let anchors = self
-                .by_contract
-                .entry((chain, contract_address))
-                .or_default();
             for record in records {
                 // Left shards are earlier in source order, so an existing token
                 // id wins exactly as in repeated ordered insertion.
@@ -88,13 +100,16 @@ impl ShardAnchors {
                         compare_token_ids_desc(&existing.token_id, &record.token_id, is_evm)
                     })
                     .unwrap_or_else(|position| position);
-                if insert_at >= options.metadata_anchors
-                    && anchors.len() >= options.metadata_anchors
+                if let Some(limit) = options.metadata_anchors
+                    && insert_at >= limit
+                    && anchors.len() >= limit
                 {
                     continue;
                 }
                 anchors.insert(insert_at, record);
-                if anchors.len() > options.metadata_anchors {
+                if let Some(limit) = options.metadata_anchors
+                    && anchors.len() > limit
+                {
                     anchors.pop();
                 }
             }
@@ -134,16 +149,7 @@ pub fn apply_pass2_anchors(
     anchors: CollectedPass2Anchors,
 ) -> Result<(), Analysis2Error> {
     for ((chain, contract_address), records) in anchors.by_contract {
-        for record in records {
-            store.ingest_metadata_anchor(
-                &chain,
-                &contract_address,
-                &record.token_id,
-                record.json,
-                record.canonical_json,
-                record.source_order,
-            )?;
-        }
+        store.ingest_metadata_records(&chain, &contract_address, records)?;
     }
     Ok(())
 }

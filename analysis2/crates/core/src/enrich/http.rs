@@ -310,7 +310,7 @@ impl HttpClient {
         })
     }
 
-    /// Generic GET on the independent "other" lane (Magic Eden, misc).
+    /// Generic GET on the independent "other" lane (NFTScan, misc).
     pub async fn get_json(
         &self,
         url: &str,

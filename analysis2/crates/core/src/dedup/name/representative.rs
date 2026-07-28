@@ -144,7 +144,7 @@ mod tests {
     #[test]
     fn mode_tie_breaks_lex_smallest() {
         let evm = ["ethereum".to_owned()].into_iter().collect::<AHashSet<_>>();
-        let mut store = ResidentStore::with_options(8, &evm);
+        let mut store = ResidentStore::with_options(Some(8), &evm);
         // "Beta" and "Alpha" each once → Alpha wins lex; add another Alpha → still Alpha.
         store
             .ingest_identity_row(row("ethereum", "0xa", "1", "Beta", 1))
@@ -160,7 +160,7 @@ mod tests {
     #[test]
     fn mode_prefers_higher_count() {
         let evm = ["ethereum".to_owned()].into_iter().collect::<AHashSet<_>>();
-        let mut store = ResidentStore::with_options(8, &evm);
+        let mut store = ResidentStore::with_options(Some(8), &evm);
         store
             .ingest_identity_row(row("ethereum", "0xa", "1", "Zed", 1))
             .unwrap();
