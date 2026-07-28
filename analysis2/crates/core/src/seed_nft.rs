@@ -5,21 +5,23 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::Analysis2Error;
-use crate::enrich::http::HttpClient;
+use crate::enrich::http::{HttpClient, is_http_status};
 use crate::enrich::types::{ApiKeys, ProviderEndpoints};
 use crate::normalize::{normalize_name, normalize_url};
 use crate::parquet::validated_metadata;
 use crate::reporting::SeedRecord;
 
 pub const MAX_SEED_NFTS_PER_CONTRACT: usize = 50_000;
-const CACHE_VERSION: u32 = 1;
+// v2 invalidates snapshots that may have been published after a failed
+// metadata-batch fallback and therefore contained identities only.
+const CACHE_VERSION: u32 = 2;
 const ALCHEMY_PAGE_SIZE: usize = 100;
 const HELIUS_PAGE_SIZE: usize = 1_000;
 const ZSTD_LEVEL: i32 = 3;
@@ -303,12 +305,19 @@ async fn download_alchemy(
         .ok_or_else(|| {
             Analysis2Error::invalid(format!("unsupported Alchemy chain {}", seed.chain))
         })?;
+    let metadata_batch_url = options
+        .endpoints
+        .alchemy_nft(&seed.chain, key, "getNFTMetadataBatch")
+        .ok_or_else(|| {
+            Analysis2Error::invalid(format!("unsupported Alchemy chain {}", seed.chain))
+        })?;
     let mut writer = CacheStreamWriter::create(path, seed)?;
     let mut page_key: Option<String> = None;
     let mut seen_keys = AHashSet::new();
     let mut seen_tokens = AHashSet::new();
     let mut provider_total = None;
     let mut resident_records = Vec::new();
+    let mut metadata_fallback = false;
     loop {
         let remaining = MAX_SEED_NFTS_PER_CONTRACT.saturating_sub(writer.count);
         if remaining == 0 {
@@ -316,14 +325,27 @@ async fn download_alchemy(
         }
         let limit = ALCHEMY_PAGE_SIZE.min(remaining);
         let mut url = format!(
-            "{base}?contractAddress={}&withMetadata=true&limit={limit}",
-            encode_query(&seed.address)
+            "{base}?contractAddress={}&withMetadata={}&limit={limit}",
+            encode_query(&seed.address),
+            !metadata_fallback
         );
         if let Some(key) = &page_key {
             url.push_str("&pageKey=");
             url.push_str(&encode_query(key));
         }
-        let payload = client.get_json_alchemy(&url, &[]).await?;
+        let payload = match client.get_json_alchemy(&url, &[]).await {
+            Ok(payload) => payload,
+            Err(error) if !metadata_fallback && is_alchemy_collection_metadata_error(&error) => {
+                metadata_fallback = true;
+                eprintln!(
+                    "[seed_nfts/warn] Alchemy collection metadata failed for {} / {}; falling back to token listing + getNFTMetadataBatch",
+                    seed.chain, seed.address
+                );
+                let fallback_url = url.replace("withMetadata=true", "withMetadata=false");
+                client.get_json_alchemy(&fallback_url, &[]).await?
+            }
+            Err(error) => return Err(error),
+        };
         if let Some(total) = json_usize(payload.get("totalCount").or_else(|| payload.get("total")))
         {
             provider_total = Some(total);
@@ -332,10 +354,18 @@ async fn download_alchemy(
             .get("nfts")
             .and_then(Value::as_array)
             .ok_or_else(|| Analysis2Error::http("Alchemy getNFTsForContract omitted nfts"))?;
-        for row in rows {
-            let record = parse_alchemy_nft(row).ok_or_else(|| {
-                Analysis2Error::http("Alchemy getNFTsForContract NFT omitted tokenId")
-            })?;
+        let records = if metadata_fallback {
+            hydrate_alchemy_page(client, &metadata_batch_url, seed, rows).await?
+        } else {
+            rows.iter()
+                .map(|row| {
+                    parse_alchemy_nft(row).ok_or_else(|| {
+                        Analysis2Error::http("Alchemy getNFTsForContract NFT omitted tokenId")
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?
+        };
+        for record in records {
             if seen_tokens.insert(record.token_id.clone()) {
                 writer.push(&record)?;
                 resident_records.push(record);
@@ -377,6 +407,86 @@ async fn download_alchemy(
     Ok(cache_ref(seed, path, footer, false, Some(resident_records)))
 }
 
+fn is_alchemy_collection_metadata_error(error: &Analysis2Error) -> bool {
+    let lower = error.to_string().to_ascii_lowercase();
+    lower.contains("error fetching metadata for that collection")
+        || (is_http_status(error, 500) && lower.contains("metadata"))
+}
+
+async fn hydrate_alchemy_page(
+    client: &HttpClient,
+    metadata_batch_url: &str,
+    seed: &SeedRecord,
+    rows: &[Value],
+) -> Result<Vec<SeedNftRecord>, Analysis2Error> {
+    let base_records = rows
+        .iter()
+        .map(|row| {
+            parse_alchemy_nft(row).ok_or_else(|| {
+                Analysis2Error::http("Alchemy getNFTsForContract NFT omitted tokenId")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if base_records.is_empty() {
+        return Ok(base_records);
+    }
+    let tokens = base_records
+        .iter()
+        .map(|record| {
+            json!({
+                "contractAddress": seed.address,
+                "tokenId": record.token_id,
+            })
+        })
+        .collect::<Vec<_>>();
+    // The dedicated v3 endpoint documents an object with `tokens`; an older
+    // Alchemy batch guide documents the legacy bare array. Prefer the current
+    // contract and fall back once for accounts still serving the legacy shape.
+    let request = json!({"tokens": tokens, "refreshCache": false});
+    let payload = match client
+        .post_json_alchemy(metadata_batch_url, &[], &request)
+        .await
+    {
+        Ok(payload) => payload,
+        Err(primary) => client
+            .post_json_alchemy(metadata_batch_url, &[], request.get("tokens").expect("present"))
+            .await
+            .map_err(|legacy| {
+                Analysis2Error::http(format!(
+                    "Alchemy getNFTMetadataBatch failed with current and legacy request bodies: current={primary}; legacy={legacy}"
+                ))
+            })?,
+    };
+    let items = payload
+        .as_array()
+        .or_else(|| payload.get("nfts").and_then(Value::as_array));
+    let items = items.ok_or_else(|| {
+        Analysis2Error::http(format!(
+            "Alchemy metadata batch returned no NFT array for {} / {}",
+            seed.chain, seed.address
+        ))
+    })?;
+    let mut hydrated = AHashMap::with_capacity(items.len());
+    for item in items {
+        if let Some(record) = parse_alchemy_nft(item) {
+            hydrated.insert(record.token_id.clone(), record);
+        }
+    }
+    if base_records
+        .iter()
+        .any(|record| !hydrated.contains_key(&record.token_id))
+    {
+        return Err(Analysis2Error::http(format!(
+            "Alchemy metadata batch omitted one or more NFTs for {} / {}",
+            seed.chain, seed.address
+        )));
+    }
+    Ok(base_records
+        .into_iter()
+        .map(|base| hydrated.remove(&base.token_id).unwrap_or(base))
+        .collect())
+}
+
 async fn download_helius(
     client: &HttpClient,
     options: &SeedNftDownloadOptions,
@@ -394,6 +504,7 @@ async fn download_helius(
     let mut page = 1usize;
     let mut has_more;
     let mut seen_tokens = AHashSet::new();
+    let mut seen_pages = AHashSet::new();
     let mut resident_records = Vec::new();
     loop {
         let remaining = MAX_SEED_NFTS_PER_CONTRACT.saturating_sub(writer.count);
@@ -411,7 +522,6 @@ async fn download_helius(
                 "groupValue": seed.address,
                 "page": page,
                 "limit": limit,
-                "sortBy": {"sortBy": "id", "sortDirection": "asc"},
                 "options": {
                     "showUnverifiedCollections": false,
                     "showCollectionMetadata": false,
@@ -432,7 +542,20 @@ async fn download_helius(
             .get("items")
             .and_then(Value::as_array)
             .ok_or_else(|| Analysis2Error::http("Helius getAssetsByGroup omitted items"))?;
+        let page_identity = rows
+            .iter()
+            .filter_map(|row| row.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\0");
+        if !page_identity.is_empty() && !seen_pages.insert(page_identity) {
+            return Err(Analysis2Error::http(
+                "Helius getAssetsByGroup repeated an asset page",
+            ));
+        }
         for row in rows {
+            if helius_row_is_explicitly_non_nft(row) {
+                continue;
+            }
             let record = parse_helius_nft(row)
                 .ok_or_else(|| Analysis2Error::http("Helius getAssetsByGroup item omitted id"))?;
             if seen_tokens.insert(record.token_id.clone()) {
@@ -453,6 +576,22 @@ async fn download_helius(
     let truncated = capped && has_more;
     let footer = writer.finish(None, truncated)?;
     Ok(cache_ref(seed, path, footer, false, Some(resident_records)))
+}
+
+fn helius_row_is_explicitly_non_nft(row: &Value) -> bool {
+    row.get("interface")
+        .and_then(Value::as_str)
+        .is_some_and(|interface| {
+            matches!(
+                interface.to_ascii_lowercase().as_str(),
+                "fungibleasset"
+                    | "fungibletoken"
+                    | "identity"
+                    | "executable"
+                    | "mplcorecollection"
+                    | "mplcoregroup"
+            )
+        })
 }
 
 fn parse_alchemy_nft(row: &Value) -> Option<SeedNftRecord> {

@@ -404,7 +404,7 @@ impl HttpClient {
         let header_map = build_headers(headers)?;
         let endpoint = redact_endpoint(url);
         let cache_identity = success_cache_identity(&method, &endpoint, body);
-        let cacheable = success_response_is_cacheable(&endpoint);
+        let cacheable = success_response_is_cacheable(&endpoint, body);
         if cacheable
             && let Some(value) = self
                 .success_cache
@@ -439,11 +439,10 @@ impl HttpClient {
             drop(_permit);
             match result {
                 Ok(value) => {
-                    // Helius (and similar) may return HTTP 200 + JSON-RPC rate-limit.
-                    if let Some(err) = jsonrpc_rate_limit_error(&value) {
-                        let error = Analysis2Error::http(format!(
-                            "HTTP 429 endpoint={endpoint} content_type=application/json body={err}"
-                        ));
+                    // Several providers report throttling/transient failures in an
+                    // HTTP 200 JSON envelope. Route those through the same finite
+                    // retry/cool-down policy as transport-level failures.
+                    if let Some(error) = application_retryable_error(&value, &endpoint) {
                         if !self
                             .handle_request_error(
                                 &method,
@@ -716,6 +715,7 @@ fn is_retryable(error: &Analysis2Error) -> bool {
                 || lower.contains("connection")
                 || lower.contains("read body failed")
                 || lower.contains("error decoding response body")
+                || lower.contains("invalid json")
                 || lower.contains("error sending request")
                 || lower.contains("http 500")
                 || lower.contains("http 502")
@@ -795,6 +795,67 @@ fn jsonrpc_rate_limit_error(value: &Value) -> Option<String> {
     }
 }
 
+fn application_retryable_error(value: &Value, endpoint: &str) -> Option<Analysis2Error> {
+    if let Some(err) = jsonrpc_rate_limit_error(value) {
+        return Some(Analysis2Error::http(format!(
+            "HTTP 429 endpoint={endpoint} content_type=application/json body={err}"
+        )));
+    }
+    if let Some(rows) = value.as_array() {
+        return rows
+            .iter()
+            .find_map(|row| application_retryable_error(row, endpoint));
+    }
+
+    let status_code = value.get("status").and_then(|status| {
+        status
+            .as_i64()
+            .or_else(|| status.as_str().and_then(|text| text.parse().ok()))
+    });
+    let provider_code = value
+        .get("code")
+        .or_else(|| value.pointer("/error/code"))
+        .and_then(|code| {
+            code.as_i64()
+                .or_else(|| code.as_str().and_then(|text| text.parse().ok()))
+        });
+    let message = ["message", "result", "msg", "error"]
+        .into_iter()
+        .filter_map(|key| value.get(key))
+        .map(|part| {
+            part.as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| part.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    let lower = message.to_ascii_lowercase();
+    let rate_limited = lower.contains("rate limit")
+        || lower.contains("rate-limit")
+        || lower.contains("too many requests")
+        || matches!(provider_code, Some(429));
+    if rate_limited {
+        return Some(Analysis2Error::http(format!(
+            "HTTP 429 endpoint={endpoint} content_type=application/json body={}",
+            one_line_error(&message, ERROR_BODY_CHARS)
+        )));
+    }
+    let transient = lower.contains("server busy")
+        || lower.contains("internal error")
+        || lower.contains("temporarily unavailable")
+        || lower.contains("timeout occurred")
+        || lower.contains("query timeout")
+        || matches!(provider_code, Some(500..=599) | Some(-32603));
+    let envelope_is_error =
+        status_code == Some(0) || provider_code.is_some_and(|code| !(200..300).contains(&code));
+    (transient && envelope_is_error).then(|| {
+        Analysis2Error::http(format!(
+            "HTTP 503 endpoint={endpoint} content_type=application/json body={}",
+            one_line_error(&message, ERROR_BODY_CHARS)
+        ))
+    })
+}
+
 fn print_request_error(
     method: &reqwest::Method,
     endpoint: &str,
@@ -848,12 +909,42 @@ fn success_cache_identity(
     format!("{method}\n{redacted_endpoint}\n{body}")
 }
 
-/// Spot prices are intentionally refreshed by UTC day. All other enrichment
-/// requests describe historical/on-chain evidence and retain successful raw
-/// responses across analysis and derived-cache upgrades.
-fn success_response_is_cacheable(redacted_endpoint: &str) -> bool {
+/// Cache only immutable, transaction/block-addressed RPC responses. Mutable
+/// collection, holder, asset, market, latest-block, and price snapshots must
+/// be refreshed under the derived evidence cache's explicit policy.
+fn success_response_is_cacheable(redacted_endpoint: &str, body: Option<&Value>) -> bool {
     let lower = redacted_endpoint.to_ascii_lowercase();
-    !(lower.contains("api.g.alchemy.com/prices/") || lower.contains("/prices/v1/"))
+    if lower.contains("api.g.alchemy.com/prices/") || lower.contains("/prices/v1/") {
+        return false;
+    }
+    // REST NFT/market endpoints and collection/owner snapshots are mutable.
+    // The derived evidence cache owns their explicit refresh policy; a hidden
+    // raw-response cache must never defeat a requested refresh.
+    if body.is_none() {
+        return false;
+    }
+    rpc_body_is_immutable(body.expect("checked above"))
+}
+
+fn rpc_body_is_immutable(body: &Value) -> bool {
+    if let Some(rows) = body.as_array() {
+        return !rows.is_empty() && rows.iter().all(rpc_body_is_immutable);
+    }
+    let Some(method) = body.get("method").and_then(Value::as_str) else {
+        return false;
+    };
+    match method {
+        "eth_getTransactionReceipt" | "alchemy_getTransactionReceipts" | "getTransaction" => true,
+        "eth_getBlockByNumber" => body
+            .pointer("/params/0")
+            .and_then(Value::as_str)
+            .is_some_and(|block| !block.eq_ignore_ascii_case("latest")),
+        "eth_call" => body
+            .pointer("/params/1")
+            .and_then(Value::as_str)
+            .is_some_and(|block| !block.eq_ignore_ascii_case("latest")),
+        _ => false,
+    }
 }
 
 fn response_is_fully_successful(value: &Value) -> bool {
@@ -1201,7 +1292,8 @@ mod tests {
             {"jsonrpc":"2.0", "error": {"code":-32000}}
         ])));
         assert!(!success_response_is_cacheable(
-            "api.g.alchemy.com/prices/v1/***/tokens/by-symbol"
+            "api.g.alchemy.com/prices/v1/***/tokens/by-symbol",
+            None,
         ));
     }
 
@@ -1236,7 +1328,11 @@ mod tests {
             std::process::id()
         ));
         let _ = fs::remove_dir_all(&dir);
-        let body = serde_json::json!({"method":"getAsset","params":{"id":"mint"}});
+        let body = serde_json::json!({
+            "jsonrpc":"2.0",
+            "method":"getTransaction",
+            "params":["signature", {"commitment":"finalized"}]
+        });
 
         let first = HttpClient::with_retries_and_cache(1, 0, Some(dir.clone())).unwrap();
         let first_value = first

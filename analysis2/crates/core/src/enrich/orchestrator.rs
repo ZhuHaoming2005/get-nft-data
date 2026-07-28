@@ -2561,14 +2561,14 @@ mod tests {
             .mock_async(|when, then| {
                 when.method(POST)
                     .path("/helius")
-                    .body_contains("getSignaturesForAddress");
+                    .body_contains("getSignaturesForAsset");
                 then.status(200).json_body(json!({
                     "jsonrpc": "2.0",
                     "id": "1",
-                    "result": [
-                        {"signature": "SigTransfer111111111111111111111111111111"},
-                        {"signature": "SigSale11111111111111111111111111111111111"}
-                    ]
+                    "result": {"items": [
+                        ["SigTransfer111111111111111111111111111111", "TRANSFER"],
+                        ["SigSale11111111111111111111111111111111111", "SALE"]
+                    ]}
                 }));
             })
             .await;
@@ -2677,11 +2677,11 @@ mod tests {
             .mock_async(|when, then| {
                 when.method(POST)
                     .path("/helius")
-                    .body_contains("getSignaturesForAddress");
+                    .body_contains("getSignaturesForAsset");
                 then.status(200).json_body(json!({
                     "jsonrpc": "2.0",
                     "id": "1",
-                    "result": [{"signature": sig}]
+                    "result": {"items": [[sig, "TRANSFER"]]}
                 }));
             })
             .await;
@@ -2923,8 +2923,8 @@ mod tests {
 
     #[tokio::test]
     async fn solana_asset_page_truncation_keeps_histories_truncated() {
-        // Even when the single returned asset fully decodes, collection total > fetched
-        // assets → snapshot.truncated → histories must stay Truncated.
+        // Even when the single returned asset fully decodes, reaching the configured
+        // asset cap makes the snapshot and dependent histories Truncated.
         let server = MockServer::start_async().await;
         let mint = "MintTruncPage111111111111111111111111111";
         let seller = "SellerTrunc11111111111111111111111111111";
@@ -2955,11 +2955,11 @@ mod tests {
             .mock_async(|when, then| {
                 when.method(POST)
                     .path("/helius")
-                    .body_contains("getSignaturesForAddress");
+                    .body_contains("getSignaturesForAsset");
                 then.status(200).json_body(json!({
                     "jsonrpc": "2.0",
                     "id": "1",
-                    "result": [{"signature": sig}]
+                    "result": {"items": [[sig, "TRANSFER"]]}
                 }));
             })
             .await;
@@ -3028,6 +3028,7 @@ mod tests {
         let limits = HttpLimits {
             concurrency: 2,
             retries: 0,
+            max_solana_assets: 1,
             endpoints: mock_endpoints(&server),
             ..HttpLimits::default()
         };

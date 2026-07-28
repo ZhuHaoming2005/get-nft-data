@@ -8,8 +8,9 @@
 //! After an interrupt, the next run loads meta+jsonl (and/or the JSON snapshot),
 //! rematerializes bundles, and only HTTP-fetches candidates still missing.
 //! Pagination bounds must match. A stale pricing day triggers a price-only
-//! refresh. Seed membership, provider-key presence, and producer-version
-//! changes do not discard successfully collected candidate evidence.
+//! refresh. Seed membership and provider-key presence do not discard
+//! successfully collected candidate evidence. Producer versions remain
+//! reusable only while their provider semantics are compatible.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
@@ -23,10 +24,11 @@ use crate::entity::{ContractId, ResidentStore};
 use crate::error::Analysis2Error;
 use crate::reporting::json::SeedRecord;
 
-// This is a format/producer marker, not an expiry gate. Older caches remain
-// readable when serde can decode them: successful provider evidence must not
-// be discarded merely because analysis semantics or this marker changed.
-pub const EVIDENCE_CACHE_VERSION: u32 = 14;
+// Version 15 invalidates older provider evidence: those bundles can contain a
+// capped Helius `total`, address-based NFT history, indefinitely cached mutable
+// responses, or incomplete Etherscan ERC-721-only transfer evidence.
+pub const EVIDENCE_CACHE_VERSION: u32 = 15;
+const MIN_REUSABLE_EVIDENCE_CACHE_VERSION: u32 = 15;
 pub const DEFAULT_EVIDENCE_CACHE_FILE: &str = "evidence_cache.json";
 /// How many finished candidates to buffer before an append + snapshot flush.
 pub const DEFAULT_EVIDENCE_CACHE_BATCH: usize = 16;
@@ -175,11 +177,9 @@ pub fn load_evidence_cache(path: &Path) -> Result<EvidenceCacheFile, Analysis2Er
     let cache: EvidenceCacheFile = serde_json::from_str(&text).map_err(|e| {
         Analysis2Error::invalid(format!("parse evidence cache {}: {e}", path.display()))
     })?;
-    // Refuse only caches produced by a newer binary. Historical versions are
-    // forward-filled through serde defaults and remain reusable.
-    if cache.version > EVIDENCE_CACHE_VERSION {
+    if !(MIN_REUSABLE_EVIDENCE_CACHE_VERSION..=EVIDENCE_CACHE_VERSION).contains(&cache.version) {
         return Err(Analysis2Error::invalid(format!(
-            "evidence cache version {} is newer than supported version {EVIDENCE_CACHE_VERSION}",
+            "evidence cache version {} is incompatible; supported versions are {MIN_REUSABLE_EVIDENCE_CACHE_VERSION}..={EVIDENCE_CACHE_VERSION}",
             cache.version,
         )));
     }
@@ -223,9 +223,9 @@ pub fn load_evidence_cache_resumable(path: &Path) -> Result<EvidenceCacheFile, A
         let meta: Meta = serde_json::from_str(&meta_text).map_err(|e| {
             Analysis2Error::invalid(format!("parse evidence meta {}: {e}", meta_path.display()))
         })?;
-        if meta.version > EVIDENCE_CACHE_VERSION {
+        if !(MIN_REUSABLE_EVIDENCE_CACHE_VERSION..=EVIDENCE_CACHE_VERSION).contains(&meta.version) {
             return Err(Analysis2Error::invalid(format!(
-                "evidence cache version {} is newer than supported version {EVIDENCE_CACHE_VERSION}",
+                "evidence cache version {} is incompatible; supported versions are {MIN_REUSABLE_EVIDENCE_CACHE_VERSION}..={EVIDENCE_CACHE_VERSION}",
                 meta.version,
             )));
         }
@@ -661,7 +661,7 @@ mod tests {
     }
 
     #[test]
-    fn historical_cache_remains_readable() {
+    fn incompatible_historical_cache_is_rejected() {
         let mut cache = build_evidence_cache(params(), &AHashMap::new());
         cache.version = 1;
         let dir = std::env::temp_dir().join(format!(
@@ -673,8 +673,8 @@ mod tests {
         let path = dir.join("evidence_cache.json");
         write_evidence_cache(&path, &cache).unwrap();
 
-        let loaded = load_evidence_cache(&path).unwrap();
-        assert_eq!(loaded.version, 1);
+        let error = load_evidence_cache(&path).unwrap_err().to_string();
+        assert!(error.contains("incompatible"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -692,7 +692,7 @@ mod tests {
         write_evidence_cache(&path, &cache).unwrap();
 
         let error = load_evidence_cache(&path).unwrap_err().to_string();
-        assert!(error.contains("newer than supported"), "{error}");
+        assert!(error.contains("incompatible"), "{error}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

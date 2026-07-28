@@ -15,7 +15,7 @@ fn etherscan_chain_id(chain: &str) -> Option<&'static str> {
     }
 }
 
-/// Fetch ERC-721 transfers via Etherscan v2 `tokennfttx` (fallback only).
+/// Fetch ERC-721 and ERC-1155 transfers via Etherscan v2 (fallback only).
 pub async fn fetch_transfers(
     client: &HttpClient,
     base_url: &str,
@@ -35,56 +35,46 @@ pub async fn fetch_transfers(
         );
     };
 
-    let mut transfers = Vec::new();
-    let mut truncated = false;
-    let pages = max_pages.max(1);
-    for page in 1..=pages {
-        let url = format!(
-            "{}{}chainid={}&module=account&action=tokennfttx&contractaddress={}&page={page}&offset=1000&startblock=0&endblock=9999999999&sort=asc&apikey={}",
-            base_url.trim_end_matches('/'),
-            if base_url.contains('?') { "&" } else { "?" },
+    let (erc721, erc1155) = tokio::join!(
+        fetch_transfer_action(
+            client,
+            base_url,
+            api_key,
             chain_id,
             contract,
-            api_key
-        );
-        let payload = match client.get_json_etherscan(&url, &[]).await {
-            Ok(v) => v,
-            Err(e) => {
-                if transfers.is_empty() {
-                    return FetchOutcome::failed("etherscan", "etherscan_transfers", e);
+            max_pages,
+            "tokennfttx"
+        ),
+        fetch_transfer_action(
+            client,
+            base_url,
+            api_key,
+            chain_id,
+            contract,
+            max_pages,
+            "token1155tx"
+        ),
+    );
+    let mut transfers = Vec::new();
+    let mut truncated = false;
+    let mut failures = Vec::new();
+    for outcome in [erc721, erc1155] {
+        match outcome {
+            Ok((mut rows, partial, failure)) => {
+                transfers.append(&mut rows);
+                truncated |= partial;
+                if let Some(failure) = failure {
+                    failures.push(failure);
                 }
+            }
+            Err(error) => {
                 truncated = true;
-                break;
+                failures.push(error);
             }
-        };
-        let Some(items) = payload.get("result").and_then(Value::as_array) else {
-            // Etherscan returns status/message when empty or errored.
-            if transfers.is_empty() {
-                let message = payload
-                    .get("message")
-                    .and_then(Value::as_str)
-                    .unwrap_or("empty etherscan result");
-                if message.eq_ignore_ascii_case("OK")
-                    || message.eq_ignore_ascii_case("No transactions found")
-                {
-                    break;
-                }
-                return FetchOutcome::failed("etherscan", "etherscan_transfers", message);
-            }
-            break;
-        };
-        if items.is_empty() {
-            break;
         }
-        for item in items {
-            transfers.push(parse_etherscan_transfer(item, contract));
-        }
-        if items.len() < 1000 {
-            break;
-        }
-        if page == pages {
-            truncated = true;
-        }
+    }
+    if transfers.is_empty() && failures.len() == 2 {
+        return FetchOutcome::failed("etherscan", "etherscan_transfers", failures.join("; "));
     }
 
     let count = transfers.len();
@@ -95,7 +85,7 @@ pub async fn fetch_transfers(
     } else {
         EvidenceStatus::Complete
     };
-    FetchOutcome {
+    let mut outcome = FetchOutcome {
         value: transfers,
         status,
         observation: Some(EvidenceObservation {
@@ -106,7 +96,93 @@ pub async fn fetch_transfers(
         }),
         failure: None,
         truncated,
+    };
+    if !failures.is_empty() {
+        outcome.failure = Some(failures.join("; "));
     }
+    outcome
+}
+
+async fn fetch_transfer_action(
+    client: &HttpClient,
+    base_url: &str,
+    api_key: &str,
+    chain_id: &str,
+    contract: &str,
+    max_pages: usize,
+    action: &str,
+) -> Result<(Vec<TransferEvent>, bool, Option<String>), String> {
+    let mut transfers = Vec::new();
+    let mut truncated = false;
+    let mut failure = None;
+    let pages = max_pages.max(1);
+    for page in 1..=pages {
+        let url = format!(
+            "{}{}chainid={}&module=account&action={action}&contractaddress={}&page={page}&offset=1000&startblock=0&endblock=999999999&sort=asc&apikey={}",
+            base_url.trim_end_matches('/'),
+            if base_url.contains('?') { "&" } else { "?" },
+            chain_id,
+            contract,
+            api_key
+        );
+        let payload = match client.get_json_etherscan(&url, &[]).await {
+            Ok(payload) => payload,
+            Err(error) => {
+                if transfers.is_empty() {
+                    return Err(format!("Etherscan {action}: {error}"));
+                }
+                truncated = true;
+                failure = Some(format!("Etherscan {action}: partial page failure: {error}"));
+                break;
+            }
+        };
+        let Some(items) = payload.get("result").and_then(Value::as_array) else {
+            let detail = etherscan_envelope_detail(&payload);
+            if detail
+                .to_ascii_lowercase()
+                .contains("no transactions found")
+            {
+                break;
+            }
+            if transfers.is_empty() {
+                return Err(format!("Etherscan {action}: {detail}"));
+            }
+            truncated = true;
+            failure = Some(format!(
+                "Etherscan {action}: partial provider error: {detail}"
+            ));
+            break;
+        };
+        if items.is_empty() {
+            break;
+        }
+        transfers.extend(
+            items
+                .iter()
+                .map(|item| parse_etherscan_transfer(item, contract)),
+        );
+        if items.len() < 1_000 {
+            break;
+        }
+        if page == pages {
+            truncated = true;
+        }
+    }
+    Ok((transfers, truncated, failure))
+}
+
+fn etherscan_envelope_detail(payload: &Value) -> String {
+    ["message", "result"]
+        .into_iter()
+        .filter_map(|key| payload.get(key))
+        .map(|value| {
+            value
+                .as_str()
+                .map(str::to_owned)
+                .unwrap_or_else(|| value.to_string())
+        })
+        .collect::<Vec<_>>()
+        .join(": ")
 }
 
 pub fn parse_etherscan_transfer(item: &Value, fallback_contract: &str) -> TransferEvent {

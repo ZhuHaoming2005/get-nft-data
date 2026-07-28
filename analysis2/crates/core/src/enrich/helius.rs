@@ -1,9 +1,8 @@
 //! Helius DAS helpers for Solana collection resolve + enrichment.
 //!
-//! History paths: compressed NFTs use `getSignaturesForAsset`, ordinary NFTs
-//! use `getSignaturesForAddress`, then both feed deduped `getTransaction`
-//! jsonParsed decode (standard SPL ownership + native SOL balance / transfer
-//! instructions).
+//! History paths use DAS `getSignaturesForAsset` for ordinary and compressed
+//! NFTs, then feed deduped `getTransaction` jsonParsed decode (standard SPL
+//! ownership + native SOL balance / transfer instructions).
 //! Compressed NFT / Bubblegum full parity is intentionally out of MVP scope.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
@@ -324,6 +323,7 @@ async fn fetch_collection_assets_with_visibility(
     let mut snapshot = SolanaAssetSnapshot::default();
     let mut page = 1usize;
     let mut seen_mints = std::collections::BTreeSet::new();
+    let mut seen_pages = std::collections::BTreeSet::new();
 
     loop {
         if snapshot.assets.len() >= max_assets {
@@ -375,9 +375,9 @@ async fn fetch_collection_assets_with_visibility(
             snapshot.truncated = true;
             break;
         };
-        if let Some(total) = result.get("total").and_then(Value::as_u64) {
-            snapshot.total = Some(total as usize);
-        }
+        // Helius has returned page-sized/capped `total` values in production
+        // (for example 1,000 for a 4,992-asset collection). Treat it as a hint
+        // only and determine completeness from page exhaustion.
         let items = result
             .get("items")
             .and_then(Value::as_array)
@@ -386,7 +386,15 @@ async fn fetch_collection_assets_with_visibility(
         if items.is_empty() {
             break;
         }
-        let before = snapshot.assets.len();
+        let page_identity = items
+            .iter()
+            .filter_map(|item| item.get("id").and_then(Value::as_str))
+            .collect::<Vec<_>>()
+            .join("\0");
+        if !page_identity.is_empty() && !seen_pages.insert(page_identity) {
+            snapshot.truncated = true;
+            break;
+        }
         for item in &items {
             snapshot.open_license |= is_open_license_payload(item);
             if snapshot.authority.is_empty() {
@@ -395,7 +403,8 @@ async fn fetch_collection_assets_with_visibility(
                     snapshot.authority = authorities;
                 }
             }
-            if let Some(asset) = parse_asset(item)
+            if !helius_row_is_explicitly_non_nft(item)
+                && let Some(asset) = parse_asset(item)
                 && seen_mints.insert(asset.mint.clone())
             {
                 snapshot.assets.push(asset);
@@ -405,15 +414,10 @@ async fn fetch_collection_assets_with_visibility(
                 }
             }
         }
-        if snapshot.assets.len() == before {
+        if items.len() < limit {
             break;
         }
         page += 1;
-        if let Some(total) = snapshot.total
-            && snapshot.assets.len() >= total
-        {
-            break;
-        }
     }
 
     let count = snapshot.assets.len();
@@ -616,9 +620,8 @@ pub async fn fetch_assets_by_ids(
 
 /// Bounded history discovery for Solana NFTs → transfer/sale stubs.
 ///
-/// Compressed assets use DAS `getSignaturesForAsset`; ordinary NFTs use the
-/// standard RPC `getSignaturesForAddress`. The DAS method resolves a Merkle
-/// tree and fails with `Tree not found` for ordinary mint accounts.
+/// DAS `getSignaturesForAsset` covers ordinary and compressed NFTs and avoids
+/// the incomplete account-key semantics of `getSignaturesForAddress`.
 ///
 /// Stubs alone are never Complete: callers must run [`decode_and_attach_transactions`]
 /// and recompute field quality from decode stats.
@@ -716,33 +719,20 @@ pub async fn fetch_asset_histories(
 type AssetHistoryRow = Result<(Vec<TransferEvent>, Vec<SaleEvent>, bool), String>;
 
 fn signature_request(asset: &SolanaAsset, request_id: String, max_sigs: usize) -> Value {
-    if asset.compressed {
-        json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "getSignaturesForAsset",
-            "params": {
-                "id": asset.mint,
-                "page": 1,
-                "limit": max_sigs
-            }
-        })
-    } else {
-        json!({
-            "jsonrpc": "2.0",
-            "id": request_id,
-            "method": "getSignaturesForAddress",
-            "params": [asset.mint, {"limit": max_sigs}]
-        })
-    }
+    json!({
+        "jsonrpc": "2.0",
+        "id": request_id,
+        "method": "getSignaturesForAsset",
+        "params": {
+            "id": asset.mint,
+            "page": 1,
+            "limit": max_sigs
+        }
+    })
 }
 
-fn signature_method(asset: &SolanaAsset) -> &'static str {
-    if asset.compressed {
-        "getSignaturesForAsset"
-    } else {
-        "getSignaturesForAddress"
-    }
+fn signature_method(_asset: &SolanaAsset) -> &'static str {
+    "getSignaturesForAsset"
 }
 
 async fn fetch_asset_history_batch(
@@ -842,30 +832,17 @@ fn parse_asset_history(asset: &SolanaAsset, payload: &Value, max_sigs: usize) ->
             asset.mint,
         ));
     }
-    let items = if asset.compressed {
-        payload
-            .get("result")
-            .and_then(|result| result.get("items"))
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                format!(
-                    "getSignaturesForAsset {}: response omitted result.items",
-                    asset.mint
-                )
-            })?
-            .clone()
-    } else {
-        payload
-            .get("result")
-            .and_then(Value::as_array)
-            .ok_or_else(|| {
-                format!(
-                    "getSignaturesForAddress {}: response omitted result array",
-                    asset.mint
-                )
-            })?
-            .clone()
-    };
+    let items = payload
+        .get("result")
+        .and_then(|result| result.get("items"))
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            format!(
+                "getSignaturesForAsset {}: response omitted result.items",
+                asset.mint
+            )
+        })?
+        .clone();
     let page_truncated = items.len() >= max_sigs;
     let mut transfers = Vec::new();
     let mut sales = Vec::new();
@@ -2028,6 +2005,14 @@ fn is_explicit_non_nft_interface(interface: &str) -> bool {
     )
 }
 
+fn helius_row_is_explicitly_non_nft(item: &Value) -> bool {
+    item.get("interface")
+        .and_then(Value::as_str)
+        .is_some_and(|interface| {
+            is_explicit_fungible_interface(interface) || is_explicit_non_nft_interface(interface)
+        })
+}
+
 fn parse_asset(item: &Value) -> Option<SolanaAsset> {
     let mint = item.get("id").and_then(Value::as_str)?.trim().to_owned();
     if mint.is_empty() {
@@ -2366,30 +2351,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn ordinary_nft_history_uses_signatures_for_address() {
+    async fn ordinary_nft_history_uses_signatures_for_asset() {
         let server = MockServer::start_async().await;
         let histories = server
             .mock_async(|when, then| {
                 when.method(POST)
-                    .body_contains("getSignaturesForAddress")
+                    .body_contains("getSignaturesForAsset")
                     .body_contains("ordinary-mint");
                 then.status(200).json_body(json!({
                     "jsonrpc": "2.0",
                     "id": "sigs-ordinary-mint",
-                    "result": [{
-                        "signature": "ordinary-signature",
-                        "slot": 42,
-                        "blockTime": 123
-                    }]
+                    "result": {"items": [["ordinary-signature", "Transfer"]]}
                 }));
-            })
-            .await;
-        let compressed_histories = server
-            .mock_async(|when, then| {
-                when.method(POST)
-                    .body_contains("getSignaturesForAsset")
-                    .body_contains("ordinary-mint");
-                then.status(500);
             })
             .await;
         let asset = SolanaAsset {
@@ -2402,7 +2375,6 @@ mod tests {
             fetch_asset_histories(&client, &server.base_url(), Some("key"), &[asset], 1, 10).await;
 
         assert_eq!(histories.hits(), 1);
-        assert_eq!(compressed_histories.hits(), 0);
         assert_eq!(outcome.value.0.len(), 1);
         assert_eq!(outcome.value.0[0].tx_hash, "ordinary-signature");
         assert!(outcome.value.1.is_empty());
