@@ -984,11 +984,11 @@ fn build_run_summary_for_scope_with_store(
                 .get(analysis.contract_id as usize)
                 .map(|contract| contract.nft_count)
         });
-        // The denominator is the complete NFT population of every hit contract
-        // in the resident analysis universe. Provider holder snapshots describe
-        // current ownership and are only a fallback when no resident store is
-        // available; they must not redefine "all NFTs in the hit contract".
-        let count = resident_count.or(provider_count).unwrap_or_else(|| {
+        // A provider population explicitly marked complete is authoritative for
+        // "all NFTs in the hit contract". The resident store is the input
+        // analysis snapshot and can be narrower than the on-chain collection;
+        // use it only when no complete provider population is available.
+        let count = provider_count.or(resident_count).unwrap_or_else(|| {
             hit_contract_nft_count_complete = false;
             fallback
         });
@@ -1451,6 +1451,12 @@ fn build_run_summary_for_scope_with_store(
         suspected_n > 0 && economics.output_input_ratio_count == suspected_n;
     let ratio_evidence_complete = ratio_candidate_coverage_complete && operator_output_complete;
     let ratio_sample_complete = ratio_evidence_complete;
+    // Completeness is a report-level invariant as well as a per-contract source
+    // property. Never publish a complete denominator that cannot contain every
+    // distinct stuck NFT counted by the same scope.
+    if economics.stuck_nft_count > hit_contract_nft_count {
+        hit_contract_nft_count_complete = false;
+    }
     let stuck_nft_ratio_valid = hit_contract_nft_count_complete
         && hit_contract_nft_count > 0
         && economics.stuck_nft_count <= hit_contract_nft_count;
@@ -2222,6 +2228,99 @@ mod tests {
             true
         );
         assert_eq!(summary["infringing_nft_count"], 1);
+    }
+
+    #[test]
+    fn stuck_ratio_prefers_complete_provider_population_over_resident_snapshot() {
+        let mut store = ResidentStore::new();
+        for (row, token_id) in ["1", "2", "3", "4"].into_iter().enumerate() {
+            store
+                .ingest_identity_strs(
+                    "base",
+                    "0xcand",
+                    token_id,
+                    "",
+                    "",
+                    "",
+                    SourceOrder {
+                        file_ordinal: 0,
+                        file_row_number: row as u64,
+                    },
+                )
+                .unwrap();
+        }
+        store.rebuild_contract_nft_csr();
+        store.shrink_identity_for_analysis();
+
+        let report = formal_seed_sharing_candidate(
+            "ethereum",
+            "0xseed",
+            "base",
+            "0xcand",
+            EconomicsUsdRollup::default(),
+            1,
+            vec![0],
+            vec!["token_uri".into()],
+            false,
+        );
+        let mut analysis = empty_analysis("base", "0xcand", 0);
+        analysis.collection_nft_count = Some(10);
+        analysis.collection_nft_count_complete = true;
+        analysis.economics.stuck_nft_count = 2;
+        let summary = build_run_summary_for_scope_with_store(
+            std::slice::from_ref(&report.dedup.seed),
+            &[&report],
+            &[],
+            &[],
+            &[&analysis],
+            Some(&store),
+            RunSummaryScope::All,
+        );
+
+        assert_eq!(summary["economics"]["hit_contract_nft_count"], 10);
+        assert_eq!(summary["economics"]["stuck_nft_ratio"], 0.2);
+        assert_eq!(
+            summary["economics"]["hit_contract_nft_count_complete"],
+            true
+        );
+    }
+
+    #[test]
+    fn stuck_ratio_rejects_complete_population_smaller_than_stuck_nfts() {
+        let report = formal_seed_sharing_candidate(
+            "ethereum",
+            "0xseed",
+            "base",
+            "0xcand",
+            EconomicsUsdRollup::default(),
+            1,
+            vec![0],
+            vec!["token_uri".into()],
+            false,
+        );
+        let mut analysis = empty_analysis("base", "0xcand", 0);
+        analysis.collection_nft_count = Some(1);
+        analysis.collection_nft_count_complete = true;
+        analysis.economics.stuck_nft_count = 2;
+        let summary = build_run_summary(
+            std::slice::from_ref(&report.dedup.seed),
+            &[&report],
+            &[],
+            &[],
+            &[&analysis],
+        );
+
+        assert_eq!(summary["economics"]["hit_contract_nft_count"], 1);
+        assert_eq!(summary["economics"]["stuck_nft_ratio"], Value::Null);
+        assert_eq!(summary["economics"]["stuck_nft_ratio_valid"], false);
+        assert_eq!(
+            summary["economics"]["hit_contract_nft_count_complete"],
+            false
+        );
+        assert_eq!(
+            summary["data_quality"]["hit_contract_nft_count_complete"],
+            false
+        );
     }
 
     #[test]
