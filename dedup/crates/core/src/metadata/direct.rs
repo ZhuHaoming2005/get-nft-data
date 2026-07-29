@@ -11,7 +11,7 @@ use crate::stats::SummaryAccumulator;
 use ahash::{AHashMap, AHasher};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BinaryHeap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::mem::MaybeUninit;
 use std::sync::Mutex;
@@ -26,7 +26,13 @@ const MAX_SCORE_TILE_BATCH: u64 = 8;
 const SCORE_CACHE_SLOTS: usize = 1 << 20;
 const LOCAL_CACHE_ENTRIES: usize = 16_384;
 const CACHE_SAMPLE_PAIRS: u64 = 65_536;
+const CACHE_SAMPLE_BATCH: u64 = 1_024;
 const MIN_CACHE_HIT_PERCENT: u64 = 10;
+const CACHE_POLICY_SAMPLING: u8 = 0;
+const CACHE_POLICY_ENABLED: u8 = 1;
+const CACHE_POLICY_DISABLED: u8 = 2;
+const CACHE_VALUE_BIT: u64 = 1_u64 << 63;
+const CACHE_KEY_MASK: u64 = CACHE_VALUE_BIT - 1;
 const INTERN_SHARDS: usize = 256;
 const PREPARE_BATCH: usize = 4096;
 const INLINE_ANCHORS: usize = 8;
@@ -38,6 +44,8 @@ const CANDIDATE_PAIR_CHUNK: usize = 4096;
 const CANDIDATE_SCHEDULING_CHUNK: usize = 8;
 const CANDIDATE_FINE_TAIL_PER_LANE: usize = 64;
 const CANDIDATE_COMPACT_BATCH: usize = 8;
+const SMALL_CANDIDATE_UNION_EMISSIONS: usize = 64;
+const DIRECT_PROGRESS_BATCH: u64 = 1_024;
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct MetadataStats {
@@ -123,6 +131,17 @@ impl AnchorKey {
             Self::Inline { len, values } => values[..usize::from(len)].into(),
             Self::Heap(values) => values,
         }
+    }
+
+    fn remap_tokens(&mut self, remap: &[TokenKeyId]) {
+        let anchors = match self {
+            Self::Inline { len, values } => &mut values[..usize::from(*len)],
+            Self::Heap(values) => values,
+        };
+        for (token, _) in anchors.iter_mut() {
+            *token = remap[*token as usize];
+        }
+        debug_assert!(anchors.windows(2).all(|pair| pair[0].0 <= pair[1].0));
     }
 }
 
@@ -286,6 +305,7 @@ enum CrossProfilePlan {
 
 struct ResidentCandidateIndex {
     shards: Box<[CompactCandidateEntries]>,
+    token_ranges: Box<[TokenPostingRanges]>,
     global_full: DensePostingIndex,
     prefixes: DocumentPrefixes,
     include_bm25: bool,
@@ -302,6 +322,7 @@ impl ResidentCandidateIndex {
             index,
             CandidateSources {
                 shards: &self.shards,
+                token_ranges: &self.token_ranges,
                 global_full: &self.global_full,
                 prefixes: &self.prefixes,
             },
@@ -590,8 +611,13 @@ impl<'a> TermInterner<'a> {
     }
 }
 
+struct TokenShard<'a> {
+    ids: AHashMap<&'a str, TokenKeyId>,
+    values: Vec<(TokenKeyId, &'a str)>,
+}
+
 struct TokenInterner<'a> {
-    shards: Box<[Mutex<AHashMap<&'a str, TokenKeyId>>]>,
+    shards: Box<[Mutex<TokenShard<'a>>]>,
     next_id: AtomicU64,
 }
 
@@ -599,7 +625,12 @@ impl<'a> TokenInterner<'a> {
     fn new() -> Self {
         Self {
             shards: (0..INTERN_SHARDS)
-                .map(|_| Mutex::new(AHashMap::new()))
+                .map(|_| {
+                    Mutex::new(TokenShard {
+                        ids: AHashMap::new(),
+                        values: Vec::new(),
+                    })
+                })
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
             next_id: AtomicU64::new(0),
@@ -611,13 +642,36 @@ impl<'a> TokenInterner<'a> {
         let mut shard = self.shards[shard_id]
             .lock()
             .map_err(|_| DedupError::invalid("metadata", "token interner lock poisoned"))?;
-        if let Some(&id) = shard.get(value) {
+        if let Some(&id) = shard.ids.get(value) {
             return Ok(id);
         }
         let id = TokenKeyId::try_from(self.next_id.fetch_add(1, Ordering::Relaxed))
             .map_err(|_| DedupError::invalid("metadata", "too many unique metadata token IDs"))?;
-        shard.insert(value, id);
+        shard.ids.insert(value, id);
+        shard.values.push((id, value));
         Ok(id)
+    }
+
+    fn into_ordered_remap(self) -> Result<Vec<TokenKeyId>, DedupError> {
+        let token_count = usize::try_from(self.next_id.load(Ordering::Relaxed))
+            .map_err(|_| DedupError::invalid("metadata", "metadata token count overflow"))?;
+        let mut ordered = Vec::with_capacity(token_count);
+        for shard in self.shards.into_vec() {
+            let shard = shard
+                .into_inner()
+                .map_err(|_| DedupError::invalid("metadata", "token interner lock poisoned"))?;
+            ordered.extend(shard.values);
+        }
+        ordered.par_sort_unstable_by(|left, right| {
+            crate::entity::compare_token_ids(left.1, right.1, true)
+                .then_with(|| left.1.cmp(right.1))
+        });
+        let mut remap = vec![0; token_count];
+        for (ordered_id, (old_id, _)) in ordered.into_iter().enumerate() {
+            remap[old_id as usize] = TokenKeyId::try_from(ordered_id)
+                .map_err(|_| DedupError::invalid("metadata", "too many metadata token IDs"))?;
+        }
+        Ok(remap)
     }
 }
 
@@ -725,6 +779,12 @@ impl ProfileHits {
         self.record_new_hits(profile, mask & !previous);
     }
 
+    fn insert_mask_if_missing(&self, profile: usize, mask: u64) {
+        if self.load_mask(profile) & mask != mask {
+            self.insert_mask(profile, mask);
+        }
+    }
+
     fn contains_profile_chains(
         &self,
         profile: usize,
@@ -793,76 +853,85 @@ impl ProfileHits {
 }
 
 struct ScoreCache {
-    slots: Box<[ScoreCacheSlot]>,
-}
-
-struct ScoreCacheSlot {
-    version: AtomicU64,
-    key: AtomicU64,
-    value: AtomicU8,
+    slots: Box<[AtomicU64]>,
+    sample: AtomicU64,
+    policy: AtomicU8,
 }
 
 impl ScoreCache {
     fn new() -> Self {
+        Self::with_slots(SCORE_CACHE_SLOTS)
+    }
+
+    fn with_slots(slot_count: usize) -> Self {
+        debug_assert!(slot_count.is_power_of_two());
         Self {
-            slots: (0..SCORE_CACHE_SLOTS)
-                .map(|_| ScoreCacheSlot {
-                    version: AtomicU64::new(0),
-                    key: AtomicU64::new(0),
-                    value: AtomicU8::new(0),
-                })
+            slots: (0..slot_count)
+                .map(|_| AtomicU64::new(0))
                 .collect::<Vec<_>>()
                 .into_boxed_slice(),
+            sample: AtomicU64::new(0),
+            policy: AtomicU8::new(CACHE_POLICY_SAMPLING),
         }
     }
 
-    fn get(&self, key: u64) -> Option<bool> {
-        let slot = &self.slots[self.slot(key)];
-        let before = slot.version.load(Ordering::Acquire);
-        if before & 1 != 0 {
-            return None;
+    #[cfg(test)]
+    fn enabled(&self) -> bool {
+        self.policy.load(Ordering::Relaxed) != CACHE_POLICY_DISABLED
+    }
+
+    fn record_sample(&self, probes: u64, hits: u64) {
+        if probes == 0 || self.policy.load(Ordering::Relaxed) != CACHE_POLICY_SAMPLING {
+            return;
         }
-        let stored_key = slot.key.load(Ordering::Relaxed);
-        let stored_value = slot.value.load(Ordering::Relaxed);
-        let after = slot.version.load(Ordering::Acquire);
-        if before != after || after & 1 != 0 || stored_value == 0 || stored_key != key {
+        debug_assert!(probes <= u64::from(u32::MAX));
+        debug_assert!(hits <= probes);
+        let packed = self
+            .sample
+            .fetch_add((probes << 32) | hits, Ordering::AcqRel)
+            .wrapping_add((probes << 32) | hits);
+        let total_probes = packed >> 32;
+        if total_probes < CACHE_SAMPLE_PAIRS {
+            return;
+        }
+        let total_hits = packed & u64::from(u32::MAX);
+        let decision = if total_hits.saturating_mul(100)
+            < total_probes.saturating_mul(MIN_CACHE_HIT_PERCENT)
+        {
+            CACHE_POLICY_DISABLED
+        } else {
+            CACHE_POLICY_ENABLED
+        };
+        let _ = self.policy.compare_exchange(
+            CACHE_POLICY_SAMPLING,
+            decision,
+            Ordering::AcqRel,
+            Ordering::Relaxed,
+        );
+    }
+
+    fn get(&self, key: u64) -> Option<bool> {
+        let entry = self.slots[self.slot(key)].load(Ordering::Relaxed);
+        let expected_key = cache_entry_key(key);
+        if entry & CACHE_KEY_MASK != expected_key {
             None
         } else {
-            Some(stored_value == 2)
+            Some(entry & CACHE_VALUE_BIT != 0)
         }
     }
 
     fn insert(&self, key: u64, value: bool) {
-        let slot = &self.slots[self.slot(key)];
-        let version = slot.version.load(Ordering::Relaxed);
-        if version & 1 != 0
-            || slot
-                .version
-                .compare_exchange_weak(
-                    version,
-                    version.wrapping_add(1),
-                    Ordering::Acquire,
-                    Ordering::Relaxed,
-                )
-                .is_err()
-        {
-            return;
-        }
-        slot.key.store(key, Ordering::Relaxed);
-        slot.value
-            .store(if value { 2 } else { 1 }, Ordering::Relaxed);
-        slot.version
-            .store(version.wrapping_add(2), Ordering::Release);
+        let entry = cache_entry_key(key) | if value { CACHE_VALUE_BIT } else { 0 };
+        self.slots[self.slot(key)].store(entry, Ordering::Relaxed);
     }
 
     fn slot(&self, key: u64) -> usize {
-        score_cache_slot(key, SCORE_CACHE_SLOTS)
+        score_cache_slot(key, self.slots.len())
     }
 }
 
 struct LocalScoreCache {
-    keys: Box<[u64]>,
-    values: Box<[u8]>,
+    entries: Box<[u64]>,
     #[cfg(test)]
     inserts: usize,
 }
@@ -870,8 +939,7 @@ struct LocalScoreCache {
 impl LocalScoreCache {
     fn new() -> Self {
         Self {
-            keys: vec![0; LOCAL_CACHE_ENTRIES].into_boxed_slice(),
-            values: vec![0; LOCAL_CACHE_ENTRIES].into_boxed_slice(),
+            entries: vec![0; LOCAL_CACHE_ENTRIES].into_boxed_slice(),
             #[cfg(test)]
             inserts: 0,
         }
@@ -879,13 +947,13 @@ impl LocalScoreCache {
 
     fn get(&self, key: u64) -> Option<bool> {
         let slot = self.slot(key);
-        (self.values[slot] != 0 && self.keys[slot] == key).then_some(self.values[slot] == 2)
+        let entry = self.entries[slot];
+        (entry & CACHE_KEY_MASK == cache_entry_key(key)).then_some(entry & CACHE_VALUE_BIT != 0)
     }
 
     fn insert(&mut self, key: u64, value: bool) {
         let slot = self.slot(key);
-        self.keys[slot] = key;
-        self.values[slot] = if value { 2 } else { 1 };
+        self.entries[slot] = cache_entry_key(key) | if value { CACHE_VALUE_BIT } else { 0 };
         #[cfg(test)]
         {
             self.inserts += 1;
@@ -1228,7 +1296,7 @@ fn build_index(
     let eligible_contracts = AtomicU64::new(0);
     let eligible_members = AtomicU64::new(0);
     let anchor_count = AtomicU64::new(0);
-    let profile_buckets = store
+    let mut profile_buckets = store
         .contracts
         .par_chunks(PREPARE_BATCH)
         .map(|contracts| {
@@ -1334,6 +1402,12 @@ fn build_index(
             }
             Ok(left)
         })?;
+    let token_remap = tokens.into_ordered_remap()?;
+    profile_buckets.regular.par_iter_mut().for_each(|bucket| {
+        for raw in bucket {
+            raw.key.anchors.remap_tokens(&token_remap);
+        }
+    });
     let (documents, terms, unique_terms) = documents.into_documents(progress)?;
 
     progress.begin_phase("profiles", Some(eligible_members.load(Ordering::Relaxed)));
@@ -1694,13 +1768,98 @@ impl CompactCandidateEntries {
         self.global_exact.posting_after(key, left)
     }
 
-    fn token_full_after(&self, key: (u32, u32), left: u32) -> &[u32] {
-        self.token_full.posting_after(pack_pair_key(key), left)
+    fn token_full(&self, token: u32, range: PostingKeyRange) -> CompactTokenPosting<'_> {
+        self.token_full.for_token(token, range)
     }
 
-    fn token_exact_after(&self, key: (u32, u32), left: u32) -> &[u32] {
-        self.token_exact.posting_after(pack_pair_key(key), left)
+    fn token_exact(&self, token: u32, range: PostingKeyRange) -> CompactTokenPosting<'_> {
+        self.token_exact.for_token(token, range)
     }
+}
+
+struct CompactTokenPosting<'a> {
+    posting: &'a CompactPosting<u64>,
+    key_start: usize,
+    key_end: usize,
+    token: u32,
+}
+
+impl<'a> CompactTokenPosting<'a> {
+    fn posting_after(&self, second: u32, left: u32) -> &'a [u32] {
+        let key = pack_pair_key((self.token, second));
+        let keys = &self.posting.keys[self.key_start..self.key_end];
+        let Ok(local_position) = keys.binary_search(&key) else {
+            return &[];
+        };
+        let position = self.key_start + local_position;
+        let posting = &self.posting.profiles
+            [self.posting.offsets[position]..self.posting.offsets[position + 1]];
+        let start = posting.partition_point(|profile| *profile <= left);
+        &posting[start..]
+    }
+
+    fn visit_postings_after(
+        &self,
+        sorted_seconds: &[u32],
+        left: u32,
+        mut visit: impl FnMut(&'a [u32]),
+    ) {
+        let keys = &self.posting.keys[self.key_start..self.key_end];
+        if sorted_seconds.len().saturating_mul(8) < keys.len() {
+            for &requested in sorted_seconds {
+                let key = pack_pair_key((self.token, requested));
+                let Ok(local_position) = keys.binary_search(&key) else {
+                    continue;
+                };
+                let position = self.key_start + local_position;
+                let posting = &self.posting.profiles
+                    [self.posting.offsets[position]..self.posting.offsets[position + 1]];
+                let start = posting.partition_point(|profile| *profile <= left);
+                visit(&posting[start..]);
+            }
+            return;
+        }
+        let mut key_position = 0;
+        let mut second_position = 0;
+        while key_position < keys.len() && second_position < sorted_seconds.len() {
+            let key_second = keys[key_position] as u32;
+            let requested = sorted_seconds[second_position];
+            match key_second.cmp(&requested) {
+                std::cmp::Ordering::Less => key_position += 1,
+                std::cmp::Ordering::Greater => second_position += 1,
+                std::cmp::Ordering::Equal => {
+                    let position = self.key_start + key_position;
+                    let posting = &self.posting.profiles
+                        [self.posting.offsets[position]..self.posting.offsets[position + 1]];
+                    let start = posting.partition_point(|profile| *profile <= left);
+                    visit(&posting[start..]);
+                    key_position += 1;
+                    second_position += 1;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct PostingKeyRange {
+    start: usize,
+    end: usize,
+}
+
+impl Default for PostingKeyRange {
+    fn default() -> Self {
+        Self {
+            start: usize::MAX,
+            end: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct TokenPostingRanges {
+    full: PostingKeyRange,
+    exact: PostingKeyRange,
 }
 
 impl CompactPosting<u32> {
@@ -1716,6 +1875,20 @@ impl CompactPosting<u64> {
                 .into_iter()
                 .map(|(first, second, profile)| (pack_pair_key((first, second)), profile)),
         )
+    }
+
+    fn for_token(&self, token: u32, range: PostingKeyRange) -> CompactTokenPosting<'_> {
+        let (key_start, key_end) = if range.start == usize::MAX {
+            (0, 0)
+        } else {
+            (range.start, range.end)
+        };
+        CompactTokenPosting {
+            posting: self,
+            key_start,
+            key_end,
+            token,
+        }
     }
 }
 
@@ -1827,6 +2000,11 @@ fn candidate_shard(first: u32, second: u32) -> usize {
         .wrapping_mul(0x9e37_79b9_7f4a_7c15)
         .rotate_left(23)
         ^ u64::from(second).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    mixed as usize & (CANDIDATE_SHARDS - 1)
+}
+
+fn token_candidate_shard(token: u32) -> usize {
+    let mixed = u64::from(token).wrapping_mul(0x9e37_79b9_7f4a_7c15);
     mixed as usize & (CANDIDATE_SHARDS - 1)
 }
 
@@ -2090,13 +2268,13 @@ fn build_candidate_plan(
                         for &(token, document) in index.anchors(profile) {
                             let terms = index.document_terms(document);
                             if !include_bm25 || terms.is_empty() {
-                                local[candidate_shard(token, document)]
+                                local[token_candidate_shard(token)]
                                     .token_exact
                                     .push((token, document, profile_id));
                             }
                             if include_bm25 {
                                 for &(term, _) in terms {
-                                    local[candidate_shard(token, term)]
+                                    local[token_candidate_shard(token)]
                                         .token_full
                                         .push((token, term, profile_id));
                                 }
@@ -2189,6 +2367,21 @@ fn build_candidate_plan(
     }
     drop(shards);
     let shards = compact_shards;
+    let token_count = index
+        .anchors
+        .iter()
+        .map(|(token, _)| *token as usize + 1)
+        .max()
+        .unwrap_or(0);
+    let mut token_ranges = vec![TokenPostingRanges::default(); token_count];
+    for shard in &shards {
+        record_token_key_ranges(&shard.token_full.keys, &mut token_ranges, |ranges| {
+            &mut ranges.full
+        });
+        record_token_key_ranges(&shard.token_exact.keys, &mut token_ranges, |ranges| {
+            &mut ranges.exact
+        });
+    }
     stats.posting_entries = (global_full.len() as u64).saturating_add(
         shards
             .iter()
@@ -2210,10 +2403,15 @@ fn build_candidate_plan(
                 .iter()
                 .map(CompactCandidateEntries::range_bytes)
                 .fold(0_u64, u64::saturating_add),
+        )
+        .saturating_add(
+            (token_ranges.len() as u64)
+                .saturating_mul(std::mem::size_of::<TokenPostingRanges>() as u64),
         );
     Ok((
         CrossProfilePlan::Indexed(ResidentCandidateIndex {
             shards: shards.into_boxed_slice(),
+            token_ranges: token_ranges.into_boxed_slice(),
             global_full,
             prefixes,
             include_bm25,
@@ -2222,11 +2420,29 @@ fn build_candidate_plan(
     ))
 }
 
-struct CandidateSeen {
-    generations: Vec<u16>,
-    generation: u16,
+fn record_token_key_ranges(
+    keys: &[u64],
+    ranges: &mut [TokenPostingRanges],
+    mut select: impl FnMut(&mut TokenPostingRanges) -> &mut PostingKeyRange,
+) {
+    let mut start = 0;
+    while start < keys.len() {
+        let token = (keys[start] >> 32) as usize;
+        let end = start + keys[start..].partition_point(|key| (*key >> 32) as usize == token);
+        let range = select(&mut ranges[token]);
+        debug_assert_eq!(range.start, usize::MAX);
+        *range = PostingKeyRange { start, end };
+        start = end;
+    }
 }
 
+#[cfg(test)]
+struct CandidateSeen {
+    generations: Vec<u32>,
+    generation: u32,
+}
+
+#[cfg(test)]
 impl CandidateSeen {
     fn new(profile_count: usize) -> Self {
         Self {
@@ -2235,12 +2451,10 @@ impl CandidateSeen {
         }
     }
 
-    fn begin_profile(&mut self) {
-        self.generation = self.generation.wrapping_add(1);
-        if self.generation == 0 {
-            self.generations.fill(0);
-            self.generation = 1;
-        }
+    fn begin_profile(&mut self, profile: u32) {
+        self.generation = profile
+            .checked_add(1)
+            .expect("a query profile always has a larger candidate profile");
     }
 
     fn insert(&mut self, profile: u32) -> bool {
@@ -2271,6 +2485,7 @@ struct CandidateGeneration {
 #[cfg(test)]
 struct CandidateSources<'a> {
     shards: &'a [CompactCandidateEntries],
+    token_ranges: &'a [TokenPostingRanges],
     global_full: &'a DensePostingIndex,
     prefixes: &'a DocumentPrefixes,
 }
@@ -2353,9 +2568,9 @@ fn generate_candidate_pairs(
                     .saturating_add(CANDIDATE_SCHEDULING_CHUNK)
                     .min(query_profile_count);
                 for left_id in start..end {
-                    seen.begin_profile();
                     let left_profile = &index.profiles[left_id];
                     let left_id = left_id as u32;
+                    seen.begin_profile(left_id);
                     let max_document = left_profile.max_document();
                     append_owned_candidates(
                         sources.shards[candidate_shard(max_document, 0)]
@@ -2402,9 +2617,11 @@ fn generate_candidate_pairs(
                     }
                     if left_profile.is_evm {
                         for &(token, document) in index.anchors(left_profile) {
+                            let token_shard = &sources.shards[token_candidate_shard(token)];
+                            let ranges = sources.token_ranges[token as usize];
+                            let token_exact = token_shard.token_exact(token, ranges.exact);
                             append_owned_candidates(
-                                sources.shards[candidate_shard(token, document)]
-                                    .token_exact_after((token, document), left_id),
+                                token_exact.posting_after(document, left_id),
                                 left_id,
                                 |profile| *profile,
                                 |right| {
@@ -2424,10 +2641,14 @@ fn generate_candidate_pairs(
                             if include_bm25 {
                                 let prefix = sources.prefixes.get(document);
                                 prefix_terms = prefix_terms.saturating_add(prefix.len() as u64);
-                                for &term in prefix {
-                                    append_owned_candidates(
-                                        sources.shards[candidate_shard(token, term)]
-                                            .token_full_after((token, term), left_id),
+                                let token_full = token_shard.token_full(token, ranges.full);
+                                let mut result = Ok(());
+                                token_full.visit_postings_after(prefix, left_id, |posting| {
+                                    if result.is_err() {
+                                        return;
+                                    }
+                                    result = append_owned_candidates(
+                                        posting,
                                         left_id,
                                         |profile| *profile,
                                         |right| {
@@ -2452,8 +2673,9 @@ fn generate_candidate_pairs(
                                         &mut zero_overlap_prunes,
                                         &mut unchecked_emissions,
                                         progress,
-                                    )?;
-                                }
+                                    );
+                                });
+                                result?;
                             }
                         }
                     }
@@ -2697,6 +2919,7 @@ fn build_document_prefixes(
                         frequencies.clear();
                         frequencies.extend(ranked.iter().map(|(_, _, frequency)| *frequency));
                         let len = lossless_prefix_len(frequencies, threshold);
+                        ranked[..len].sort_unstable_by_key(|(_, term, _)| *term);
                         terms.extend(ranked[..len].iter().map(|(_, term, _)| *term));
                         offsets.push(u32::try_from(terms.len()).map_err(|_| {
                             DedupError::invalid("metadata", "metadata prefix term offset overflow")
@@ -3087,10 +3310,9 @@ struct WorkerScorer<'a> {
     single_chain_word: bool,
     local_cache: Option<LocalScoreCache>,
     local_stats: LocalStats,
-    cache_enabled: bool,
-    cache_sample_complete: bool,
-    cache_probes: u64,
-    cache_hits: u64,
+    cache_sample_probes: u64,
+    cache_sample_hits: u64,
+    cache_policy: u8,
 }
 
 impl<'a> WorkerScorer<'a> {
@@ -3108,10 +3330,11 @@ impl<'a> WorkerScorer<'a> {
             single_chain_word: hits.is_single_word(),
             local_cache: None,
             local_stats: LocalStats::default(),
-            cache_enabled: cache.is_some(),
-            cache_sample_complete: false,
-            cache_probes: 0,
-            cache_hits: 0,
+            cache_sample_probes: 0,
+            cache_sample_hits: 0,
+            cache_policy: cache.map_or(CACHE_POLICY_DISABLED, |cache| {
+                cache.policy.load(Ordering::Relaxed)
+            }),
         }
     }
 
@@ -3157,6 +3380,19 @@ impl<'a> WorkerScorer<'a> {
         if !overlap_filter_passed {
             return false;
         }
+        // Keep candidate/zero-overlap accounting identical to the unsaturated
+        // path. Saturation only avoids document scoring after the posting
+        // witness has passed the same exact overlap test as before.
+        if self.pair_is_saturated(
+            left.profile_id as usize,
+            left.profile,
+            right_id as usize,
+            right,
+            left.known_hit_mask,
+        ) {
+            self.local_stats.saturated_profile_pairs += 1;
+            return true;
+        }
         let prepared_left = (left_document == left.max_document)
             .then_some((left.max_prepared_document, left.max_terms));
         self.score_pair_inner(
@@ -3173,21 +3409,19 @@ impl<'a> WorkerScorer<'a> {
         true
     }
 
-    fn score_pair_inner(
-        &mut self,
+    fn pair_is_saturated(
+        &self,
         left_id: usize,
         left: &ContractProfile,
         right_id: usize,
         right: &ContractProfile,
-        prepared_documents: Option<PreparedIndexedDocuments<'_>>,
-        mut known_left_hit_mask: Option<&mut u64>,
-    ) {
-        let saturated = if self.single_chain_word {
-            let left_contains = if let Some(known) = known_left_hit_mask.as_deref_mut() {
-                *known & right.chain_mask == right.chain_mask
-            } else {
-                self.hits.contains_mask(left_id, right.chain_mask)
-            };
+        known_left_hit_mask: Option<u64>,
+    ) -> bool {
+        if self.single_chain_word {
+            let left_contains = known_left_hit_mask.map_or_else(
+                || self.hits.contains_mask(left_id, right.chain_mask),
+                |known| known & right.chain_mask == right.chain_mask,
+            );
             left_contains && self.hits.contains_mask(right_id, left.chain_mask)
         } else {
             self.hits
@@ -3195,8 +3429,27 @@ impl<'a> WorkerScorer<'a> {
                 && self
                     .hits
                     .contains_profile_chains(right_id, left, self.index.chains(left))
-        };
-        if saturated {
+        }
+    }
+
+    fn score_pair_inner(
+        &mut self,
+        left_id: usize,
+        left: &ContractProfile,
+        right_id: usize,
+        right: &ContractProfile,
+        prepared_documents: Option<PreparedIndexedDocuments<'_>>,
+        known_left_hit_mask: Option<&mut u64>,
+    ) {
+        if prepared_documents.is_none()
+            && self.pair_is_saturated(
+                left_id,
+                left,
+                right_id,
+                right,
+                known_left_hit_mask.as_deref().copied(),
+            )
+        {
             self.local_stats.saturated_profile_pairs += 1;
             return;
         }
@@ -3213,17 +3466,19 @@ impl<'a> WorkerScorer<'a> {
                 );
                 (left_document, right_document, None)
             };
+        let mut cache_probed = false;
         let matched = if left_document == right_document {
             self.local_stats.exact_document_pairs += 1;
             true
         } else {
-            let use_cache = self.cache_enabled
+            let use_cache = self.cache_policy != CACHE_POLICY_DISABLED
                 && self
                     .index
                     .document_pair_may_repeat(left_document, right_document);
-            let cache_key = use_cache.then(|| document_pair_key(left_document, right_document));
+            let cache_key = use_cache.then(|| score_cache_key(left_document, right_document));
+            cache_probed = cache_key.is_some();
             let cached = if let Some(cache_key) = cache_key {
-                self.cache_probes += 1;
+                self.cache_sample_probes += 1;
                 self.local_stats.bm25_cache_probes += 1;
                 if let Some(value) = self
                     .local_cache
@@ -3241,7 +3496,7 @@ impl<'a> WorkerScorer<'a> {
                 None
             };
             if let Some((value, local_hit, cache_key)) = cached {
-                self.cache_hits += 1;
+                self.cache_sample_hits += 1;
                 self.local_stats.bm25_cache_hits += 1;
                 if !local_hit {
                     self.local_cache
@@ -3284,11 +3539,16 @@ impl<'a> WorkerScorer<'a> {
         if matched {
             self.local_stats.matched_profile_pairs += 1;
             if self.single_chain_word {
-                self.hits.insert_mask(left_id, right.chain_mask);
-                self.hits.insert_mask(right_id, left.chain_mask);
                 if let Some(known) = known_left_hit_mask {
+                    let missing = right.chain_mask & !*known;
+                    if missing != 0 {
+                        self.hits.insert_mask(left_id, missing);
+                    }
                     *known |= right.chain_mask;
+                } else {
+                    self.hits.insert_mask_if_missing(left_id, right.chain_mask);
                 }
+                self.hits.insert_mask_if_missing(right_id, left.chain_mask);
             } else {
                 self.hits
                     .insert_profile_chains(left_id, right, self.index.chains(right));
@@ -3296,25 +3556,36 @@ impl<'a> WorkerScorer<'a> {
                     .insert_profile_chains(right_id, left, self.index.chains(left));
             }
         }
-        self.update_cache_policy();
+        if cache_probed {
+            self.update_cache_policy();
+        }
     }
 
     fn update_cache_policy(&mut self) {
-        if self.cache_enabled
-            && !self.cache_sample_complete
-            && self.cache_probes >= CACHE_SAMPLE_PAIRS
-        {
-            self.cache_sample_complete = true;
-            if self.cache_hits.saturating_mul(100)
-                < self.cache_probes.saturating_mul(MIN_CACHE_HIT_PERCENT)
-            {
-                self.cache_enabled = false;
+        if self.cache_policy != CACHE_POLICY_SAMPLING {
+            return;
+        }
+        let Some(cache) = self.cache else {
+            return;
+        };
+        if self.cache_sample_probes >= CACHE_SAMPLE_BATCH {
+            cache.record_sample(self.cache_sample_probes, self.cache_sample_hits);
+            self.cache_sample_probes = 0;
+            self.cache_sample_hits = 0;
+            self.cache_policy = cache.policy.load(Ordering::Relaxed);
+            if self.cache_policy == CACHE_POLICY_DISABLED {
                 self.local_cache = None;
             }
         }
     }
 
     fn flush(self, stats: &AtomicStats) {
+        if self.cache_policy == CACHE_POLICY_SAMPLING
+            && self.cache_sample_probes != 0
+            && let Some(cache) = self.cache
+        {
+            cache.record_sample(self.cache_sample_probes, self.cache_sample_hits);
+        }
         self.local_stats.flush(stats);
     }
 }
@@ -3387,6 +3658,7 @@ struct CandidatePostingSlices<'a> {
     first: Option<&'a [u32]>,
     second: Option<&'a [u32]>,
     additional: Vec<&'a [u32]>,
+    emissions: usize,
 }
 
 impl<'a> CandidatePostingSlices<'a> {
@@ -3394,12 +3666,14 @@ impl<'a> CandidatePostingSlices<'a> {
         self.first = None;
         self.second = None;
         self.additional.clear();
+        self.emissions = 0;
     }
 
     fn push(&mut self, posting: &'a [u32]) {
         if posting.is_empty() {
             return;
         }
+        self.emissions = self.emissions.saturating_add(posting.len());
         if self.first.is_none() {
             self.first = Some(posting);
         } else if self.second.is_none() {
@@ -3419,6 +3693,10 @@ impl<'a> CandidatePostingSlices<'a> {
         self.first.is_none()
     }
 
+    fn emissions(&self) -> usize {
+        self.emissions
+    }
+
     fn iter(&self) -> impl Iterator<Item = &'a [u32]> + '_ {
         self.first
             .iter()
@@ -3426,6 +3704,42 @@ impl<'a> CandidatePostingSlices<'a> {
             .chain(self.second.iter().copied())
             .chain(self.additional.iter().copied())
     }
+
+    fn get(&self, index: usize) -> &'a [u32] {
+        match index {
+            0 => self.first.expect("the first candidate posting exists"),
+            1 => self.second.expect("the second candidate posting exists"),
+            index => self.additional[index - 2],
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct CandidateMergeHead {
+    source: usize,
+    right: u32,
+    offset: u32,
+}
+
+impl Ord for CandidateMergeHead {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        other
+            .right
+            .cmp(&self.right)
+            .then_with(|| other.source.cmp(&self.source))
+            .then_with(|| other.offset.cmp(&self.offset))
+    }
+}
+
+impl PartialOrd for CandidateMergeHead {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Default)]
+struct CandidateMergeScratch {
+    heap: BinaryHeap<CandidateMergeHead>,
 }
 
 fn upper_rect_tile_count(left_axis: u64, right_axis: u64) -> u64 {
@@ -3608,9 +3922,8 @@ fn score_candidate_sources(
     cache: Option<&ScoreCache>,
     candidates: &ResidentCandidateIndex,
 ) -> Result<CandidateScoreSummary, DedupError> {
-    let profile_count = index.profiles.len();
     let query_profile_count = index.query_profile_count;
-    if query_profile_count == 0 || profile_count < 2 {
+    if query_profile_count == 0 || index.profiles.len() < 2 {
         return Ok(CandidateScoreSummary::default());
     }
     let lane_count = candidate_seen_lanes(query_profile_count);
@@ -3624,8 +3937,9 @@ fn score_candidate_sources(
     let lanes = (0..lane_count)
         .into_par_iter()
         .map(|_| {
-            let mut seen = None;
             let mut postings = CandidatePostingSlices::default();
+            let mut small_seen = Vec::with_capacity(SMALL_CANDIDATE_UNION_EMISSIONS);
+            let mut merge_scratch = CandidateMergeScratch::default();
             let mut scorer = WorkerScorer::new(index, hits, cache, threshold);
             let mut summary = CandidateScoreSummary::default();
             let mut unchecked_emissions = 0_u64;
@@ -3662,6 +3976,13 @@ fn score_candidate_sources(
                         candidates.shards[candidate_shard(max_document, 0)]
                             .global_exact_after(max_document, profile_id),
                     );
+                    if left_profile.is_evm {
+                        for &(token, document) in index.anchors(left_profile).iter().rev() {
+                            let token_exact = candidates.shards[token_candidate_shard(token)]
+                                .token_exact(token, candidates.token_ranges[token as usize].exact);
+                            postings.push(token_exact.posting_after(document, profile_id));
+                        }
+                    }
                     if candidates.include_bm25 {
                         let prefix = candidates.prefixes.get(max_document);
                         summary.prefix_terms =
@@ -3669,23 +3990,19 @@ fn score_candidate_sources(
                         for &term in prefix {
                             postings.push(candidates.global_full.posting_after(term, profile_id));
                         }
-                    }
-                    if left_profile.is_evm {
-                        for &(token, document) in index.anchors(left_profile) {
-                            postings.push(
-                                candidates.shards[candidate_shard(token, document)]
-                                    .token_exact_after((token, document), profile_id),
-                            );
-                            if candidates.include_bm25 {
+                        if left_profile.is_evm {
+                            for &(token, document) in index.anchors(left_profile).iter().rev() {
+                                let token_full = candidates.shards[token_candidate_shard(token)]
+                                    .token_full(
+                                        token,
+                                        candidates.token_ranges[token as usize].full,
+                                    );
                                 let prefix = candidates.prefixes.get(document);
                                 summary.prefix_terms =
                                     summary.prefix_terms.saturating_add(prefix.len() as u64);
-                                for &term in prefix {
-                                    postings.push(
-                                        candidates.shards[candidate_shard(token, term)]
-                                            .token_full_after((token, term), profile_id),
-                                    );
-                                }
+                                token_full.visit_postings_after(prefix, profile_id, |posting| {
+                                    postings.push(posting);
+                                });
                             }
                         }
                     }
@@ -3695,8 +4012,8 @@ fn score_candidate_sources(
                             &postings,
                             candidates.include_bm25,
                             &mut left,
-                            &mut seen,
-                            profile_count,
+                            &mut small_seen,
+                            &mut merge_scratch,
                             &mut scorer,
                             &mut summary,
                             &mut unchecked_emissions,
@@ -3704,7 +4021,7 @@ fn score_candidate_sources(
                         )?;
                     }
                     completed += 1;
-                    if completed >= 64 {
+                    if completed >= DIRECT_PROGRESS_BATCH {
                         progress.add_completed(completed);
                         completed = 0;
                     }
@@ -3735,8 +4052,8 @@ fn score_candidate_postings<'a>(
     postings: &CandidatePostingSlices<'_>,
     include_bm25: bool,
     left: &mut IndexedLeftContext<'a>,
-    seen: &mut Option<CandidateSeen>,
-    profile_count: usize,
+    small_seen: &mut Vec<u32>,
+    merge_scratch: &mut CandidateMergeScratch,
     scorer: &mut WorkerScorer<'a>,
     summary: &mut CandidateScoreSummary,
     unchecked_emissions: &mut u64,
@@ -3766,23 +4083,120 @@ fn score_candidate_postings<'a>(
             progress,
         ),
         _ => {
-            let seen = seen.get_or_insert_with(|| CandidateSeen::new(profile_count));
-            seen.begin_profile();
-            for posting in postings.iter() {
-                score_seen_candidate_posting(
-                    posting,
+            if postings.emissions() <= SMALL_CANDIDATE_UNION_EMISSIONS {
+                return score_small_candidate_postings(
+                    postings,
+                    small_seen,
                     include_bm25,
                     left,
-                    seen,
                     scorer,
                     summary,
                     unchecked_emissions,
                     progress,
-                )?;
+                );
             }
-            Ok(())
+            score_merged_candidate_posting_set(
+                postings,
+                include_bm25,
+                left,
+                merge_scratch,
+                scorer,
+                summary,
+                unchecked_emissions,
+                progress,
+            )
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_merged_candidate_posting_set<'a>(
+    postings: &CandidatePostingSlices<'_>,
+    include_bm25: bool,
+    left: &mut IndexedLeftContext<'a>,
+    scratch: &mut CandidateMergeScratch,
+    scorer: &mut WorkerScorer<'a>,
+    summary: &mut CandidateScoreSummary,
+    unchecked_emissions: &mut u64,
+    progress: &dyn ProgressObserver,
+) -> Result<(), DedupError> {
+    record_candidate_emissions(
+        postings.emissions() as u64,
+        summary,
+        unchecked_emissions,
+        progress,
+    )?;
+    scratch.heap.clear();
+    for (source, posting) in postings.iter().enumerate() {
+        if let Some(&right) = posting.first() {
+            scratch.heap.push(CandidateMergeHead {
+                source,
+                right,
+                offset: 0,
+            });
+        }
+    }
+    let mut previous = None;
+    while let Some(mut head) = scratch.heap.peek_mut() {
+        let current = *head;
+        let posting = postings.get(current.source);
+        let next_offset = current.offset as usize + 1;
+        if let Some(&next) = posting.get(next_offset) {
+            debug_assert!(u32::try_from(next_offset).is_ok());
+            *head = CandidateMergeHead {
+                source: current.source,
+                right: next,
+                offset: next_offset as u32,
+            };
+            drop(head);
+        } else {
+            std::collections::binary_heap::PeekMut::pop(head);
+        }
+        let right = current.right;
+        debug_assert!(right > left.profile_id);
+        if previous == Some(right) {
+            continue;
+        }
+        previous = Some(right);
+        score_unique_indexed_candidate(left, right, include_bm25, scorer, summary);
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn score_small_candidate_postings<'a>(
+    postings: &CandidatePostingSlices<'_>,
+    seen: &mut Vec<u32>,
+    include_bm25: bool,
+    left: &mut IndexedLeftContext<'a>,
+    scorer: &mut WorkerScorer<'a>,
+    summary: &mut CandidateScoreSummary,
+    unchecked_emissions: &mut u64,
+    progress: &dyn ProgressObserver,
+) -> Result<(), DedupError> {
+    seen.clear();
+    let mut seen_filter = 0_u64;
+    for posting in postings.iter() {
+        let mut remaining = posting;
+        while !remaining.is_empty() {
+            let until_cancel_check = (CANDIDATE_CANCEL_BATCH - *unchecked_emissions) as usize;
+            let batch_len = remaining.len().min(until_cancel_check);
+            let (batch, rest) = remaining.split_at(batch_len);
+            record_candidate_emissions(batch_len as u64, summary, unchecked_emissions, progress)?;
+            for &right in batch {
+                debug_assert!(right > left.profile_id);
+                let bit = 1_u64 << (right & 63);
+                if seen_filter & bit != 0 && seen.contains(&right) {
+                    continue;
+                }
+                seen_filter |= bit;
+                seen.push(right);
+                score_unique_indexed_candidate(left, right, include_bm25, scorer, summary);
+            }
+            remaining = rest;
+        }
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3798,7 +4212,6 @@ fn score_single_candidate_posting<'a>(
     let mut previous = None;
     let mut remaining = posting;
     while !remaining.is_empty() {
-        debug_assert!(*unchecked_emissions < CANDIDATE_CANCEL_BATCH);
         let until_cancel_check = (CANDIDATE_CANCEL_BATCH - *unchecked_emissions) as usize;
         let batch_len = remaining.len().min(until_cancel_check);
         let (batch, rest) = remaining.split_at(batch_len);
@@ -3884,34 +4297,6 @@ fn score_merged_candidate_postings<'a>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn score_seen_candidate_posting<'a>(
-    posting: &[u32],
-    include_bm25: bool,
-    left: &mut IndexedLeftContext<'a>,
-    seen: &mut CandidateSeen,
-    scorer: &mut WorkerScorer<'a>,
-    summary: &mut CandidateScoreSummary,
-    unchecked_emissions: &mut u64,
-    progress: &dyn ProgressObserver,
-) -> Result<(), DedupError> {
-    let mut remaining = posting;
-    while !remaining.is_empty() {
-        debug_assert!(*unchecked_emissions < CANDIDATE_CANCEL_BATCH);
-        let until_cancel_check = (CANDIDATE_CANCEL_BATCH - *unchecked_emissions) as usize;
-        let batch_len = remaining.len().min(until_cancel_check);
-        let (batch, rest) = remaining.split_at(batch_len);
-        record_candidate_emissions(batch_len as u64, summary, unchecked_emissions, progress)?;
-        for &right in batch {
-            debug_assert!(right > left.profile_id);
-            if seen.insert(right) {
-                score_unique_indexed_candidate(left, right, include_bm25, scorer, summary);
-            }
-        }
-        remaining = rest;
-    }
-    Ok(())
-}
-
 fn record_candidate_emissions(
     mut emissions: u64,
     summary: &mut CandidateScoreSummary,
@@ -4066,27 +4451,86 @@ fn selected_documents(
 ) -> (DocumentId, DocumentId) {
     if left.is_evm
         && right.is_evm
-        && left
-            .token_mask
-            .iter()
-            .zip(right.token_mask)
-            .any(|(left, right)| left & right != 0)
+        && anchor_token_ranges_overlap(left_anchors, right_anchors)
+        && token_masks_overlap(&left.token_mask, &right.token_mask)
+        && let Some(documents) = highest_shared_anchor(left_anchors, right_anchors)
     {
-        for left_anchor in left_anchors.iter().rev() {
-            let (word, bit) = token_bit(left_anchor.0);
-            if right.token_mask[word] & bit == 0 {
-                continue;
-            }
-            if let Some(right_anchor) = right_anchors
-                .iter()
-                .rev()
-                .find(|anchor| anchor.0 == left_anchor.0)
-            {
-                return (left_anchor.1, right_anchor.1);
-            }
-        }
+        return documents;
     }
     (left.max_document(), right.max_document())
+}
+
+fn anchor_token_ranges_overlap(
+    left: &[(TokenKeyId, DocumentId)],
+    right: &[(TokenKeyId, DocumentId)],
+) -> bool {
+    match (left.first(), left.last(), right.first(), right.last()) {
+        (Some(left_first), Some(left_last), Some(right_first), Some(right_last)) => {
+            left_first.0 <= right_last.0 && right_first.0 <= left_last.0
+        }
+        _ => false,
+    }
+}
+
+#[inline]
+fn token_masks_overlap(left: &[u64; TOKEN_MASK_WORDS], right: &[u64; TOKEN_MASK_WORDS]) -> bool {
+    #[cfg(all(target_arch = "x86_64", target_feature = "avx2"))]
+    {
+        // The Linux production target is compiled for Zen 4, where AVX2 is
+        // guaranteed. Unaligned loads keep the compact profile layout.
+        unsafe {
+            use std::arch::x86_64::{__m256i, _mm256_loadu_si256, _mm256_testz_si256};
+            let left = _mm256_loadu_si256(left.as_ptr().cast::<__m256i>());
+            let right = _mm256_loadu_si256(right.as_ptr().cast::<__m256i>());
+            return _mm256_testz_si256(left, right) == 0;
+        }
+    }
+    #[cfg(not(all(target_arch = "x86_64", target_feature = "avx2")))]
+    {
+        left[0] & right[0] != 0
+            || left[1] & right[1] != 0
+            || left[2] & right[2] != 0
+            || left[3] & right[3] != 0
+    }
+}
+
+fn highest_shared_anchor(
+    left: &[(TokenKeyId, DocumentId)],
+    right: &[(TokenKeyId, DocumentId)],
+) -> Option<(DocumentId, DocumentId)> {
+    const IMBALANCE_RATIO: usize = 8;
+    if left.len().saturating_mul(IMBALANCE_RATIO) < right.len() {
+        return highest_shared_anchor_imbalanced(left, right);
+    }
+    if right.len().saturating_mul(IMBALANCE_RATIO) < left.len() {
+        return highest_shared_anchor_imbalanced(right, left).map(|(right, left)| (left, right));
+    }
+
+    let mut left_end = left.len();
+    let mut right_end = right.len();
+    while left_end != 0 && right_end != 0 {
+        let left_anchor = left[left_end - 1];
+        let right_anchor = right[right_end - 1];
+        match left_anchor.0.cmp(&right_anchor.0) {
+            std::cmp::Ordering::Equal => return Some((left_anchor.1, right_anchor.1)),
+            std::cmp::Ordering::Greater => left_end -= 1,
+            std::cmp::Ordering::Less => right_end -= 1,
+        }
+    }
+    None
+}
+
+fn highest_shared_anchor_imbalanced(
+    shorter: &[(TokenKeyId, DocumentId)],
+    longer: &[(TokenKeyId, DocumentId)],
+) -> Option<(DocumentId, DocumentId)> {
+    for &(token, short_document) in shorter.iter().rev() {
+        let end = longer.partition_point(|anchor| anchor.0 <= token);
+        if end != 0 && longer[end - 1].0 == token {
+            return Some((short_document, longer[end - 1].1));
+        }
+    }
+    None
 }
 
 #[derive(Default)]
@@ -4310,6 +4754,23 @@ fn score_cache_slot(key: u64, slots: usize) -> usize {
     mixed as usize & (slots - 1)
 }
 
+fn cache_entry_key(key: u64) -> u64 {
+    debug_assert!(key < CACHE_KEY_MASK);
+    key + 1
+}
+
+fn score_cache_key(left: DocumentId, right: DocumentId) -> u64 {
+    debug_assert_ne!(left, right);
+    let (left, right) = if left < right {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    let right = u64::from(right);
+    right * (right - 1) / 2 + u64::from(left)
+}
+
+#[cfg(test)]
 fn document_pair_key(left: DocumentId, right: DocumentId) -> u64 {
     let (left, right) = if left <= right {
         (left, right)
@@ -4528,6 +4989,7 @@ mod tests {
             frequencies.clear();
             frequencies.extend(ranked.iter().map(|(_, _, frequency)| *frequency));
             let len = lossless_prefix_len(&frequencies, threshold);
+            ranked[..len].sort_unstable_by_key(|(_, term, _)| *term);
             expected_terms.extend(ranked[..len].iter().map(|(_, term, _)| *term));
             expected_offsets.push(u32::try_from(expected_terms.len()).unwrap());
         }
@@ -4660,28 +5122,29 @@ mod tests {
         for &source in sources {
             postings.push(source);
         }
-        let mut seen = None;
+        let mut small_seen = Vec::new();
+        let mut merge_scratch = CandidateMergeScratch::default();
         let mut summary = CandidateScoreSummary::default();
         let mut unchecked = initial_unchecked;
         score_candidate_postings(
             &postings,
             true,
             &mut left,
-            &mut seen,
-            index.profiles.len(),
+            &mut small_seen,
+            &mut merge_scratch,
             &mut scorer,
             &mut summary,
             &mut unchecked,
             progress,
         )?;
-        Ok((summary, seen.is_some(), unchecked))
+        Ok((summary, merge_scratch.heap.capacity() != 0, unchecked))
     }
 
     #[test]
     fn owned_candidate_generation_deduplicates_and_checks_cancellation() {
         let entries = vec![(7, 1), (7, 1), (7, 2)];
         let mut seen = CandidateSeen::new(3);
-        seen.begin_profile();
+        seen.begin_profile(0);
         let mut pairs = CandidatePairChunks::new();
         let mut scoring_work = 0;
         let mut emissions = 0;
@@ -4717,7 +5180,7 @@ mod tests {
         assert_eq!(scoring_work, 2);
 
         let mut seen = CandidateSeen::new(3);
-        seen.begin_profile();
+        seen.begin_profile(0);
         let mut unchecked = CANDIDATE_CANCEL_BATCH - 1;
         let mut scoring_work = 0;
         assert!(matches!(
@@ -4776,6 +5239,42 @@ mod tests {
         assert_eq!(posting.profiles.as_ref(), &[2, 3, 3]);
         assert_eq!(posting.posting_after(1, 0), &[2, 3]);
         assert_eq!(posting.posting_after(1, 2), &[3]);
+    }
+
+    #[test]
+    fn token_posting_batch_lookup_matches_individual_queries_for_both_strategies() {
+        let mut entries = Vec::new();
+        for second in 0..32_u32 {
+            entries.push((7, second, 1));
+            entries.push((7, second, 5));
+        }
+        entries.extend([(9, 1, 2), (9, 1, 6)]);
+        let posting = CompactPosting::from_triples(entries);
+        let mut ranges = vec![TokenPostingRanges::default(); 10];
+        record_token_key_ranges(&posting.keys, &mut ranges, |candidate| &mut candidate.full);
+        let token = posting.for_token(7, ranges[7].full);
+
+        for requested in [
+            vec![1, 17],
+            (0..32_u32).filter(|second| second % 2 == 0).collect(),
+        ] {
+            let expected = requested
+                .iter()
+                .map(|&second| token.posting_after(second, 1).to_vec())
+                .filter(|candidate| !candidate.is_empty())
+                .collect::<Vec<_>>();
+            let mut actual = Vec::new();
+            token.visit_postings_after(&requested, 1, |candidate| {
+                actual.push(candidate.to_vec());
+            });
+            assert_eq!(actual, expected);
+        }
+
+        let missing = posting.for_token(8, ranges[8].full);
+        assert!(missing.posting_after(1, 0).is_empty());
+        let mut visited = false;
+        missing.visit_postings_after(&[1], 0, |_| visited = true);
+        assert!(!visited);
     }
 
     #[test]
@@ -4846,6 +5345,32 @@ mod tests {
             ),
             (30, 31)
         );
+    }
+
+    #[test]
+    fn token_interner_remaps_parallel_ids_into_evm_numeric_order() {
+        let interner = TokenInterner::new();
+        let ten = interner.intern("10").unwrap();
+        let text = interner.intern("token").unwrap();
+        let two = interner.intern("2").unwrap();
+        let zero = interner.intern("0").unwrap();
+
+        let remap = interner.into_ordered_remap().unwrap();
+        assert!(remap[zero as usize] < remap[two as usize]);
+        assert!(remap[two as usize] < remap[ten as usize]);
+        assert!(remap[ten as usize] < remap[text as usize]);
+    }
+
+    #[test]
+    fn highest_shared_anchor_handles_imbalanced_lists_and_duplicate_tokens() {
+        let short = [(3, 30), (9, 90)];
+        let mut long = (0..=32)
+            .map(|token| (token, token + 100))
+            .collect::<Vec<_>>();
+        long.insert(10, (9, 999));
+
+        assert_eq!(highest_shared_anchor(&short, &long), Some((90, 999)));
+        assert_eq!(highest_shared_anchor(&long, &short), Some((999, 90)));
     }
 
     #[test]
@@ -4927,7 +5452,7 @@ mod tests {
             (left.max_document(), right.max_document())
         };
         for seed in 0..512_u32 {
-            let left_anchors = (0..1 + seed as usize % INLINE_ANCHORS)
+            let mut left_anchors = (0..1 + seed as usize % INLINE_ANCHORS)
                 .map(|index| {
                     (
                         seed.wrapping_mul(17)
@@ -4937,7 +5462,8 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>();
-            let right_anchors = (0..1 + (seed as usize / 3) % INLINE_ANCHORS)
+            left_anchors.sort_by_key(|anchor| anchor.0);
+            let mut right_anchors = (0..1 + (seed as usize / 3) % INLINE_ANCHORS)
                 .map(|index| {
                     (
                         seed.wrapping_mul(31)
@@ -4947,6 +5473,7 @@ mod tests {
                     )
                 })
                 .collect::<Vec<_>>();
+            right_anchors.sort_by_key(|anchor| anchor.0);
             for (left_evm, right_evm) in [(true, true), (true, false), (false, true)] {
                 let left = profile(left_evm, &left_anchors);
                 let right = profile(right_evm, &right_anchors);
@@ -5065,6 +5592,46 @@ mod tests {
     }
 
     #[test]
+    fn triangular_score_cache_keys_are_symmetric_unique_and_fit_the_packed_entry() {
+        let mut expected = 0_u64;
+        for right in 1..128_u32 {
+            for left in 0..right {
+                assert_eq!(score_cache_key(left, right), expected);
+                assert_eq!(score_cache_key(right, left), expected);
+                expected += 1;
+            }
+        }
+
+        let maximum = score_cache_key(u32::MAX - 1, u32::MAX);
+        assert!(maximum < CACHE_KEY_MASK);
+        assert_eq!(cache_entry_key(maximum) & CACHE_VALUE_BIT, 0);
+
+        let cache = ScoreCache::with_slots(1);
+        cache.insert(maximum, false);
+        assert_eq!(cache.get(maximum), Some(false));
+        cache.insert(maximum, true);
+        assert_eq!(cache.get(maximum), Some(true));
+    }
+
+    #[test]
+    fn packed_shared_cache_never_returns_a_torn_collision_under_contention() {
+        let cache = ScoreCache::with_slots(8);
+        let keys = (0_u64..)
+            .filter(|key| cache.slot(*key) == 0)
+            .take(16)
+            .collect::<Vec<_>>();
+        keys.par_iter().enumerate().for_each(|(index, &key)| {
+            let expected = index & 1 != 0;
+            for _ in 0..20_000 {
+                cache.insert(key, expected);
+                if let Some(actual) = cache.get(key) {
+                    assert_eq!(actual, expected);
+                }
+            }
+        });
+    }
+
+    #[test]
     fn local_score_cache_never_returns_a_colliding_key() {
         let mut cache = LocalScoreCache::new();
         let first = 0_u64;
@@ -5108,21 +5675,23 @@ mod tests {
         let index =
             indexed_scoring_index(&["shared alpha", "shared beta"], &[0, 1], &[0, 1], &[2, 1]);
         let hits = ProfileHits::new(index.profiles.len(), index.chain_count, false);
-        let cache = ScoreCache::new();
+        let below_cache = ScoreCache::new();
 
-        let mut below = WorkerScorer::new(&index, &hits, Some(&cache), 0.99);
+        let mut below = WorkerScorer::new(&index, &hits, Some(&below_cache), 0.99);
         below.local_cache = Some(LocalScoreCache::new());
-        below.cache_probes = 100_000;
-        below.cache_hits = 9_999;
+        below_cache.record_sample(100_000, 9_999);
+        below.cache_sample_probes = CACHE_SAMPLE_BATCH;
         below.update_cache_policy();
-        assert!(!below.cache_enabled);
+        assert!(!below_cache.enabled());
         assert!(below.local_cache.is_none());
 
-        let mut boundary = WorkerScorer::new(&index, &hits, Some(&cache), 0.99);
-        boundary.cache_probes = 100_000;
-        boundary.cache_hits = 10_000;
-        boundary.update_cache_policy();
-        assert!(boundary.cache_enabled);
+        let boundary_cache = ScoreCache::new();
+        boundary_cache.record_sample(100_000, 10_000);
+        assert!(boundary_cache.enabled());
+        assert_eq!(
+            boundary_cache.policy.load(Ordering::Relaxed),
+            CACHE_POLICY_ENABLED
+        );
         assert_eq!(MIN_CACHE_HIT_PERCENT, 10);
     }
 
@@ -5136,7 +5705,8 @@ mod tests {
         let posting = [1_u32, 1_u32];
         let mut postings = CandidatePostingSlices::default();
         postings.push(&posting);
-        let mut seen = None;
+        let mut small_seen = Vec::new();
+        let mut merge_scratch = CandidateMergeScratch::default();
         let mut summary = CandidateScoreSummary::default();
         let mut unchecked = CANDIDATE_CANCEL_BATCH - 1;
         let progress = CancelAfterChecks::new(1);
@@ -5144,8 +5714,8 @@ mod tests {
             &postings,
             true,
             &mut left,
-            &mut seen,
-            index.profiles.len(),
+            &mut small_seen,
+            &mut merge_scratch,
             &mut scorer,
             &mut summary,
             &mut unchecked,
@@ -5157,7 +5727,7 @@ mod tests {
         assert_eq!(summary.zero_overlap_prunes, 0);
         assert_eq!(unchecked, 1);
         assert_eq!(progress.checks.load(Ordering::Relaxed), 1);
-        assert!(seen.is_none());
+        assert!(merge_scratch.heap.is_empty());
     }
 
     #[test]
@@ -5203,7 +5773,8 @@ mod tests {
         let mut postings = CandidatePostingSlices::default();
         postings.push(&first);
         postings.push(&second);
-        let mut seen = None;
+        let mut small_seen = Vec::new();
+        let mut merge_scratch = CandidateMergeScratch::default();
         let mut summary = CandidateScoreSummary::default();
         let mut unchecked = CANDIDATE_CANCEL_BATCH - 1;
         let progress = CancelAfterChecks::new(1);
@@ -5212,8 +5783,8 @@ mod tests {
             &postings,
             true,
             &mut left,
-            &mut seen,
-            index.profiles.len(),
+            &mut small_seen,
+            &mut merge_scratch,
             &mut scorer,
             &mut summary,
             &mut unchecked,
@@ -5225,28 +5796,67 @@ mod tests {
         assert_eq!(summary.pair_count, 1);
         assert_eq!(unchecked, 1);
         assert_eq!(progress.checks.load(Ordering::Relaxed), 1);
-        assert!(seen.is_none());
+        assert!(merge_scratch.heap.is_empty());
     }
 
     #[test]
-    fn candidate_posting_union_allocates_seen_only_at_the_k2_k3_boundary() {
+    fn candidate_posting_union_uses_heap_only_above_the_small_union_boundary() {
+        assert!(std::mem::size_of::<CandidateMergeHead>() <= 16);
         let index = indexed_scoring_index(&["shared"], &[0, 0, 0, 0, 0], &[0, 1, 2, 3, 4], &[5]);
         let first = [1, 3];
         let second = [2, 3];
         let third = [1, 4];
 
-        let (two, allocated_seen, _) =
+        let (two, used_heap, _) =
             score_test_candidate_postings(&index, &[&first, &second], 0, &NoopProgress).unwrap();
         assert_eq!(two.pair_emissions, 4);
         assert_eq!(two.pair_count, 3);
-        assert!(!allocated_seen);
+        assert!(!used_heap);
 
-        let (three, allocated_seen, _) =
+        let (three, used_heap, _) =
             score_test_candidate_postings(&index, &[&first, &second, &third], 0, &NoopProgress)
                 .unwrap();
         assert_eq!(three.pair_emissions, 6);
         assert_eq!(three.pair_count, 4);
-        assert!(allocated_seen);
+        assert!(!used_heap);
+
+        let dense_first = vec![1; 22];
+        let dense_second = vec![2; 22];
+        let dense_third = vec![3; 21];
+        let (dense, used_heap, _) = score_test_candidate_postings(
+            &index,
+            &[&dense_first, &dense_second, &dense_third],
+            0,
+            &NoopProgress,
+        )
+        .unwrap();
+        assert_eq!(dense.pair_emissions, 65);
+        assert_eq!(dense.pair_count, 3);
+        assert!(used_heap);
+    }
+
+    #[test]
+    fn small_candidate_union_bitmap_prefilter_keeps_colliding_profile_ids_exact() {
+        const PROFILE_COUNT: usize = 66;
+        let index = indexed_scoring_index(
+            &["shared"],
+            &vec![0; PROFILE_COUNT],
+            &(0..PROFILE_COUNT)
+                .map(|profile| (profile % 8) as ChainId)
+                .collect::<Vec<_>>(),
+            &[PROFILE_COUNT as u8],
+        );
+        let first = [1];
+        let second = [65];
+        let both = [1, 65];
+        let (summary, used_heap, _) =
+            score_test_candidate_postings(&index, &[&first, &second, &both], 0, &NoopProgress)
+                .unwrap();
+
+        assert_eq!(1 & 63, 65 & 63);
+        assert_eq!(summary.pair_emissions, 4);
+        assert_eq!(summary.pair_count, 2);
+        assert!(!used_heap);
     }
 
     #[test]
@@ -5281,7 +5891,7 @@ mod tests {
                 let raw_emissions = sources.iter().map(Vec::len).sum::<usize>() as u64;
                 let nonempty_sources = sources.iter().filter(|source| !source.is_empty()).count();
                 let mut reference = CandidateSeen::new(PROFILE_COUNT);
-                reference.begin_profile();
+                reference.begin_profile(0);
                 let mut unique = 0_u64;
                 for source in &sources {
                     for &right in source {
@@ -5289,12 +5899,15 @@ mod tests {
                     }
                 }
 
-                let (actual, allocated_seen, _) =
+                let (actual, used_heap, _) =
                     score_test_candidate_postings(&index, &source_refs, 0, &NoopProgress).unwrap();
                 assert_eq!(actual.pair_emissions, raw_emissions);
                 assert_eq!(actual.pair_count, unique);
                 assert_eq!(actual.zero_overlap_prunes, 0);
-                assert_eq!(allocated_seen, nonempty_sources >= 3);
+                assert_eq!(
+                    used_heap,
+                    nonempty_sources >= 3 && raw_emissions > SMALL_CANDIDATE_UNION_EMISSIONS as u64
+                );
             }
         }
     }
@@ -5461,7 +6074,7 @@ mod tests {
     }
 
     #[test]
-    fn evm_indexed_candidate_still_validates_the_selected_token_documents() {
+    fn evm_indexed_candidate_validates_selected_documents_before_saturation() {
         let mut index = indexed_scoring_index(
             &[
                 "lefttokenonly",
@@ -5502,9 +6115,12 @@ mod tests {
             index.document_terms(selected_right),
         ));
         let hits = ProfileHits::new(index.profiles.len(), index.chain_count, false);
+        hits.insert_mask(0, index.profiles[1].chain_mask);
+        hits.insert_mask(1, index.profiles[0].chain_mask);
         let mut scorer = WorkerScorer::new(&index, &hits, None, 0.1);
         let mut left = IndexedLeftContext::new(&index, &hits, 0);
         assert!(!scorer.score_indexed_candidate(&mut left, 1, true));
+        assert_eq!(scorer.local_stats.saturated_profile_pairs, 0);
         assert_eq!(scorer.local_stats.bm25_scores, 0);
     }
 

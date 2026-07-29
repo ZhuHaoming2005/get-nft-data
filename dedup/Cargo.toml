@@ -29,6 +29,6 @@ unicode-normalization = "0.1"
 dedup_core = { path = "crates/core" }
 
 [profile.release]
-lto = "thin"
+lto = "fat"
 codegen-units = 1
 panic = "abort"
