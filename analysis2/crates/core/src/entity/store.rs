@@ -558,6 +558,23 @@ impl ResidentStore {
         self.totals.values().map(|t| t.contracts).sum()
     }
 
+    /// Restore full-snapshot denominators after a cache-replay load retained
+    /// only seed/candidate contracts. Resident identities remain scoped.
+    pub fn restore_snapshot_totals(
+        &mut self,
+        rows_loaded: u64,
+        totals: impl IntoIterator<Item = (String, u64, u64)>,
+    ) -> Result<(), Analysis2Error> {
+        self.totals.clear();
+        for (chain, contracts, nfts) in totals {
+            let chain_id = self.ensure_chain(&chain)?;
+            self.totals
+                .insert(chain_id, ChainTotals { contracts, nfts });
+        }
+        self.rows_loaded = rows_loaded;
+        Ok(())
+    }
+
     /// Merge another shard; preserves destination (left) identity and remaps shard ids.
     pub fn merge_shard(&mut self, shard: ResidentStore) -> Result<(), Analysis2Error> {
         let ResidentStore {

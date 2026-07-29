@@ -7,6 +7,8 @@
 //! identities so process-local `ContractId` / `NftId` values can be remapped.
 
 use std::fs;
+use std::fs::File;
+use std::io::{BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -17,13 +19,17 @@ use crate::error::Analysis2Error;
 use crate::reporting::json::SeedRecord;
 use crate::reporting::manifest::FailureRecord;
 
-pub const DEDUP_CACHE_VERSION: u32 = 2;
+pub const DEDUP_CACHE_VERSION: u32 = 3;
 pub const DEFAULT_DEDUP_CACHE_FILE: &str = "dedup_cache.json";
 
 /// Parameters that must match between the producing and reusing runs.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DedupCacheParams {
     pub inputs: Vec<String>,
+    /// Cheap ordered file identity used to reject stale caches even when the
+    /// input paths themselves did not change.
+    #[serde(default)]
+    pub input_fingerprints: Vec<InputFileFingerprint>,
     pub chains: Vec<String>,
     pub evm_chains: Vec<String>,
     pub name_threshold: Option<f64>,
@@ -36,6 +42,13 @@ pub struct DedupCacheParams {
     pub seeds_path: String,
     /// Seeds embedded for exact list comparison on reuse.
     pub seeds: Vec<SeedRecord>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InputFileFingerprint {
+    pub path: String,
+    pub byte_len: u64,
+    pub modified_unix_nanos: u64,
 }
 
 /// One hit edge with stable identities (no process-local ids).
@@ -58,11 +71,26 @@ pub struct CachedSeedHits {
     pub edges: Vec<CachedHitEdge>,
 }
 
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CachedChainTotals {
+    pub chain: String,
+    pub contracts: u64,
+    pub nfts: u64,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CachedDatasetStats {
+    pub rows_loaded: u64,
+    pub chains: Vec<CachedChainTotals>,
+}
+
 /// On-disk dedup checkpoint.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct DedupCacheFile {
     pub version: u32,
     pub params: DedupCacheParams,
+    #[serde(default)]
+    pub dataset: CachedDatasetStats,
     pub completed: Vec<CachedSeedHits>,
     #[serde(default)]
     pub failures: Vec<FailureRecord>,
@@ -127,9 +155,23 @@ pub fn build_dedup_cache(
             edges,
         });
     }
+    let mut chains = store
+        .totals
+        .iter()
+        .map(|(&chain_id, totals)| CachedChainTotals {
+            chain: store.chain_name(chain_id).to_owned(),
+            contracts: totals.contracts,
+            nfts: totals.nfts,
+        })
+        .collect::<Vec<_>>();
+    chains.sort_unstable_by(|left, right| left.chain.cmp(&right.chain));
     DedupCacheFile {
         version: DEDUP_CACHE_VERSION,
         params,
+        dataset: CachedDatasetStats {
+            rows_loaded: store.rows_loaded,
+            chains,
+        },
         completed: cached_completed,
         failures: failures.to_vec(),
     }
@@ -140,13 +182,17 @@ pub fn write_dedup_cache(path: &Path, cache: &DedupCacheFile) -> Result<(), Anal
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
     }
-    let body = serde_json::to_vec(cache)
-        .map_err(|e| Analysis2Error::invalid(format!("serialize dedup cache: {e}")))?;
     let tmp = path.with_extension("json.tmp");
-    fs::write(&tmp, &body)?;
+    {
+        let file = File::create(&tmp)?;
+        let mut writer = BufWriter::new(file);
+        serde_json::to_writer(&mut writer, cache)
+            .map_err(|e| Analysis2Error::invalid(format!("serialize dedup cache: {e}")))?;
+        writer.flush()?;
+    }
     if let Err(error) = fs::rename(&tmp, path) {
         // Windows may fail rename over existing file; fall back to overwrite.
-        fs::write(path, &body).map_err(|e| {
+        fs::copy(&tmp, path).map_err(|e| {
             Analysis2Error::invalid(format!(
                 "write dedup cache {} (rename failed: {error}): {e}",
                 path.display()
@@ -159,10 +205,10 @@ pub fn write_dedup_cache(path: &Path, cache: &DedupCacheFile) -> Result<(), Anal
 
 /// Load and parse a dedup cache file.
 pub fn load_dedup_cache(path: &Path) -> Result<DedupCacheFile, Analysis2Error> {
-    let text = fs::read_to_string(path).map_err(|e| {
+    let file = File::open(path).map_err(|e| {
         Analysis2Error::invalid(format!("read dedup cache {}: {e}", path.display()))
     })?;
-    let cache: DedupCacheFile = serde_json::from_str(&text).map_err(|e| {
+    let cache: DedupCacheFile = serde_json::from_reader(BufReader::new(file)).map_err(|e| {
         Analysis2Error::invalid(format!("parse dedup cache {}: {e}", path.display()))
     })?;
     if cache.version != DEDUP_CACHE_VERSION {
@@ -183,6 +229,11 @@ pub fn validate_dedup_cache(
     if got.inputs != expected.inputs {
         return Err(Analysis2Error::invalid(
             "dedup cache inputs do not match current --input list",
+        ));
+    }
+    if got.input_fingerprints != expected.input_fingerprints {
+        return Err(Analysis2Error::invalid(
+            "dedup cache input file fingerprints do not match current files",
         ));
     }
     if got.chains != expected.chains || got.evm_chains != expected.evm_chains {
@@ -336,6 +387,7 @@ mod tests {
         };
         let params = DedupCacheParams {
             inputs: vec!["a.parquet".into()],
+            input_fingerprints: vec![],
             chains: vec!["ethereum".into(), "base".into()],
             evm_chains: vec!["ethereum".into(), "base".into()],
             name_threshold: Some(0.98),

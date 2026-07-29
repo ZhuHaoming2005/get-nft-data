@@ -193,11 +193,27 @@ struct MetadataSeedQuery<'a> {
     threshold: f64,
 }
 
+#[derive(Clone, Copy, Debug, Default)]
+struct MetadataQueryStats {
+    exact_pairs: u64,
+    pair_cache_hits: u64,
+    pairs_scored: u64,
+}
+
+impl MetadataQueryStats {
+    fn merge(&mut self, other: Self) {
+        self.exact_pairs += other.exact_pairs;
+        self.pair_cache_hits += other.pair_cache_hits;
+        self.pairs_scored += other.pairs_scored;
+    }
+}
+
 impl MetadataSeedQuery<'_> {
     fn edge_for_candidate(
         &self,
         candidate: ContractId,
         score_cache: &mut AHashMap<(u32, u32), Option<f64>>,
+        stats: &mut MetadataQueryStats,
     ) -> Option<HitEdge> {
         if candidate == self.seed {
             return None;
@@ -215,6 +231,7 @@ impl MetadataSeedQuery<'_> {
             candidate_anchors,
         )?;
         let score = if left_doc == right_doc {
+            stats.exact_pairs += 1;
             1.0
         } else {
             let cache_key = if left_doc <= right_doc {
@@ -223,8 +240,10 @@ impl MetadataSeedQuery<'_> {
                 (right_doc, left_doc)
             };
             if let Some(cached) = score_cache.get(&cache_key) {
+                stats.pair_cache_hits += 1;
                 (*cached)?
             } else {
+                stats.pairs_scored += 1;
                 let left = &self.index.documents[left_doc as usize];
                 let right = &self.index.documents[right_doc as usize];
                 let left_terms = self.index.document_terms(left_doc);
@@ -352,6 +371,22 @@ impl<'a> ParallelTermInterner<'a> {
     fn len(&self) -> usize {
         self.next_id.load(Ordering::Relaxed) as usize
     }
+
+    fn into_indexed_values(self) -> Result<Vec<&'a str>, Analysis2Error> {
+        let mut values = vec![None; self.len()];
+        for shard in self.shards {
+            let entries = shard
+                .into_inner()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (value, id) in entries {
+                values[id as usize] = Some(value);
+            }
+        }
+        values
+            .into_iter()
+            .map(|value| value.ok_or_else(|| Analysis2Error::invalid("metadata interner id gap")))
+            .collect()
+    }
 }
 
 struct InternedMetadataDocument {
@@ -423,6 +458,7 @@ pub fn finalize_metadata_index_with_progress(
     progress: &dyn ProgressObserver,
 ) -> Result<(), Analysis2Error> {
     const PROGRESS_BATCH: usize = 1 << 10;
+    const CATALOG_BATCH: usize = 4 * 1024;
     const TOKENIZE_BATCH: usize = 4 * 1024;
 
     let n_contracts = store.contracts.len();
@@ -431,15 +467,14 @@ pub fn finalize_metadata_index_with_progress(
         .iter()
         .map(|contract| contract.metadata_by_token.len())
         .sum();
-    // Keys borrow the already-resident anchor strings. The previous owned maps
-    // duplicated every unique canonical document and token id during finalize.
-    let mut canonical_to_doc: AHashMap<&str, u32> = AHashMap::with_capacity(anchor_count);
-    let mut canonical_documents: Vec<&str> = Vec::with_capacity(anchor_count);
+    // Sharded borrowed-string catalogs let the expensive canonical/token hash
+    // work run in parallel without duplicating the resident strings.
+    let canonical_interner = ParallelTermInterner::new();
+    let token_interner = ParallelTermInterner::new();
     // Most canonical documents occur in one contract. Store that common case
     // inline and allocate a side vector only for actual cross-contract reuse.
-    let mut doc_first_contract = Vec::<ContractId>::with_capacity(anchor_count);
+    let mut doc_first_contract = Vec::<ContractId>::new();
     let mut doc_extra_contracts = AHashMap::<u32, Vec<ContractId>>::new();
-    let mut token_keys: AHashMap<&str, u32> = AHashMap::with_capacity(anchor_count);
 
     let mut contract_anchor_offsets = Vec::with_capacity(n_contracts + 1);
     let mut contract_anchor_values = Vec::with_capacity(anchor_count);
@@ -447,73 +482,57 @@ pub fn finalize_metadata_index_with_progress(
     let mut contract_is_evm: Vec<bool> = vec![false; n_contracts];
 
     progress.begin_phase("metadata_catalog", Some(n_contracts as u64));
-    let mut pending_progress = 0_u64;
-    for (contract_index, contract) in store.contracts.iter().enumerate() {
-        if contract_index % PROGRESS_BATCH == 0 {
-            progress.check_cancelled()?;
-        }
-        let chain = store.chain_name(contract.chain_id);
-        let is_evm = store.is_evm_chain(chain);
-        contract_is_evm[contract.id as usize] = is_evm;
-        for record in &contract.metadata_by_token {
-            let canonical = record.canonical_json.as_str();
-            let document_id = if let Some(&id) = canonical_to_doc.get(canonical) {
-                id
-            } else {
-                let id = u32::try_from(canonical_documents.len())
-                    .map_err(|_| Analysis2Error::invalid("too many metadata documents for u32"))?;
-                canonical_documents.push(canonical);
-                doc_first_contract.push(contract.id);
-                canonical_to_doc.insert(canonical, id);
-                id
-            };
-            let first_contract = doc_first_contract[document_id as usize];
-            if first_contract != contract.id {
-                let contracts = doc_extra_contracts.entry(document_id).or_default();
-                if contracts.last().copied() != Some(contract.id) {
-                    // Contracts are visited in id order, so this also keeps
-                    // every document posting sorted without a later sort.
-                    contracts.push(contract.id);
+    for contract_batch in store.contracts.chunks(CATALOG_BATCH) {
+        progress.check_cancelled()?;
+        let catalog_batch = contract_batch
+            .par_iter()
+            .map(|contract| {
+                let chain = store.chain_name(contract.chain_id);
+                let is_evm = store.is_evm_chain(chain);
+                let mut anchors = Vec::with_capacity(contract.metadata_by_token.len());
+                for record in &contract.metadata_by_token {
+                    let document_id = canonical_interner.intern(&record.canonical_json)?;
+                    let token = if is_evm {
+                        normalized_evm_token_slice(&record.token_id)
+                    } else {
+                        record.token_id.as_str()
+                    };
+                    anchors.push(AnchorRef {
+                        token_key: token_interner.intern(token)?,
+                        document_id,
+                    });
+                }
+                Ok::<_, Analysis2Error>((contract.id, is_evm, anchors))
+            })
+            .collect::<Vec<_>>();
+
+        doc_first_contract.resize(canonical_interner.len(), ContractId::MAX);
+        for result in catalog_batch {
+            let (contract_id, is_evm, anchors) = result?;
+            contract_is_evm[contract_id as usize] = is_evm;
+            for anchor in &anchors {
+                let first = &mut doc_first_contract[anchor.document_id as usize];
+                if *first == ContractId::MAX {
+                    *first = contract_id;
+                } else if *first != contract_id {
+                    let contracts = doc_extra_contracts.entry(anchor.document_id).or_default();
+                    if contracts.last().copied() != Some(contract_id) {
+                        // Batches are consumed in contract-id order, preserving
+                        // sorted document postings without a later sort.
+                        contracts.push(contract_id);
+                    }
                 }
             }
-
-            let token = if is_evm {
-                // Decimal token ids only need canonical equality here. Borrowing
-                // the zero-trimmed slice avoids BigUint parse + String allocation.
-                normalized_evm_token_slice(&record.token_id)
-            } else {
-                record.token_id.as_str()
-            };
-            let token_key = if let Some(&key) = token_keys.get(token) {
-                key
-            } else {
-                let key = u32::try_from(token_keys.len())
-                    .map_err(|_| Analysis2Error::invalid("too many metadata token keys for u32"))?;
-                token_keys.insert(token, key);
-                key
-            };
-            contract_anchor_values.push(AnchorRef {
-                token_key,
-                document_id,
-            });
+            contract_anchor_values.extend(anchors);
+            contract_anchor_offsets.push(
+                u32::try_from(contract_anchor_values.len())
+                    .map_err(|_| Analysis2Error::invalid("too many metadata anchors for u32"))?,
+            );
         }
-        contract_anchor_offsets.push(
-            u32::try_from(contract_anchor_values.len())
-                .map_err(|_| Analysis2Error::invalid("too many metadata anchors for u32"))?,
-        );
-        pending_progress += 1;
-        if pending_progress as usize == PROGRESS_BATCH {
-            progress.add_completed(pending_progress);
-            pending_progress = 0;
-        }
+        progress.add_completed(contract_batch.len() as u64);
     }
-    if pending_progress > 0 {
-        progress.add_completed(pending_progress);
-    }
-
-    // Release maps that borrow store fields before assigning the finished index.
-    drop(canonical_to_doc);
-    drop(token_keys);
+    drop(token_interner);
+    let canonical_documents = canonical_interner.into_indexed_values()?;
 
     // Tokenize a bounded parallel batch, immediately intern and compact it,
     // then release its borrowed/raw term vectors. Keeping raw tokenization for
@@ -552,6 +571,13 @@ pub fn finalize_metadata_index_with_progress(
     drop(canonical_documents);
     store.clear_metadata_anchors();
 
+    let shared_documents = doc_extra_contracts.len();
+    let extra_contract_refs = doc_extra_contracts.values().map(Vec::len).sum::<usize>();
+    let total_postings = document_frequency
+        .iter()
+        .map(|&frequency| u64::from(frequency))
+        .sum::<u64>();
+    let max_document_frequency = document_frequency.iter().copied().max().unwrap_or(0);
     progress.begin_phase("metadata_postings", Some(documents.len() as u64));
     let term_postings = build_term_postings(
         &documents,
@@ -560,6 +586,17 @@ pub fn finalize_metadata_index_with_progress(
         progress,
         PROGRESS_BATCH,
     )?;
+    eprintln!(
+        "metadata/index: contracts={} anchors={} documents={} shared_documents={} extra_contract_refs={} terms={} postings={} max_df={}",
+        n_contracts,
+        anchor_count,
+        documents.len(),
+        shared_documents,
+        extra_contract_refs,
+        document_frequency.len(),
+        total_postings,
+        max_document_frequency,
+    );
 
     store.metadata_index = MetadataIndex {
         documents,
@@ -719,31 +756,53 @@ pub fn query_metadata_for_seed_with_scratch(
                 progress.check_cancelled()?;
                 let mut edges = Vec::new();
                 let mut local_cache = AHashMap::with_capacity(candidates.len());
+                let mut stats = MetadataQueryStats::default();
                 for &candidate in candidates {
-                    if let Some(edge) = query.edge_for_candidate(candidate, &mut local_cache) {
+                    if let Some(edge) =
+                        query.edge_for_candidate(candidate, &mut local_cache, &mut stats)
+                    {
                         edges.push(edge);
                     }
                 }
                 progress.add_completed(candidates.len() as u64);
-                Ok::<_, Analysis2Error>(edges)
+                Ok::<_, Analysis2Error>((edges, stats))
             })
             .collect::<Vec<_>>();
         // Indexed chunks are collected in candidate order, preserving stable
         // edge order across thread counts.
+        let mut stats = MetadataQueryStats::default();
+        let mut emitted = 0_u64;
         for chunk in chunks {
-            for edge in chunk? {
+            let (edges, chunk_stats) = chunk?;
+            stats.merge(chunk_stats);
+            emitted += edges.len() as u64;
+            for edge in edges {
                 graph.push(edge);
             }
         }
+        eprintln!(
+            "metadata/query: seed={} candidates={} exact_pairs={} pair_cache_hits={} pairs_scored={} emitted={}",
+            seed,
+            scratch.output.len(),
+            stats.exact_pairs,
+            stats.pair_cache_hits,
+            stats.pairs_scored,
+            emitted,
+        );
         return Ok(());
     }
 
+    let mut stats = MetadataQueryStats::default();
+    let mut emitted = 0_u64;
     for (position, &candidate) in scratch.output.iter().enumerate() {
         if position % 256 == 0 {
             progress.check_cancelled()?;
         }
-        if let Some(edge) = query.edge_for_candidate(candidate, &mut scratch.score_cache) {
+        if let Some(edge) =
+            query.edge_for_candidate(candidate, &mut scratch.score_cache, &mut stats)
+        {
             graph.push(edge);
+            emitted += 1;
         }
         if position % 256 == 255 {
             progress.add_completed(256);
@@ -753,6 +812,15 @@ pub fn query_metadata_for_seed_with_scratch(
     if remainder > 0 {
         progress.add_completed(remainder as u64);
     }
+    eprintln!(
+        "metadata/query: seed={} candidates={} exact_pairs={} pair_cache_hits={} pairs_scored={} emitted={}",
+        seed,
+        scratch.output.len(),
+        stats.exact_pairs,
+        stats.pair_cache_hits,
+        stats.pairs_scored,
+        emitted,
+    );
     Ok(())
 }
 

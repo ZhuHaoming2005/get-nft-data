@@ -8,6 +8,7 @@ use parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use rayon::prelude::*;
 use std::borrow::Cow;
 use std::fs::File;
+use std::ops::Range;
 use std::path::Path;
 
 use crate::Analysis2Error;
@@ -29,36 +30,57 @@ pub fn scan_pass1(
     merge_shards_ordered(shard_results, options)
 }
 
-fn scan_file_pass1(
-    input: &ValidatedInput,
-    options: &LoadOptions,
-    progress: &dyn ProgressObserver,
-) -> Result<ResidentStore, Analysis2Error> {
-    let mut row_start = 0_u64;
-    let mut row_groups = Vec::with_capacity(input.row_group_count);
+#[derive(Clone, Debug)]
+pub(crate) struct RowGroupChunk {
+    pub(crate) row_groups: Range<usize>,
+    pub(crate) row_start: u64,
+}
+
+/// Split a file into a bounded number of contiguous row-group tasks. Keeping
+/// several row groups on one reader amortizes file open/reader construction
+/// without reducing parallelism on the default large-file workload.
+pub(crate) fn row_group_chunks(input: &ValidatedInput) -> Vec<RowGroupChunk> {
+    if input.row_group_count == 0 {
+        return Vec::new();
+    }
+    let target_tasks = rayon::current_num_threads().saturating_mul(2).max(1);
+    let groups_per_task = input.row_group_count.div_ceil(target_tasks).max(1);
+    let mut row_starts = Vec::with_capacity(input.row_group_count + 1);
+    row_starts.push(0_u64);
     for row_group in 0..input.row_group_count {
-        row_groups.push((row_group, row_start));
         let rows = input
             .metadata
             .metadata()
             .row_group(row_group)
             .num_rows()
             .max(0) as u64;
-        row_start = row_start.saturating_add(rows);
+        row_starts.push(row_starts.last().copied().unwrap_or(0).saturating_add(rows));
     }
-    let row_group_results: Vec<Result<ResidentStore, Analysis2Error>> = row_groups
-        .par_iter()
-        .map(|&(row_group, row_start)| {
-            scan_row_group_pass1(input, row_group, row_start, options, progress)
+    (0..input.row_group_count)
+        .step_by(groups_per_task)
+        .map(|start| RowGroupChunk {
+            row_groups: start..(start + groups_per_task).min(input.row_group_count),
+            row_start: row_starts[start],
         })
-        .collect();
-    merge_shards_ordered(row_group_results, options)
+        .collect()
 }
 
-fn scan_row_group_pass1(
+fn scan_file_pass1(
     input: &ValidatedInput,
-    row_group: usize,
-    row_start: u64,
+    options: &LoadOptions,
+    progress: &dyn ProgressObserver,
+) -> Result<ResidentStore, Analysis2Error> {
+    let chunks = row_group_chunks(input);
+    let chunk_results: Vec<Result<ResidentStore, Analysis2Error>> = chunks
+        .par_iter()
+        .map(|chunk| scan_row_group_chunk_pass1(input, chunk, options, progress))
+        .collect();
+    merge_shards_ordered(chunk_results, options)
+}
+
+fn scan_row_group_chunk_pass1(
+    input: &ValidatedInput,
+    chunk: &RowGroupChunk,
     options: &LoadOptions,
     progress: &dyn ProgressObserver,
 ) -> Result<ResidentStore, Analysis2Error> {
@@ -76,7 +98,7 @@ fn scan_row_group_pass1(
     );
     let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, input.metadata.clone())
         .with_projection(mask)
-        .with_row_groups(vec![row_group])
+        .with_row_groups(chunk.row_groups.clone().collect())
         .with_batch_size(8 * 1024)
         .build()
         .map_err(|error| Analysis2Error::parquet(format!("{}: {error}", input.path.display())))?;
@@ -90,7 +112,7 @@ fn scan_row_group_pass1(
         for row_index in 0..batch.num_rows() {
             let source_order = SourceOrder {
                 file_ordinal: input.file_ordinal,
-                file_row_number: row_start + row_offset,
+                file_row_number: chunk.row_start + row_offset,
             };
             row_offset += 1;
             let chain = normalized_chain(columns.value_at(0, row_index));
@@ -98,6 +120,27 @@ fn scan_row_group_pass1(
                 && !options.allowed_chains.contains(chain.as_ref())
             {
                 continue;
+            }
+            let contract_address = columns.value_at(1, row_index).trim();
+            if let Some(filter) = &options.identity_contract_filter {
+                let address = if options.evm_chains.contains(chain.as_ref()) {
+                    if contract_address
+                        .bytes()
+                        .any(|byte| byte.is_ascii_uppercase())
+                    {
+                        Cow::Owned(contract_address.to_ascii_lowercase())
+                    } else {
+                        Cow::Borrowed(contract_address)
+                    }
+                } else {
+                    Cow::Borrowed(contract_address)
+                };
+                if !filter
+                    .get(chain.as_ref())
+                    .is_some_and(|contracts| contracts.contains(address.as_ref()))
+                {
+                    continue;
+                }
             }
             // Cache replay only needs identity. Avoid decoding and interning the
             // large Name/URI columns that dedup queries would consume.
@@ -112,7 +155,7 @@ fn scan_row_group_pass1(
             };
             shard.ingest_identity_strs(
                 chain.as_ref(),
-                columns.value_at(1, row_index).trim(),
+                contract_address,
                 columns.value_at(2, row_index).trim(),
                 dedup_values.0,
                 dedup_values.1,

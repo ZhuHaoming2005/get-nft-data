@@ -17,9 +17,10 @@ pub use aggregate::{
     matrix_secondary_chains,
 };
 pub use dedup_cache::{
-    CachedHitEdge, CachedSeedHits, DEDUP_CACHE_VERSION, DEFAULT_DEDUP_CACHE_FILE, DedupCacheFile,
-    DedupCacheParams, build_dedup_cache, default_dedup_cache_path, load_dedup_cache,
-    rematerialize_dedup_batch, validate_dedup_cache, write_dedup_cache,
+    CachedChainTotals, CachedDatasetStats, CachedHitEdge, CachedSeedHits, DEDUP_CACHE_VERSION,
+    DEFAULT_DEDUP_CACHE_FILE, DedupCacheFile, DedupCacheParams, InputFileFingerprint,
+    build_dedup_cache, default_dedup_cache_path, load_dedup_cache, rematerialize_dedup_batch,
+    validate_dedup_cache, write_dedup_cache,
 };
 pub use evidence_cache::{
     DEFAULT_EVIDENCE_CACHE_BATCH, DEFAULT_EVIDENCE_CACHE_FILE, EVIDENCE_CACHE_VERSION,

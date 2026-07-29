@@ -7,7 +7,7 @@ mod pass1;
 mod pass2;
 mod validate;
 
-use ahash::AHashSet;
+use ahash::{AHashMap, AHashSet};
 use std::path::PathBuf;
 
 use crate::Analysis2Error;
@@ -33,6 +33,9 @@ pub struct LoadOptions {
     pub build_dedup_indexes: bool,
     /// When false, skip the Name index while retaining URI and Metadata indexes.
     pub build_name_index: bool,
+    /// Optional cache-replay scope: retain identity rows only for these
+    /// normalized `(chain, contract)` keys while still scanning input batches.
+    pub identity_contract_filter: Option<AHashMap<String, AHashSet<String>>>,
 }
 
 impl Default for LoadOptions {
@@ -43,6 +46,7 @@ impl Default for LoadOptions {
             metadata_anchors: None,
             build_dedup_indexes: true,
             build_name_index: true,
+            identity_contract_filter: None,
         }
     }
 }
@@ -59,6 +63,7 @@ impl LoadOptions {
             metadata_anchors,
             build_dedup_indexes: true,
             build_name_index: true,
+            identity_contract_filter: None,
         }
     }
 
@@ -74,7 +79,27 @@ impl LoadOptions {
             metadata_anchors,
             build_dedup_indexes: false,
             build_name_index: false,
+            identity_contract_filter: None,
         }
+    }
+
+    pub fn retain_identity_contracts<'a>(
+        &mut self,
+        contracts: impl IntoIterator<Item = (&'a str, &'a str)>,
+    ) {
+        let mut filter = AHashMap::<String, AHashSet<String>>::new();
+        for (chain, address) in contracts {
+            let chain = pass1::normalize_chain(chain);
+            let address = if self.evm_chains.contains(&chain) {
+                address.trim().to_ascii_lowercase()
+            } else {
+                address.trim().to_owned()
+            };
+            if !chain.is_empty() && !address.is_empty() {
+                filter.entry(chain).or_default().insert(address);
+            }
+        }
+        self.identity_contract_filter = Some(filter);
     }
 }
 

@@ -42,12 +42,13 @@ pub use parquet::{
 };
 pub use progress::{EwmaEta, NoopProgress, ProgressObserver};
 pub use reporting::{
-    CachedHitEdge, CachedSeedHits, DEDUP_CACHE_VERSION, DEFAULT_DEDUP_CACHE_FILE,
-    DEFAULT_EVIDENCE_CACHE_BATCH, DEFAULT_EVIDENCE_CACHE_FILE, DETAIL_CANDIDATES_REL, DETAIL_DIR,
-    DedupCacheFile, DedupCacheParams, DedupRunParams, EVIDENCE_CACHE_VERSION, EvidenceCacheFile,
-    EvidenceCacheParams, EvidenceCacheSink, FailureRecord, INTERMEDIATE_DIR, SCOPE_ALL_CHAINS,
-    SCOPE_CHAIN_MATRIX, SCOPE_CROSS_CHAIN, SCOPE_INTRA_CHAIN, SUMMARY_DIR, ScopeAnalysisSets,
-    ScopeNftCounts, SeedDedupReport, SeedFullReport, SeedRecord, build_all_chains_duplicate_scale,
+    CachedChainTotals, CachedDatasetStats, CachedHitEdge, CachedSeedHits, DEDUP_CACHE_VERSION,
+    DEFAULT_DEDUP_CACHE_FILE, DEFAULT_EVIDENCE_CACHE_BATCH, DEFAULT_EVIDENCE_CACHE_FILE,
+    DETAIL_CANDIDATES_REL, DETAIL_DIR, DedupCacheFile, DedupCacheParams, DedupRunParams,
+    EVIDENCE_CACHE_VERSION, EvidenceCacheFile, EvidenceCacheParams, EvidenceCacheSink,
+    FailureRecord, INTERMEDIATE_DIR, InputFileFingerprint, SCOPE_ALL_CHAINS, SCOPE_CHAIN_MATRIX,
+    SCOPE_CROSS_CHAIN, SCOPE_INTRA_CHAIN, SUMMARY_DIR, ScopeAnalysisSets, ScopeNftCounts,
+    SeedDedupReport, SeedFullReport, SeedRecord, build_all_chains_duplicate_scale,
     build_contract_nft_map, build_contract_nft_map_for_graphs, build_dedup_cache,
     build_evidence_cache, build_seed_analysis_rollup, build_seed_dedup_report,
     candidate_json_rel_path, count_failed_seeds, count_scope_nfts, default_dedup_cache_path,

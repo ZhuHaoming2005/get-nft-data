@@ -11,14 +11,14 @@ use analysis2_core::{
     Analysis2Error, ApiKeys, CandidateAnalysis, CandidateRegistry, ContractId,
     DEFAULT_EVIDENCE_CACHE_BATCH, DedupCacheParams, DedupRunParams, EvidenceBundle,
     EvidenceCacheSink, EvidenceStatus, FailureRecord, HitGraph, HttpLimits, INTERMEDIATE_DIR,
-    LegitSignals, LoadOptions, MetadataQueryScratch, MetadataRecord, NameQueryScratch, PaperConfig,
-    PendingDedupLoad, ProgressObserver, ResidentStore, ScopeAnalysisSets, SeedDedupReport,
-    SeedFullReport, SeedNftCacheRef, SeedNftDownloadOptions, SeedRecord, SourceOrder,
-    UriQueryScratch, analyze_candidate, build_contract_nft_map_for_graphs, build_dedup_cache,
-    build_evidence_cache, build_seed_analysis_rollup, build_seed_dedup_report, cache_fingerprint,
-    candidate_json_rel_path, default_dedup_cache_path, default_evidence_cache_path,
-    enrich_candidates_with_hook, evidence_cache_artifacts_present, evidence_cache_params,
-    finalize_legit_signals, load_dedup_cache, load_evidence_cache_resumable,
+    InputFileFingerprint, LegitSignals, LoadOptions, MetadataQueryScratch, MetadataRecord,
+    NameQueryScratch, PaperConfig, PendingDedupLoad, ProgressObserver, ResidentStore,
+    ScopeAnalysisSets, SeedDedupReport, SeedFullReport, SeedNftCacheRef, SeedNftDownloadOptions,
+    SeedRecord, SourceOrder, UriQueryScratch, analyze_candidate, build_contract_nft_map_for_graphs,
+    build_dedup_cache, build_evidence_cache, build_seed_analysis_rollup, build_seed_dedup_report,
+    cache_fingerprint, candidate_json_rel_path, default_dedup_cache_path,
+    default_evidence_cache_path, enrich_candidates_with_hook, evidence_cache_artifacts_present,
+    evidence_cache_params, finalize_legit_signals, load_dedup_cache, load_evidence_cache_resumable,
     load_resident_store_uri_ready, load_seeds_json, prepare_seed_nft_caches,
     query_metadata_for_seed_with_scratch, query_name_for_seed_with_scratch,
     query_uri_for_seed_with_scratch, refresh_cached_evm_holders, refresh_cached_prices,
@@ -726,13 +726,44 @@ fn make_dedup_cache_params(
     config: &RunConfig,
     seeds: &[SeedRecord],
     seed_nft_fingerprint: String,
-) -> DedupCacheParams {
-    DedupCacheParams {
+) -> Result<DedupCacheParams, Analysis2Error> {
+    let input_fingerprints = config
+        .inputs
+        .iter()
+        .map(|path| {
+            let metadata = std::fs::metadata(path).map_err(|error| {
+                Analysis2Error::invalid(format!("fingerprint input {}: {error}", path.display()))
+            })?;
+            let modified = metadata.modified().map_err(|error| {
+                Analysis2Error::invalid(format!(
+                    "read input modification time {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let nanos = modified
+                .duration_since(std::time::UNIX_EPOCH)
+                .map_err(|error| {
+                    Analysis2Error::invalid(format!(
+                        "input modification time predates Unix epoch {}: {error}",
+                        path.display()
+                    ))
+                })?
+                .as_nanos()
+                .min(u64::MAX as u128) as u64;
+            Ok(InputFileFingerprint {
+                path: path.display().to_string(),
+                byte_len: metadata.len(),
+                modified_unix_nanos: nanos,
+            })
+        })
+        .collect::<Result<Vec<_>, Analysis2Error>>()?;
+    Ok(DedupCacheParams {
         inputs: config
             .inputs
             .iter()
             .map(|p| p.display().to_string())
             .collect(),
+        input_fingerprints,
         chains: config.chains.clone(),
         evm_chains: config.evm_chains.clone(),
         name_threshold: config.name_threshold,
@@ -741,7 +772,7 @@ fn make_dedup_cache_params(
         seed_nft_fingerprint,
         seeds_path: config.seeds.display().to_string(),
         seeds: seeds.to_vec(),
-    }
+    })
 }
 
 fn normalized_relation_key(chain: &str, address: &str) -> (String, String) {
@@ -919,7 +950,7 @@ fn try_load_dedup_cache_preflight(
     match load_dedup_cache(cache_path) {
         Ok(cache) => {
             let expected =
-                make_dedup_cache_params(config, seeds, cache.params.seed_nft_fingerprint.clone());
+                make_dedup_cache_params(config, seeds, cache.params.seed_nft_fingerprint.clone())?;
             match validate_dedup_cache(&cache, &expected) {
                 Ok(()) => Ok(Some(cache)),
                 Err(e) => {
@@ -956,6 +987,22 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         options.build_name_index = config.name_threshold.is_some();
         options
     };
+    if let Some(cache) = &preflight_cache {
+        let identities = cache
+            .params
+            .seeds
+            .iter()
+            .map(|seed| (seed.chain.as_str(), seed.address.as_str()))
+            .chain(cache.completed.iter().flat_map(|entry| {
+                entry.edges.iter().map(|edge| {
+                    (
+                        edge.candidate_chain.as_str(),
+                        edge.candidate_address.as_str(),
+                    )
+                })
+            }));
+        options.retain_identity_contracts(identities);
+    }
     let (mut store, mut pending, mut seed_nft_caches) = load_with_seed_nft_pipeline(
         &config.inputs,
         &options,
@@ -964,7 +1011,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
         progress,
     )?;
     let seed_nft_fingerprint = cache_fingerprint(&seed_nft_caches)?;
-    let cache_params = make_dedup_cache_params(config, &seeds, seed_nft_fingerprint);
+    let cache_params = make_dedup_cache_params(config, &seeds, seed_nft_fingerprint)?;
 
     // The compressed seed snapshots are part of the cache identity. Validate
     // after the download/cache pipeline has atomically published them.
@@ -1009,6 +1056,14 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
     }
 
     let seed_batch = if let Some(cache) = dedup_cache {
+        store.restore_snapshot_totals(
+            cache.dataset.rows_loaded,
+            cache
+                .dataset
+                .chains
+                .iter()
+                .map(|totals| (totals.chain.clone(), totals.contracts, totals.nfts)),
+        )?;
         // Pass-2 metadata was not collected yet; URI memory can be released.
         let _ = pending;
         store.drop_uri_indexes();
@@ -1469,6 +1524,7 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                         .insert(analysis.contract_id, analysis);
                 }
                 if let Some(analysis) = batch.intra {
+                    let analysis = Arc::new(analysis);
                     scope_analyses
                         .intra_chain_by_chain
                         .entry(analysis.chain.to_ascii_lowercase())
@@ -1477,9 +1533,10 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                     scope_analyses.intra_chain.push(analysis);
                 }
                 if let Some(analysis) = batch.cross {
-                    scope_analyses.cross_chain.push(analysis);
+                    scope_analyses.cross_chain.push(Arc::new(analysis));
                 }
                 for (direction, analysis) in batch.matrix {
+                    let analysis = Arc::new(analysis);
                     scope_analyses
                         .cross_chain_by_primary
                         .entry(direction.0.clone())

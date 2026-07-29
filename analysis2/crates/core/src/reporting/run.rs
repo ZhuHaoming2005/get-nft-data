@@ -2,6 +2,7 @@
 
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 
 use ahash::{AHashMap, AHashSet};
 use serde::{Deserialize, Serialize};
@@ -32,11 +33,11 @@ use super::markdown;
 /// scope. Matrix entries are keyed by `(primary, secondary)`.
 #[derive(Clone, Debug, Default)]
 pub struct ScopeAnalysisSets {
-    pub intra_chain: Vec<CandidateAnalysis>,
-    pub intra_chain_by_chain: BTreeMap<String, Vec<CandidateAnalysis>>,
-    pub cross_chain: Vec<CandidateAnalysis>,
-    pub cross_chain_by_primary: BTreeMap<String, Vec<CandidateAnalysis>>,
-    pub chain_matrix: BTreeMap<(String, String), Vec<CandidateAnalysis>>,
+    pub intra_chain: Vec<Arc<CandidateAnalysis>>,
+    pub intra_chain_by_chain: BTreeMap<String, Vec<Arc<CandidateAnalysis>>>,
+    pub cross_chain: Vec<Arc<CandidateAnalysis>>,
+    pub cross_chain_by_primary: BTreeMap<String, Vec<Arc<CandidateAnalysis>>>,
+    pub chain_matrix: BTreeMap<(String, String), Vec<Arc<CandidateAnalysis>>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1788,7 +1789,8 @@ pub fn write_run_outputs(
         Some(store),
         RunSummaryScope::All,
     );
-    let intra_refs: Vec<&CandidateAnalysis> = scope_analyses.intra_chain.iter().collect();
+    let intra_refs: Vec<&CandidateAnalysis> =
+        scope_analyses.intra_chain.iter().map(Arc::as_ref).collect();
     let mut intra_summary = build_run_summary_for_scope_with_store(
         selected_seeds,
         &ok_reports,
@@ -1798,7 +1800,8 @@ pub fn write_run_outputs(
         Some(store),
         RunSummaryScope::Intra,
     );
-    let cross_refs: Vec<&CandidateAnalysis> = scope_analyses.cross_chain.iter().collect();
+    let cross_refs: Vec<&CandidateAnalysis> =
+        scope_analyses.cross_chain.iter().map(Arc::as_ref).collect();
     let mut cross_summary = build_run_summary_for_scope_with_store(
         selected_seeds,
         &ok_reports,
@@ -1817,6 +1820,7 @@ pub fn write_run_outputs(
             .get(&chain_key)
             .into_iter()
             .flatten()
+            .map(Arc::as_ref)
             .collect();
         intra_chain_summaries.insert(
             chain_key.clone(),
@@ -1835,6 +1839,7 @@ pub fn write_run_outputs(
             .get(&chain_key)
             .into_iter()
             .flatten()
+            .map(Arc::as_ref)
             .collect();
         cross_primary_summaries.insert(
             chain_key,
@@ -1869,6 +1874,7 @@ pub fn write_run_outputs(
                 .get(&direction)
                 .into_iter()
                 .flatten()
+                .map(Arc::as_ref)
                 .collect();
             matrix_summaries.insert(
                 direction,

@@ -13,7 +13,9 @@ use crate::entity::{
 };
 use crate::parquet::LoadOptions;
 use crate::parquet::metadata::validated_metadata;
-use crate::parquet::pass1::{ProjectedUtf8Columns, normalized_chain};
+use crate::parquet::pass1::{
+    ProjectedUtf8Columns, RowGroupChunk, normalized_chain, row_group_chunks,
+};
 use crate::parquet::validate::{PASS2_COLUMNS, ValidatedInput};
 use crate::progress::ProgressObserver;
 
@@ -21,6 +23,30 @@ use crate::progress::ProgressObserver;
 #[derive(Default)]
 struct ShardAnchors {
     by_chain: AHashMap<String, AHashMap<String, Vec<MetadataRecord>>>,
+    stats: Pass2Stats,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct Pass2Stats {
+    rows: u64,
+    chain_rejected: u64,
+    structural_rejected: u64,
+    metadata_rejected: u64,
+    selection_rejected: u64,
+    json_parsed: u64,
+    json_valid: u64,
+}
+
+impl Pass2Stats {
+    fn merge(&mut self, other: Self) {
+        self.rows += other.rows;
+        self.chain_rejected += other.chain_rejected;
+        self.structural_rejected += other.structural_rejected;
+        self.metadata_rejected += other.metadata_rejected;
+        self.selection_rejected += other.selection_rejected;
+        self.json_parsed += other.json_parsed;
+        self.json_valid += other.json_valid;
+    }
 }
 
 /// Exact subset needed by the seed-scoped metadata alignment algorithm.
@@ -209,11 +235,12 @@ impl ShardAnchors {
 
     fn merge_ordered(
         &mut self,
-        other: Self,
+        mut other: Self,
         options: &LoadOptions,
         selection: Option<&MetadataQuerySelection<'_>>,
     ) {
-        for (chain, contracts) in other.by_chain {
+        self.stats.merge(other.stats);
+        for (chain, contracts) in other.by_chain.drain() {
             for (contract_address, records) in contracts {
                 for record in records {
                     self.insert(
@@ -296,6 +323,23 @@ pub fn collect_pass2_anchors(
     if let Some(selection) = selection {
         shard.prune_to_alignment_anchors(options, selection);
     }
+    let retained = shard
+        .by_chain
+        .values()
+        .flat_map(|contracts| contracts.values())
+        .map(Vec::len)
+        .sum::<usize>();
+    eprintln!(
+        "metadata/pass2: rows={} chain_rejected={} structural_rejected={} metadata_rejected={} selection_rejected={} json_parsed={} json_valid={} retained={}",
+        shard.stats.rows,
+        shard.stats.chain_rejected,
+        shard.stats.structural_rejected,
+        shard.stats.metadata_rejected,
+        shard.stats.selection_rejected,
+        shard.stats.json_parsed,
+        shard.stats.json_valid,
+        retained,
+    );
     Ok(CollectedPass2Anchors {
         by_chain: shard.by_chain,
     })
@@ -320,28 +364,15 @@ fn scan_file_pass2(
     progress: &dyn ProgressObserver,
     selection: Option<&MetadataQuerySelection<'_>>,
 ) -> Result<ShardAnchors, Analysis2Error> {
-    let mut row_start = 0_u64;
-    let mut row_groups = Vec::with_capacity(input.row_group_count);
-    for row_group in 0..input.row_group_count {
-        row_groups.push((row_group, row_start));
-        let rows = input
-            .metadata
-            .metadata()
-            .row_group(row_group)
-            .num_rows()
-            .max(0) as u64;
-        row_start = row_start.saturating_add(rows);
-    }
+    let chunks = row_group_chunks(input);
 
-    // Parse independent row groups in parallel, then merge in row-group order so
-    // duplicate token ids still keep the first valid source row.
-    let row_group_results: Vec<Result<ShardAnchors, Analysis2Error>> = row_groups
+    // Parse contiguous row-group chunks in parallel, then merge in source order
+    // so duplicate token ids still keep the first valid source row.
+    let chunk_results: Vec<Result<ShardAnchors, Analysis2Error>> = chunks
         .par_iter()
-        .map(|&(row_group, row_start)| {
-            scan_row_group_pass2(input, row_group, row_start, options, progress, selection)
-        })
+        .map(|chunk| scan_row_group_chunk_pass2(input, chunk, options, progress, selection))
         .collect();
-    merge_anchor_shards_ordered(row_group_results, options, selection)
+    merge_anchor_shards_ordered(chunk_results, options, selection)
 }
 
 fn merge_anchor_shards_ordered(
@@ -365,10 +396,9 @@ fn merge_anchor_shards_ordered(
     }
 }
 
-fn scan_row_group_pass2(
+fn scan_row_group_chunk_pass2(
     input: &ValidatedInput,
-    row_group: usize,
-    row_start: u64,
+    chunk: &RowGroupChunk,
     options: &LoadOptions,
     progress: &dyn ProgressObserver,
     selection: Option<&MetadataQuerySelection<'_>>,
@@ -382,7 +412,7 @@ fn scan_row_group_pass2(
     );
     let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, input.metadata.clone())
         .with_projection(mask)
-        .with_row_groups(vec![row_group])
+        .with_row_groups(chunk.row_groups.clone().collect())
         .with_batch_size(8 * 1024)
         .build()
         .map_err(|error| Analysis2Error::parquet(format!("{}: {error}", input.path.display())))?;
@@ -394,21 +424,24 @@ fn scan_row_group_pass2(
         })?;
         let columns = ProjectedUtf8Columns::new(&batch, &input.path, &PASS2_COLUMNS)?;
         for row_index in 0..batch.num_rows() {
+            shard.stats.rows += 1;
             let chain = normalized_chain(columns.value_at(0, row_index));
             let contract_address = columns.value_at(1, row_index).trim();
             let token_id = columns.value_at(2, row_index).trim();
             let metadata_raw = columns.value_at(3, row_index).trim();
             let source_order = SourceOrder {
                 file_ordinal: input.file_ordinal,
-                file_row_number: row_start + row_offset,
+                file_row_number: chunk.row_start + row_offset,
             };
             row_offset += 1;
             if !options.allowed_chains.is_empty()
                 && !options.allowed_chains.contains(chain.as_ref())
             {
+                shard.stats.chain_rejected += 1;
                 continue;
             }
             if chain.is_empty() || contract_address.is_empty() || token_id.is_empty() {
+                shard.stats.structural_rejected += 1;
                 continue;
             }
             // Cheap reject before full JSON parse+canonicalize.
@@ -416,6 +449,7 @@ fn scan_row_group_pass2(
                 || metadata_raw == "{}"
                 || !matches!(metadata_raw.as_bytes().first(), Some(b'{') | Some(b'['))
             {
+                shard.stats.metadata_rejected += 1;
                 continue;
             }
             if !shard.could_accept(
@@ -425,11 +459,14 @@ fn scan_row_group_pass2(
                 options,
                 selection,
             ) {
+                shard.stats.selection_rejected += 1;
                 continue;
             }
+            shard.stats.json_parsed += 1;
             let Some(canonical_json) = validated_metadata(metadata_raw) else {
                 continue;
             };
+            shard.stats.json_valid += 1;
             shard.insert(
                 chain.as_ref(),
                 contract_address,
