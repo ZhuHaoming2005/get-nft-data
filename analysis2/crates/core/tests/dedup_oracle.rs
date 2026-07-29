@@ -46,8 +46,8 @@ fn contract_id(store: &ResidentStore, chain: &str, address: &str) -> u32 {
 
 fn contract_nft_map(store: &ResidentStore) -> AHashMap<u32, Vec<u32>> {
     let mut map: AHashMap<u32, Vec<u32>> = AHashMap::new();
-    for nft in &store.nfts {
-        map.entry(nft.contract_id).or_default().push(nft.id);
+    for (nft_id, nft) in store.nfts.iter().enumerate() {
+        map.entry(nft.contract_id).or_default().push(nft_id as u32);
     }
     map
 }

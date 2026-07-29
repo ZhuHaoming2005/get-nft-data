@@ -174,7 +174,7 @@ impl ResidentStore {
         name_norm: &str,
         token_uri_norm: &str,
         image_uri_norm: &str,
-        source_order: SourceOrder,
+        _source_order: SourceOrder,
     ) -> Result<(), Analysis2Error> {
         if chain.is_empty() || contract_address.is_empty() || token_id.is_empty() {
             return Ok(());
@@ -213,13 +213,11 @@ impl ResidentStore {
         let nft_id = NftId::try_from(self.nfts.len())
             .map_err(|_| Analysis2Error::invalid("too many NFTs for NftId"))?;
         self.nfts.push(Nft {
-            id: nft_id,
             contract_id,
-            token_id: self.strings.get(token_sid).to_owned(),
+            token_id_id: token_sid,
             name_id,
             token_uri_id,
             image_uri_id,
-            source_order,
         });
         self.nft_index.insert(nft_key, nft_id);
         self.contracts[contract_id as usize].nft_count += 1;
@@ -240,7 +238,7 @@ impl ResidentStore {
         let existing_name = existing.name_id;
         let existing_token = existing.token_uri_id;
         let existing_image = existing.image_uri_id;
-        let token_id = existing.token_id.clone();
+        let token_id = self.strings.get(existing.token_id_id).to_owned();
 
         let name_id = if existing_name.is_none() {
             self.strings.intern_nonblank(name_norm)
@@ -425,6 +423,12 @@ impl ResidentStore {
         self.contract_nft_csr = build_contract_nft_csr(&self.nfts);
     }
 
+    /// Release the load/rematerialization lookup once NFT identities are final.
+    pub fn drop_nft_index(&mut self) {
+        self.nft_index.clear();
+        self.nft_index.shrink_to_fit();
+    }
+
     /// Remove all resident NFT rows for the named seed contracts before their
     /// provider-complete snapshots are streamed in. Contract ids remain stable.
     pub fn remove_seed_contract_nfts(&mut self, seeds: &[(String, String)]) {
@@ -447,13 +451,10 @@ impl ResidentStore {
         for totals in self.totals.values_mut() {
             totals.nfts = 0;
         }
-        for (index, nft) in self.nfts.iter_mut().enumerate() {
-            nft.id = index as NftId;
-            let token_sid = self
-                .strings
-                .lookup(&nft.token_id)
-                .expect("resident NFT token id must remain interned");
-            self.nft_index.insert((nft.contract_id, token_sid), nft.id);
+        for (index, nft) in self.nfts.iter().enumerate() {
+            let nft_id = index as NftId;
+            self.nft_index
+                .insert((nft.contract_id, nft.token_id_id), nft_id);
             let contract = &mut self.contracts[nft.contract_id as usize];
             contract.nft_count += 1;
             self.totals.entry(contract.chain_id).or_default().nfts += 1;
@@ -507,8 +508,12 @@ impl ResidentStore {
     /// Free Metadata BM25 index after the Metadata query stage.
     pub fn drop_metadata_index(&mut self) {
         self.metadata_index = MetadataIndex::default();
-        // Anchors on contracts are only needed for BM25 finalize/query; release
-        // the large JSON payloads before enrich/report.
+        self.clear_metadata_anchors();
+    }
+
+    /// Release canonical metadata after it has been compiled into numeric BM25
+    /// documents and anchor references.
+    pub(crate) fn clear_metadata_anchors(&mut self) {
         for contract in &mut self.contracts {
             contract.metadata_by_token.clear();
             contract.metadata_by_token.shrink_to_fit();
@@ -529,8 +534,7 @@ impl ResidentStore {
 
         self.nfts.clear();
         self.nfts.shrink_to_fit();
-        self.nft_index.clear();
-        self.nft_index.shrink_to_fit();
+        self.drop_nft_index();
         self.contract_nft_csr = CsrIndex::new();
         // Address text lives on `Contract.address`; string pool is only for
         // interned NFT/URI/name keys and contract_index lookups.
@@ -620,7 +624,8 @@ impl ResidentStore {
             let name_id = nft.name_id.map(|id| string_map[id as usize]);
             let token_uri_id = nft.token_uri_id.map(|id| string_map[id as usize]);
             let image_uri_id = nft.image_uri_id.map(|id| string_map[id as usize]);
-            let token_sid = self.strings.intern(&nft.token_id);
+            let token_sid = string_map[nft.token_id_id as usize];
+            let token_id = self.strings.get(token_sid).to_owned();
             let nft_key = (contract_id, token_sid);
             if let Some(&existing_id) = self.nft_index.get(&nft_key) {
                 let existing = &mut self.nfts[existing_id as usize];
@@ -632,27 +637,25 @@ impl ResidentStore {
                     token_uri_id,
                     "token_uri_norm",
                     contract_id,
-                    &nft.token_id,
+                    &token_id,
                 )?;
                 existing.image_uri_id = merge_mapped_uri(
                     existing.image_uri_id,
                     image_uri_id,
                     "image_uri_norm",
                     contract_id,
-                    &nft.token_id,
+                    &token_id,
                 )?;
                 continue;
             }
             let nft_id = NftId::try_from(self.nfts.len())
                 .map_err(|_| Analysis2Error::invalid("too many NFTs for NftId"))?;
             self.nfts.push(Nft {
-                id: nft_id,
                 contract_id,
-                token_id: nft.token_id.clone(),
+                token_id_id: token_sid,
                 name_id,
                 token_uri_id,
                 image_uri_id,
-                source_order: nft.source_order,
             });
             self.nft_index.insert(nft_key, nft_id);
             let chain_id = self.contracts[contract_id as usize].chain_id;
@@ -700,14 +703,15 @@ fn build_uri_chain_index(
 ) -> UriChainIndex {
     let mut triples: Vec<(u32, u16, u32)> = nfts
         .par_iter()
-        .filter_map(|nft| {
+        .enumerate()
+        .filter_map(|(nft_id, nft)| {
             let uri = if token_dimension {
                 nft.token_uri_id
             } else {
                 nft.image_uri_id
             }?;
             let chain = contracts.get(nft.contract_id as usize)?.chain_id;
-            Some((uri, chain, nft.id))
+            Some((uri, chain, nft_id as NftId))
         })
         .collect();
     triples.par_sort_unstable();
@@ -717,7 +721,8 @@ fn build_uri_chain_index(
 fn build_contract_nft_csr(nfts: &[Nft]) -> CsrIndex {
     let mut pairs: Vec<(u32, u32)> = nfts
         .par_iter()
-        .map(|nft| (nft.contract_id, nft.id))
+        .enumerate()
+        .map(|(nft_id, nft)| (nft.contract_id, nft_id as NftId))
         .collect();
     pairs.par_sort_unstable();
     CsrIndex::from_sorted_pairs(&pairs)

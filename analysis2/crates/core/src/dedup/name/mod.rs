@@ -175,12 +175,13 @@ pub(crate) fn finalize_name_index_with_progress(
     let mut nft_pairs: Vec<(u32, u32)> = store
         .nfts
         .par_iter()
-        .filter_map(|nft| {
+        .enumerate()
+        .filter_map(|(nft_id, nft)| {
             let name_id = nft.name_id?;
             let contract = &store.contracts[nft.contract_id as usize];
             let chain = store.chain_name(contract.chain_id);
             (!store.is_evm_chain(chain) && usable(store.string(name_id)))
-                .then_some((name_id, nft.id))
+                .then_some((name_id, nft_id as u32))
         })
         .collect();
     nft_pairs.par_sort_unstable();
@@ -787,8 +788,10 @@ mod tests {
 
     fn nft_map(store: &ResidentStore) -> AHashMap<ContractId, Vec<NftId>> {
         let mut map: AHashMap<ContractId, Vec<NftId>> = AHashMap::new();
-        for nft in &store.nfts {
-            map.entry(nft.contract_id).or_default().push(nft.id);
+        for (nft_id, nft) in store.nfts.iter().enumerate() {
+            map.entry(nft.contract_id)
+                .or_default()
+                .push(nft_id as NftId);
         }
         map
     }

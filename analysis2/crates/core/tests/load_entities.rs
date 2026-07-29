@@ -123,31 +123,22 @@ fn load_entities_totals_uri_csr_and_descending_anchors() {
     // Per-NFT names stored for later name finalize
     assert!(store.nfts.iter().all(|n| n.name_id.is_some()));
 
-    // EVM contract 0xaaa anchors: tokens 1,2,10 with k=2 → descending [10, 2]
+    // Raw anchors are released once the equivalent compact metadata index is
+    // finalized; the metadata unit tests verify their descending selection.
     let aaa = store
         .contracts
         .iter()
         .find(|c| c.address == "0xaaa")
         .expect("0xaaa");
-    let aaa_tokens: Vec<&str> = aaa
-        .metadata_by_token
-        .iter()
-        .map(|r| r.token_id.as_str())
-        .collect();
-    assert_eq!(aaa_tokens, ["10", "2"]);
+    assert!(aaa.metadata_by_token.is_empty());
 
-    // Solana collection: mint_a, mint_z with k=2 → lex descending [mint_z, mint_a]
     let coll = store
         .contracts
         .iter()
         .find(|c| c.address == "collxyz")
         .expect("solana collection");
-    let sol_tokens: Vec<&str> = coll
-        .metadata_by_token
-        .iter()
-        .map(|r| r.token_id.as_str())
-        .collect();
-    assert_eq!(sol_tokens, ["mint_z", "mint_a"]);
+    assert!(coll.metadata_by_token.is_empty());
+    assert!(!store.metadata_index.is_empty());
 }
 
 #[test]
@@ -169,13 +160,8 @@ fn load_options_mixed_case_evm_chains_use_bigint_descending_anchors() {
         .iter()
         .find(|c| c.address == "0xaaa")
         .expect("0xaaa");
-    let aaa_tokens: Vec<&str> = aaa
-        .metadata_by_token
-        .iter()
-        .map(|r| r.token_id.as_str())
-        .collect();
-    // Bigint descending (not lex): 10 > 2 > 1 → k=2 keeps [10, 2].
-    assert_eq!(aaa_tokens, ["10", "2"]);
+    assert!(aaa.metadata_by_token.is_empty());
+    assert!(!store.metadata_index.is_empty());
 }
 
 #[test]

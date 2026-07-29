@@ -485,8 +485,10 @@ mod tests {
 
     fn nft_map(store: &ResidentStore) -> AHashMap<ContractId, Vec<NftId>> {
         let mut map: AHashMap<ContractId, Vec<NftId>> = AHashMap::new();
-        for nft in &store.nfts {
-            map.entry(nft.contract_id).or_default().push(nft.id);
+        for (nft_id, nft) in store.nfts.iter().enumerate() {
+            map.entry(nft.contract_id)
+                .or_default()
+                .push(nft_id as NftId);
         }
         map
     }

@@ -165,7 +165,7 @@ pub fn build_seed_dedup_report(
                     .get(&rel.candidate_contract)
                     .copied()
                     .unwrap_or_default(),
-                nft_ids: rel.nft_ids.clone(),
+                nft_ids: rel.nft_ids.to_vec(),
             }
         })
         .collect();

@@ -47,13 +47,11 @@ pub struct Contract {
 /// Per-NFT identity and interned dimension values.
 #[derive(Clone, Debug)]
 pub struct Nft {
-    pub id: NftId,
     pub contract_id: ContractId,
-    pub token_id: String,
+    pub token_id_id: StringId,
     pub name_id: Option<StringId>,
     pub token_uri_id: Option<StringId>,
     pub image_uri_id: Option<StringId>,
-    pub source_order: SourceOrder,
 }
 
 /// Canonical EVM token-id string for shared-key alignment (bigint, no leading zeros).

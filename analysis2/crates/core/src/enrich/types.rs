@@ -334,14 +334,8 @@ impl EvidenceBundle {
     ///
     /// Duplicate detection is contract-level: once a candidate contract is hit
     /// in a scope, every NFT in that contract has equal standing in deep
-    /// analysis. `token_ids` remains part of the selector API because callers
-    /// use it to decide whether the contract belongs to a scope, but it must not
-    /// narrow transfers, sales, or holders inside an included contract.
-    pub fn filtered_for_analysis(
-        &self,
-        _token_ids: &ahash::AHashSet<String>,
-        seed_keys: &ahash::AHashSet<String>,
-    ) -> Self {
+    /// analysis, so only seed-relation keys are needed here.
+    pub fn filtered_for_analysis(&self, seed_keys: &ahash::AHashSet<String>) -> Self {
         let mut scoped = self.clone();
         scoped
             .relation_legit
@@ -620,10 +614,8 @@ mod tests {
             .relation_legit
             .insert("base:0xother".into(), LegitSignals::default());
 
-        let filtered = bundle.filtered_for_analysis(
-            &["1".to_owned()].into_iter().collect(),
-            &["ethereum:0xseed".to_owned()].into_iter().collect(),
-        );
+        let filtered =
+            bundle.filtered_for_analysis(&["ethereum:0xseed".to_owned()].into_iter().collect());
         // A contract-level hit includes every NFT event/holder in the candidate,
         // even when only token 1 produced the original duplicate edge.
         assert_eq!(filtered.transfers.len(), 2);

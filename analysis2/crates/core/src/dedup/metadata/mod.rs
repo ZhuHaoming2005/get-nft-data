@@ -17,9 +17,10 @@ pub use bm25::{
 
 use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::dedup::hits::{Dimension, HitEdge, HitGraph};
-use crate::entity::{ChainId, ContractId, CsrIndex, ResidentStore, normalized_evm_token_slice};
+use crate::entity::{ChainId, ContractId, ResidentStore, normalized_evm_token_slice};
 use crate::error::Analysis2Error;
 use crate::progress::{NoopProgress, ProgressObserver};
 
@@ -29,6 +30,99 @@ use self::bm25::{lossless_prefix_len, visit_tokens};
 /// Default BM25 cosine threshold.
 pub const DEFAULT_METADATA_THRESHOLD: f64 = 0.6;
 const PARALLEL_METADATA_CANDIDATE_CHUNK: usize = 64;
+
+#[derive(Clone, Debug)]
+struct DenseCsr<T> {
+    offsets: Vec<u32>,
+    values: Vec<T>,
+}
+
+impl<T> Default for DenseCsr<T> {
+    fn default() -> Self {
+        Self {
+            offsets: Vec::new(),
+            values: Vec::new(),
+        }
+    }
+}
+
+impl<T> DenseCsr<T> {
+    fn from_rows(mut rows: Vec<Vec<T>>) -> Result<Self, Analysis2Error> {
+        let total = rows.iter().map(Vec::len).sum();
+        let mut offsets = Vec::with_capacity(rows.len() + 1);
+        let mut values = Vec::with_capacity(total);
+        offsets.push(0);
+        for row in &mut rows {
+            values.append(row);
+            offsets.push(
+                u32::try_from(values.len())
+                    .map_err(|_| Analysis2Error::invalid("dense CSR exceeds u32 capacity"))?,
+            );
+        }
+        Ok(Self { offsets, values })
+    }
+
+    fn values_for(&self, key: u32) -> Option<&[T]> {
+        let index = key as usize;
+        let start = *self.offsets.get(index)? as usize;
+        let end = *self.offsets.get(index + 1)? as usize;
+        self.values.get(start..end)
+    }
+
+    fn get(&self, key: usize) -> Option<&[T]> {
+        self.values_for(key as u32)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = &[T]> {
+        self.offsets
+            .windows(2)
+            .map(|pair| &self.values[pair[0] as usize..pair[1] as usize])
+    }
+}
+
+impl<T> std::ops::Index<usize> for DenseCsr<T> {
+    type Output = [T];
+
+    fn index(&self, index: usize) -> &Self::Output {
+        self.values_for(index as u32).expect("dense CSR index")
+    }
+}
+
+#[derive(Debug, Default)]
+struct DenseAtomicCsr {
+    offsets: Vec<u32>,
+    values: Vec<AtomicU32>,
+}
+
+impl Clone for DenseAtomicCsr {
+    fn clone(&self) -> Self {
+        Self {
+            offsets: self.offsets.clone(),
+            values: self
+                .values
+                .iter()
+                .map(|value| AtomicU32::new(value.load(Ordering::Relaxed)))
+                .collect(),
+        }
+    }
+}
+
+impl DenseAtomicCsr {
+    fn values_for(&self, key: u32) -> Option<&[AtomicU32]> {
+        let index = key as usize;
+        let start = *self.offsets.get(index)? as usize;
+        let end = *self.offsets.get(index + 1)? as usize;
+        self.values.get(start..end)
+    }
+
+    fn len_for(&self, key: u32) -> u32 {
+        let index = key as usize;
+        self.offsets
+            .get(index..=index + 1)
+            .map(|pair| pair[1] - pair[0])
+            .unwrap_or(0)
+    }
+}
 
 /// Reusable per-worker Metadata candidate buffers.
 #[derive(Default)]
@@ -118,14 +212,12 @@ pub struct MetadataIndex {
     documents: Vec<PreparedDocument>,
     terms: Vec<(u32, u32)>,
     /// `document_id` → contracts that hold this canonical document as an anchor.
-    doc_contracts: Vec<Vec<ContractId>>,
+    doc_contracts: DenseCsr<ContractId>,
     /// Parallel to `ResidentStore::contracts`.
-    pub(crate) contract_anchors: Vec<Vec<AnchorRef>>,
+    contract_anchors: DenseCsr<AnchorRef>,
     contract_is_evm: Vec<bool>,
-    /// Global document frequency per term id.
-    document_frequency: Vec<u32>,
     /// term_id → sorted unique document ids (full inverted index).
-    term_postings: CsrIndex,
+    term_postings: DenseAtomicCsr,
 }
 
 impl MetadataIndex {
@@ -312,6 +404,7 @@ pub fn finalize_metadata_index_with_progress(
     }
     drop(term_ids);
     drop(canonical_documents);
+    store.clear_metadata_anchors();
 
     progress.begin_phase("metadata_postings", Some(documents.len() as u64));
     let term_postings = build_term_postings(
@@ -325,10 +418,9 @@ pub fn finalize_metadata_index_with_progress(
     store.metadata_index = MetadataIndex {
         documents,
         terms,
-        doc_contracts,
-        contract_anchors,
+        doc_contracts: DenseCsr::from_rows(doc_contracts)?,
+        contract_anchors: DenseCsr::from_rows(contract_anchors)?,
         contract_is_evm,
-        document_frequency,
         term_postings,
     };
     Ok(())
@@ -340,7 +432,7 @@ fn build_term_postings(
     document_frequency: &[u32],
     progress: &dyn ProgressObserver,
     progress_batch: usize,
-) -> Result<CsrIndex, Analysis2Error> {
+) -> Result<DenseAtomicCsr, Analysis2Error> {
     let term_count = u32::try_from(document_frequency.len())
         .map_err(|_| Analysis2Error::invalid("too many BM25 terms for u32"))?;
     let mut offsets = Vec::with_capacity(document_frequency.len() + 1);
@@ -354,11 +446,37 @@ fn build_term_postings(
         );
     }
 
-    // Fill the final u32 buffer directly. The former parallel path first
-    // allocated an equally large Vec<AtomicU32> and then allocated Vec<u32>
-    // during conversion, briefly doubling the complete postings payload.
-    let mut values = vec![0_u32; total as usize];
-    let mut cursors = offsets[..document_frequency.len()].to_vec();
+    let cursors = offsets[..document_frequency.len()]
+        .iter()
+        .map(|&offset| AtomicU32::new(offset))
+        .collect::<Vec<_>>();
+    // Atomic values remain the final index storage, so parallel construction
+    // needs no equally large conversion buffer.
+    let values = (0..total).map(|_| AtomicU32::new(0)).collect::<Vec<_>>();
+    if documents.len() >= progress_batch && rayon::current_num_threads() > 1 {
+        documents
+            .par_chunks(progress_batch)
+            .enumerate()
+            .try_for_each(|(chunk_index, chunk)| {
+                progress.check_cancelled()?;
+                let document_start = chunk_index * progress_batch;
+                for (offset, document) in chunk.iter().enumerate() {
+                    let document_id = u32::try_from(document_start + offset).map_err(|_| {
+                        Analysis2Error::invalid("too many metadata documents for u32")
+                    })?;
+                    for &(term, _) in document.terms(terms) {
+                        let position =
+                            cursors[term as usize].fetch_add(1, Ordering::Relaxed) as usize;
+                        values[position].store(document_id, Ordering::Relaxed);
+                    }
+                }
+                progress.add_completed(chunk.len() as u64);
+                Ok::<_, Analysis2Error>(())
+            })?;
+        debug_assert_eq!(offsets.len(), term_count as usize + 1);
+        return Ok(DenseAtomicCsr { offsets, values });
+    }
+
     let mut pending_progress = 0_u64;
     for (document_id, document) in documents.iter().enumerate() {
         if document_id % progress_batch == 0 {
@@ -367,9 +485,8 @@ fn build_term_postings(
         let document_id = u32::try_from(document_id)
             .map_err(|_| Analysis2Error::invalid("too many metadata documents for u32"))?;
         for &(term, _) in document.terms(terms) {
-            let cursor = &mut cursors[term as usize];
-            values[*cursor as usize] = document_id;
-            *cursor += 1;
+            let position = cursors[term as usize].fetch_add(1, Ordering::Relaxed) as usize;
+            values[position].store(document_id, Ordering::Relaxed);
         }
         pending_progress += 1;
         if pending_progress as usize == progress_batch {
@@ -381,11 +498,8 @@ fn build_term_postings(
         progress.add_completed(pending_progress);
     }
 
-    Ok(CsrIndex {
-        keys: (0..term_count).collect(),
-        offsets,
-        values,
-    })
+    debug_assert_eq!(offsets.len(), term_count as usize + 1);
+    Ok(DenseAtomicCsr { offsets, values })
 }
 
 /// Query Metadata for `seed` against the finalized index; emit whole-contract edges.
@@ -423,11 +537,7 @@ pub fn query_metadata_for_seed_with_scratch(
     if index.is_empty() {
         return Ok(());
     }
-    let seed_anchors = index
-        .contract_anchors
-        .get(seed_usize)
-        .map(Vec::as_slice)
-        .unwrap_or(&[]);
+    let seed_anchors = index.contract_anchors.get(seed_usize).unwrap_or(&[]);
     if seed_anchors.is_empty() {
         return Ok(());
     }
@@ -506,7 +616,7 @@ fn collect_candidates(
 
     // Exact document reuse is always a candidate (byte-identical canonical JSON).
     for &document_id in &scratch.seed_documents {
-        if let Some(contracts) = index.doc_contracts.get(document_id as usize) {
+        if let Some(contracts) = index.doc_contracts.values_for(document_id) {
             for &contract_id in contracts {
                 if contract_id != seed {
                     scratch.candidates.insert(contract_id);
@@ -543,11 +653,7 @@ fn collect_candidates(
         scratch
             .ordered_terms
             .extend(doc_terms.iter().map(|&(term, frequency)| {
-                let df = index
-                    .document_frequency
-                    .get(term as usize)
-                    .copied()
-                    .unwrap_or(0);
+                let df = index.term_postings.len_for(term);
                 (df, term, frequency)
             }));
         scratch.ordered_terms.sort_unstable();
@@ -561,8 +667,9 @@ fn collect_candidates(
         let prefix_len = lossless_prefix_len(&scratch.frequencies, threshold);
         for &(_, term, _) in scratch.ordered_terms.iter().take(prefix_len) {
             if let Some(docs) = index.term_postings.values_for(term) {
-                for &document_id in docs {
-                    if let Some(contracts) = index.doc_contracts.get(document_id as usize) {
+                for document_id in docs {
+                    let document_id = document_id.load(Ordering::Relaxed);
+                    if let Some(contracts) = index.doc_contracts.values_for(document_id) {
                         for &contract_id in contracts {
                             if contract_id != seed {
                                 scratch.candidates.insert(contract_id);
@@ -650,8 +757,8 @@ mod tests {
 
     fn nft_map(store: &ResidentStore) -> AHashMap<ContractId, Vec<crate::entity::NftId>> {
         let mut map: AHashMap<ContractId, Vec<_>> = AHashMap::new();
-        for nft in &store.nfts {
-            map.entry(nft.contract_id).or_default().push(nft.id);
+        for (nft_id, nft) in store.nfts.iter().enumerate() {
+            map.entry(nft.contract_id).or_default().push(nft_id as u32);
         }
         map
     }
@@ -692,14 +799,15 @@ mod tests {
                 ("ethereum", "0xa", "10", r#"{"name":"t10"}"#, 3),
             ],
         );
-        let tokens: Vec<&str> = store.contracts[0]
-            .metadata_by_token
-            .iter()
-            .map(|r| r.token_id.as_str())
-            .collect();
-        assert_eq!(tokens, ["10", "2"]);
         let refs = &store.metadata_index.contract_anchors[0];
         assert_eq!(refs.len(), 2);
+        assert_eq!(
+            refs.iter()
+                .map(|anchor| anchor.document_id)
+                .collect::<Vec<_>>(),
+            [0, 1]
+        );
+        assert!(store.contracts[0].metadata_by_token.is_empty());
     }
 
     #[test]

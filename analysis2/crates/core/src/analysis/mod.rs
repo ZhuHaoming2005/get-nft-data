@@ -1201,7 +1201,7 @@ mod tests {
 
         for key in [legit_key, suspicious_key] {
             let keys = ahash::AHashSet::from([key.clone()]);
-            let scoped = evidence.filtered_for_analysis(&ahash::AHashSet::new(), &keys);
+            let scoped = evidence.filtered_for_analysis(&keys);
             let expected = analyze_candidate(&store, contract, &scoped, &config).unwrap();
             let signals = scoped.relation_legit.clone();
             let projected = base.project_relation_signals(&signals);

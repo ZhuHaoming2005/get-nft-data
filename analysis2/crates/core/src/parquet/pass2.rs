@@ -45,7 +45,9 @@ impl<'a> MetadataQuerySelection<'a> {
             if store.is_evm_chain(chain) {
                 let mut seed_token_ids = AHashSet::new();
                 for &nft in store.nfts_for_contract(seed) {
-                    let token = normalized_evm_token_slice(&store.nfts[nft as usize].token_id);
+                    let token = normalized_evm_token_slice(
+                        store.string(store.nfts[nft as usize].token_id_id),
+                    );
                     evm_seed_token_ids.insert(token);
                     seed_token_ids.insert(token);
                 }

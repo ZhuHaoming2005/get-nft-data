@@ -1,6 +1,7 @@
 //! Candidate registry derived from a HitGraph.
 
 use ahash::{AHashMap, AHashSet};
+use std::sync::Arc;
 
 use crate::entity::{ContractId, NftId};
 
@@ -12,7 +13,29 @@ pub struct SeedCandidateRelation {
     pub seed_contract: ContractId,
     pub candidate_contract: ContractId,
     pub dimensions: Vec<Dimension>,
-    pub nft_ids: Vec<NftId>,
+    pub nft_ids: Arc<[NftId]>,
+}
+
+#[derive(Debug, Default)]
+enum PendingNfts {
+    #[default]
+    Explicit,
+    ExplicitSet(AHashSet<NftId>),
+    WholeContract,
+}
+
+impl PendingNfts {
+    fn insert_explicit(&mut self, nft: NftId) {
+        match self {
+            Self::Explicit => {
+                *self = Self::ExplicitSet(AHashSet::from([nft]));
+            }
+            Self::ExplicitSet(nfts) => {
+                nfts.insert(nft);
+            }
+            Self::WholeContract => {}
+        }
+    }
 }
 
 /// Unique candidates plus per-seed relations (multi-seed hits keep separate relations).
@@ -42,7 +65,7 @@ impl CandidateRegistry {
         // (seed, candidate) → (dimensions, nfts)
         let mut pair_dims: AHashMap<(ContractId, ContractId), AHashSet<Dimension>> =
             AHashMap::new();
-        let mut pair_nfts: AHashMap<(ContractId, ContractId), AHashSet<NftId>> = AHashMap::new();
+        let mut pair_nfts: AHashMap<(ContractId, ContractId), PendingNfts> = AHashMap::new();
         let mut candidates: AHashSet<ContractId> = AHashSet::new();
 
         for graph in graphs {
@@ -50,16 +73,15 @@ impl CandidateRegistry {
                 let key = (edge.seed_contract, edge.candidate_contract);
                 candidates.insert(edge.candidate_contract);
                 pair_dims.entry(key).or_default().insert(edge.dimension);
-                let nfts = pair_nfts.entry(key).or_default();
                 match edge.candidate_nft {
                     Some(nft) => {
-                        nfts.insert(nft);
+                        pair_nfts.entry(key).or_default().insert_explicit(nft);
                     }
                     None => {
-                        if let Some(contract_members) = contract_nfts.get(&edge.candidate_contract)
-                        {
-                            nfts.extend(contract_members.iter().copied());
-                        }
+                        // Keep whole-contract hits symbolic during aggregation;
+                        // expanding once per candidate avoids one large set per
+                        // seed relation and preserves the exact final id list.
+                        pair_nfts.insert(key, PendingNfts::WholeContract);
                     }
                 }
             }
@@ -73,6 +95,7 @@ impl CandidateRegistry {
 
         let mut relations = Vec::with_capacity(keys.len());
         let mut relations_by_seed: AHashMap<ContractId, Vec<usize>> = AHashMap::new();
+        let mut whole_contract_nfts: AHashMap<ContractId, Arc<[NftId]>> = AHashMap::new();
 
         for key in keys {
             let (seed_contract, candidate_contract) = key;
@@ -82,12 +105,25 @@ impl CandidateRegistry {
                 .into_iter()
                 .collect();
             dimensions.sort_by_key(|d| dimension_ord(*d));
-            let mut nft_ids: Vec<NftId> = pair_nfts
-                .remove(&key)
-                .unwrap_or_default()
-                .into_iter()
-                .collect();
-            nft_ids.sort_unstable();
+            let nft_ids = match pair_nfts.remove(&key).unwrap_or_default() {
+                PendingNfts::WholeContract => whole_contract_nfts
+                    .entry(candidate_contract)
+                    .or_insert_with(|| {
+                        let mut ids = contract_nfts
+                            .get(&candidate_contract)
+                            .cloned()
+                            .unwrap_or_default();
+                        ids.sort_unstable();
+                        Arc::from(ids)
+                    })
+                    .clone(),
+                PendingNfts::ExplicitSet(nfts) => {
+                    let mut ids: Vec<NftId> = nfts.into_iter().collect();
+                    ids.sort_unstable();
+                    Arc::from(ids)
+                }
+                PendingNfts::Explicit => Arc::from([]),
+            };
 
             let idx = relations.len();
             relations.push(SeedCandidateRelation {
@@ -231,6 +267,19 @@ mod tests {
         assert_eq!(filtered.relations().len(), 1);
         assert_eq!(filtered.relations()[0].candidate_contract, 11);
         assert_eq!(reg.relations().len(), 3);
+    }
+
+    #[test]
+    fn whole_contract_nft_ids_are_shared_across_seed_relations() {
+        let mut graph = HitGraph::new();
+        graph.push(edge(1, 10, None, Dimension::Name, 0, 1));
+        graph.push(edge(2, 10, None, Dimension::Metadata, 0, 1));
+        let contract_nfts = AHashMap::from([(10, vec![102, 100, 101])]);
+
+        let registry = CandidateRegistry::from_hit_graph(&graph, &contract_nfts);
+        let relations = registry.relations();
+        assert_eq!(&*relations[0].nft_ids, &[100, 101, 102]);
+        assert!(Arc::ptr_eq(&relations[0].nft_ids, &relations[1].nft_ids));
     }
 
     #[test]

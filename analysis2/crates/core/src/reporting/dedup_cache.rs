@@ -110,7 +110,7 @@ pub fn build_dedup_cache(
                 store
                     .nfts
                     .get(nft_id as usize)
-                    .map(|nft| nft.token_id.clone())
+                    .map(|nft| store.string(nft.token_id_id).to_owned())
             });
             edges.push(CachedHitEdge {
                 candidate_chain: store.chain_name(cand.chain_id).to_owned(),

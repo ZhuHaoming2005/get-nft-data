@@ -59,9 +59,7 @@ pub type EnrichOverride = Arc<
 
 #[derive(Clone, Debug, Default)]
 struct ScopeEvidenceSelector {
-    token_ids: AHashSet<String>,
     seed_keys: AHashSet<String>,
-    token_ids_by_seed: AHashMap<String, AHashSet<String>>,
 }
 
 impl ScopeEvidenceSelector {
@@ -84,22 +82,7 @@ impl ScopeEvidenceSelector {
     /// analysis receives every NFT event in that contract.
     #[cfg(test)]
     fn filtered_bundle(&self, bundle: &EvidenceBundle) -> EvidenceBundle {
-        let mut suspicious_token_ids = AHashSet::new();
-        for (seed_key, token_ids) in &self.token_ids_by_seed {
-            let expected_key = parse_relation_key(seed_key);
-            let is_legit = bundle
-                .relation_legit
-                .iter()
-                .find(|(key, _)| parse_relation_key(key) == expected_key)
-                .is_some_and(|(_, signals)| signals.is_legit_duplicate());
-            if !is_legit {
-                suspicious_token_ids.extend(token_ids.iter().cloned());
-            }
-        }
-        if self.token_ids_by_seed.is_empty() {
-            suspicious_token_ids.extend(self.token_ids.iter().cloned());
-        }
-        bundle.filtered_for_analysis(&suspicious_token_ids, &self.seed_keys)
+        bundle.filtered_for_analysis(&self.seed_keys)
     }
 }
 
@@ -134,51 +117,23 @@ fn build_scope_selectors(
         let primary = store.chain_name(seed.chain_id).to_ascii_lowercase();
         let secondary = store.chain_name(candidate.chain_id).to_ascii_lowercase();
         let seed_key = canonical_relation_key(&primary, &seed.address);
-        let token_ids: Vec<String> = relation
-            .nft_ids
-            .iter()
-            .filter_map(|id| store.nfts.get(*id as usize))
-            .map(|nft| nft.token_id.clone())
-            .collect();
         let candidate_selectors = selectors
             .entry(relation.candidate_contract)
             .or_insert_with(CandidateScopeSelectors::default);
-        candidate_selectors
-            .all
-            .token_ids
-            .extend(token_ids.iter().cloned());
         candidate_selectors.all.seed_keys.insert(seed_key.clone());
-        candidate_selectors
-            .all
-            .token_ids_by_seed
-            .entry(seed_key.clone())
-            .or_default()
-            .extend(token_ids.iter().cloned());
         let same_chain = primary.eq_ignore_ascii_case(&secondary);
         let scope_selector = if same_chain {
             &mut candidate_selectors.intra
         } else {
             &mut candidate_selectors.cross
         };
-        scope_selector.token_ids.extend(token_ids.iter().cloned());
         scope_selector.seed_keys.insert(seed_key.clone());
-        scope_selector
-            .token_ids_by_seed
-            .entry(seed_key.clone())
-            .or_default()
-            .extend(token_ids.iter().cloned());
         if !same_chain {
             let matrix = candidate_selectors
                 .matrix
                 .entry((primary, secondary))
                 .or_insert_with(ScopeEvidenceSelector::default);
-            matrix.token_ids.extend(token_ids.iter().cloned());
-            matrix.seed_keys.insert(seed_key.clone());
-            matrix
-                .token_ids_by_seed
-                .entry(seed_key)
-                .or_default()
-                .extend(token_ids);
+            matrix.seed_keys.insert(seed_key);
         }
     }
     selectors
@@ -577,6 +532,7 @@ fn query_seeds_staged(
     metadata_threshold: f64,
     progress: &dyn ProgressObserver,
 ) -> Result<SeedDedupBatch, Analysis2Error> {
+    store.drop_nft_index();
     progress.set_stage("dedup");
     let (mut states, failures) = resolve_seed_states(store, seeds, progress)?;
     let quiet = CancellationOnlyProgress { inner: progress };
@@ -613,6 +569,7 @@ fn query_seeds_with_staged_pass2(
     metadata_threshold: f64,
     progress: &dyn ProgressObserver,
 ) -> Result<SeedDedupBatch, Analysis2Error> {
+    store.drop_nft_index();
     progress.set_stage("dedup");
     let (mut states, failures) = resolve_seed_states(store, seeds, progress)?;
     let quiet = CancellationOnlyProgress { inner: progress };
@@ -1462,18 +1419,16 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                     analysis.project_relation_signals(&selector.relation_signals(bundle))
                 };
                 let all = project_scope(&selectors.all);
-                let mut per_seed = Vec::with_capacity(selectors.all.token_ids_by_seed.len());
-                for (seed_key, token_ids) in &selectors.all.token_ids_by_seed {
+                let mut per_seed = Vec::with_capacity(selectors.all.seed_keys.len());
+                for seed_key in &selectors.all.seed_keys {
                     let per_seed_selector = ScopeEvidenceSelector {
-                        token_ids: token_ids.clone(),
                         seed_keys: AHashSet::from([seed_key.clone()]),
-                        token_ids_by_seed: AHashMap::from([(seed_key.clone(), token_ids.clone())]),
                     };
                     per_seed.push((seed_key.clone(), project_scope(&per_seed_selector)));
                 }
-                let intra = (!selectors.intra.token_ids_by_seed.is_empty())
+                let intra = (!selectors.intra.seed_keys.is_empty())
                     .then(|| project_scope(&selectors.intra));
-                let cross = (!selectors.cross.token_ids_by_seed.is_empty())
+                let cross = (!selectors.cross.seed_keys.is_empty())
                     .then(|| project_scope(&selectors.cross));
                 let matrix = selectors
                     .matrix
@@ -1724,18 +1679,8 @@ mod tests {
         let suspicious_seed = "ethereum:0xsuspicious".to_owned();
         let mut selector = ScopeEvidenceSelector::default();
         selector
-            .token_ids
-            .extend(["legit-nft".to_owned(), "suspect-nft".to_owned()]);
-        selector
             .seed_keys
             .extend([legit_seed.clone(), suspicious_seed.clone()]);
-        selector
-            .token_ids_by_seed
-            .insert(legit_seed.clone(), AHashSet::from(["legit-nft".to_owned()]));
-        selector.token_ids_by_seed.insert(
-            suspicious_seed.clone(),
-            AHashSet::from(["suspect-nft".to_owned()]),
-        );
 
         let mut bundle = EvidenceBundle::empty(0, "base", "0xcandidate");
         bundle.relation_legit.insert(

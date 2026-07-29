@@ -23,8 +23,10 @@ fn hash_str(s: &str) -> u64 {
 #[derive(Clone, Debug, Default)]
 pub struct StringPool {
     strings: Vec<String>,
-    /// `hash(str)` → candidate string ids (verify with `strings[id] == s`).
-    by_hash: AHashMap<u64, Vec<StringId>>,
+    /// `hash(str)` → first string id (always equality-checked).
+    by_hash: AHashMap<u64, StringId>,
+    /// Exact side table used only for genuine 64-bit hash collisions.
+    collisions: AHashMap<u64, Vec<StringId>>,
 }
 
 impl StringPool {
@@ -51,8 +53,12 @@ impl StringPool {
 
     pub fn lookup(&self, s: &str) -> Option<StringId> {
         let hash = hash_str(s);
-        let candidates = self.by_hash.get(&hash)?;
-        candidates
+        let first = *self.by_hash.get(&hash)?;
+        if self.strings[first as usize] == s {
+            return Some(first);
+        }
+        self.collisions
+            .get(&hash)?
             .iter()
             .copied()
             .find(|&id| self.strings[id as usize] == s)
@@ -61,16 +67,25 @@ impl StringPool {
     /// Intern `s`, returning the existing id on duplicate.
     pub fn intern(&mut self, s: &str) -> StringId {
         let hash = hash_str(s);
-        if let Some(candidates) = self.by_hash.get(&hash) {
-            for &id in candidates {
-                if self.strings[id as usize] == s {
-                    return id;
+        if let Some(&first) = self.by_hash.get(&hash) {
+            if self.strings[first as usize] == s {
+                return first;
+            }
+            if let Some(candidates) = self.collisions.get(&hash) {
+                for &id in candidates {
+                    if self.strings[id as usize] == s {
+                        return id;
+                    }
                 }
             }
+            let id = StringId::try_from(self.strings.len()).expect("too many interned strings");
+            self.strings.push(s.to_owned());
+            self.collisions.entry(hash).or_default().push(id);
+            return id;
         }
         let id = StringId::try_from(self.strings.len()).expect("too many interned strings");
         self.strings.push(s.to_owned());
-        self.by_hash.entry(hash).or_default().push(id);
+        self.by_hash.insert(hash, id);
         id
     }
 

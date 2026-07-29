@@ -112,7 +112,11 @@ pub async fn enrich_candidates_with_hook(
             store
                 .nfts_for_contract(contract_id)
                 .iter()
-                .map(|&nft_id| store.nfts[nft_id as usize].token_id.clone())
+                .map(|&nft_id| {
+                    store
+                        .string(store.nfts[nft_id as usize].token_id_id)
+                        .to_owned()
+                })
                 .collect::<Vec<_>>()
         };
         let price_cache = price_cache.clone();

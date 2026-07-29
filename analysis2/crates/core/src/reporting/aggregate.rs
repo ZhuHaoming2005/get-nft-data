@@ -612,7 +612,7 @@ pub fn build_scope_duplicate_scale_for_chains<'a>(
     for rel in filtered {
         let cand_key = format!("{}:{}", rel.candidate_chain, rel.candidate_address);
         total_contracts.insert(cand_key.clone());
-        for &nft in rel.nft_ids {
+        for &nft in rel.nft_ids.iter() {
             total_nfts.insert(nft);
         }
 
