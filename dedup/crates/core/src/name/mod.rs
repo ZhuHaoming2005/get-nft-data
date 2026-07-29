@@ -19,7 +19,6 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 const PROGRESS_BATCH: u64 = 4096;
 const SCORE_PROGRESS_BATCH: u64 = 64;
 const SCORE_SCHEDULING_CHUNK: usize = 8;
-const DENSE_SEEN_BUDGET_BYTES: usize = 4 * 1024 * 1024 * 1024;
 type NameHits = AHashSet<NameHit>;
 
 #[derive(Default)]
@@ -635,57 +634,34 @@ fn score_resident_index(
     let score_cutoff = (threshold_pct / 100.0).clamp(0.0, 1.0);
     let args = Args::default().score_cutoff(score_cutoff);
 
-    enum CandidateSeen {
-        Dense {
-            generations: Vec<u16>,
-            generation: u16,
-        },
-        Sparse(AHashSet<u32>),
+    struct CandidateSeen {
+        generations: Vec<u16>,
+        generation: u16,
     }
 
     impl CandidateSeen {
-        fn new(name_count: usize, dense: bool) -> Self {
-            if dense {
-                Self::Dense {
-                    generations: vec![0; name_count],
-                    generation: 0,
-                }
-            } else {
-                Self::Sparse(AHashSet::new())
+        fn new(name_count: usize) -> Self {
+            Self {
+                generations: vec![0; name_count],
+                generation: 0,
             }
         }
 
         fn begin_name(&mut self) {
-            match self {
-                Self::Dense {
-                    generations,
-                    generation,
-                } => {
-                    *generation = generation.wrapping_add(1);
-                    if *generation == 0 {
-                        generations.fill(0);
-                        *generation = 1;
-                    }
-                }
-                Self::Sparse(seen) => seen.clear(),
+            self.generation = self.generation.wrapping_add(1);
+            if self.generation == 0 {
+                self.generations.fill(0);
+                self.generation = 1;
             }
         }
 
         fn insert(&mut self, candidate: u32) -> bool {
-            match self {
-                Self::Dense {
-                    generations,
-                    generation,
-                } => {
-                    let slot = &mut generations[candidate as usize];
-                    if *slot == *generation {
-                        false
-                    } else {
-                        *slot = *generation;
-                        true
-                    }
-                }
-                Self::Sparse(seen) => seen.insert(candidate),
+            let slot = &mut self.generations[candidate as usize];
+            if *slot == self.generation {
+                false
+            } else {
+                *slot = self.generation;
+                true
             }
         }
     }
@@ -697,11 +673,6 @@ fn score_resident_index(
     }
 
     let lane_count = rayon::current_num_threads().min(left_count).max(1);
-    let dense_bytes = names
-        .len()
-        .checked_mul(std::mem::size_of::<u16>())
-        .and_then(|bytes| bytes.checked_mul(lane_count));
-    let use_dense_seen = dense_bytes.is_some_and(|bytes| bytes <= DENSE_SEEN_BUDGET_BYTES);
 
     let next_left = AtomicUsize::new(0);
     let worker = (0..lane_count)
@@ -709,7 +680,7 @@ fn score_resident_index(
         .map(|_| {
             let mut worker = Worker {
                 candidates: Vec::new(),
-                seen: CandidateSeen::new(names.len(), use_dense_seen),
+                seen: CandidateSeen::new(names.len()),
                 hits: AHashSet::new(),
             };
             let mut pending = 0_u64;
@@ -805,7 +776,7 @@ fn score_resident_index(
         .reduce(
             || Worker {
                 candidates: Vec::new(),
-                seen: CandidateSeen::new(0, false),
+                seen: CandidateSeen::new(0),
                 hits: AHashSet::new(),
             },
             |mut left, mut right| {

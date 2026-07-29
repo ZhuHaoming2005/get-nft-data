@@ -16,9 +16,9 @@ pub struct RunConfig {
     pub output_dir: PathBuf,
     pub chains: Vec<String>,
     pub evm_chains: Vec<String>,
-    pub name_threshold: f64,
+    pub name_threshold: Option<f64>,
     pub metadata_threshold: f64,
-    pub metadata_anchors: usize,
+    pub metadata_anchors: Option<usize>,
     pub run_name: bool,
     pub run_uri: bool,
     pub run_metadata: bool,
@@ -38,20 +38,33 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
         .map(|c| c.trim().to_ascii_lowercase())
         .filter(|c| !c.is_empty())
         .collect::<Vec<_>>();
-    let load_options =
-        LoadOptions::new(allowed, evm_names.iter().cloned(), config.metadata_anchors);
+    let mut load_options = LoadOptions::new(
+        allowed,
+        evm_names.iter().cloned(),
+        if config.run_metadata {
+            config.metadata_anchors
+        } else {
+            Some(0)
+        },
+    );
+    load_options.load_names = config.run_name && config.name_threshold.is_some();
+    load_options.load_token_uris = config.run_uri;
+    load_options.load_image_uris = config.run_uri;
+    load_options.load_metadata = config.run_metadata;
     let stage_started = Instant::now();
-    let store = load_entities_with_options(&config.inputs, &load_options, progress)?;
+    let mut store = load_entities_with_options(&config.inputs, &load_options, progress)?;
+    let interned_strings = store.strings.len();
+    let token_uri_postings = store.token_uri_postings.len();
+    let image_uri_postings = store.image_uri_postings.len();
     let mut stage_timings = vec![StageTiming {
         stage: "load",
         elapsed_secs: stage_started.elapsed().as_secs_f64(),
     }];
 
     let mut acc = SummaryAccumulator::default();
-    let name_threshold = config.name_threshold / 100.0;
-    if config.run_name {
+    if let (true, Some(name_threshold)) = (config.run_name, config.name_threshold) {
         let stage_started = Instant::now();
-        run_name(&store, name_threshold, &mut acc, progress)?;
+        run_name(&store, name_threshold / 100.0, &mut acc, progress)?;
         stage_timings.push(StageTiming {
             stage: "name",
             elapsed_secs: stage_started.elapsed().as_secs_f64(),
@@ -81,6 +94,7 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             progress,
         )?;
     }
+    store.release_completed_dimension_data();
     let mut metadata_stats = None;
     if config.run_metadata {
         let stage_started = Instant::now();
@@ -90,7 +104,7 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             .map(|c| c.trim().to_ascii_lowercase())
             .collect();
         let result = run_metadata(
-            &store,
+            &mut store,
             &evm,
             config.metadata_anchors,
             config.metadata_threshold,
@@ -126,6 +140,9 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             name_threshold: config.name_threshold,
             metadata_threshold: config.metadata_threshold,
             metadata_anchors: config.metadata_anchors,
+            interned_strings,
+            token_uri_postings,
+            image_uri_postings,
             metadata_direct: metadata_stats,
             stage_timings,
             phase_timings,

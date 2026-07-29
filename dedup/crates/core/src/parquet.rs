@@ -23,23 +23,56 @@ pub const REQUIRED_COLUMNS: [&str; 7] = [
     "metadata_json",
 ];
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct LoadOptions {
     pub allowed_chains: AHashSet<String>,
     pub evm_chains: AHashSet<String>,
-    pub metadata_anchors: usize,
+    pub metadata_anchors: Option<usize>,
+    pub load_names: bool,
+    pub load_token_uris: bool,
+    pub load_image_uris: bool,
+    pub load_metadata: bool,
+}
+
+impl Default for LoadOptions {
+    fn default() -> Self {
+        Self {
+            allowed_chains: AHashSet::new(),
+            evm_chains: AHashSet::new(),
+            metadata_anchors: None,
+            load_names: true,
+            load_token_uris: true,
+            load_image_uris: true,
+            load_metadata: true,
+        }
+    }
 }
 
 impl LoadOptions {
     pub fn new(
         allowed_chains: impl IntoIterator<Item = String>,
         evm_chains: impl IntoIterator<Item = String>,
-        metadata_anchors: usize,
+        metadata_anchors: impl Into<Option<usize>>,
     ) -> Self {
         Self {
             allowed_chains: allowed_chains.into_iter().collect(),
             evm_chains: evm_chains.into_iter().collect(),
-            metadata_anchors,
+            metadata_anchors: metadata_anchors.into(),
+            load_names: true,
+            load_token_uris: true,
+            load_image_uris: true,
+            load_metadata: true,
+        }
+    }
+
+    fn loads_column(&self, column: usize) -> bool {
+        match column {
+            0..=2 => true,
+            3 => self.load_names,
+            4 => self.load_token_uris,
+            5 => self.load_image_uris,
+            6 => self.load_metadata,
+            _ => false,
         }
     }
 }
@@ -60,14 +93,7 @@ pub fn load_entities(
     input_files: &[PathBuf],
     progress: &dyn ProgressObserver,
 ) -> Result<EntityStore, DedupError> {
-    load_entities_with_options(
-        input_files,
-        &LoadOptions {
-            metadata_anchors: 8,
-            ..LoadOptions::default()
-        },
-        progress,
-    )
+    load_entities_with_options(input_files, &LoadOptions::default(), progress)
 }
 
 /// Validate all schemas, scan files in parallel into local shards, then merge shards in
@@ -85,7 +111,7 @@ pub fn load_entities_with_options(
     }
     progress.set_stage("load");
     progress.begin_phase("validate", Some(input_files.len() as u64));
-    let inputs = validate_inputs(input_files, progress)?;
+    let inputs = validate_inputs(input_files, options, progress)?;
     let total_rows: u64 = inputs.iter().map(|input| input.row_count).sum();
     progress.begin_phase("scan_files", Some(total_rows));
 
@@ -99,20 +125,24 @@ pub fn load_entities_with_options(
     let shard_count = shard_results.len() as u64;
     let mut store = merge_shards_ordered(shard_results, options)?;
     progress.add_completed(shard_count);
+    store.finalize_metadata_anchors();
     if !options.allowed_chains.is_empty() && store.contracts.is_empty() {
         return Err(DedupError::invalid(
             "load",
             "none of the requested --chains were present in the inputs",
         ));
     }
-    progress.begin_phase("build_uri_postings", Some(store.nfts.len() as u64));
-    store.rebuild_uri_postings();
-    progress.add_completed(store.nfts.len() as u64);
+    if options.load_token_uris || options.load_image_uris {
+        progress.begin_phase("build_uri_postings", Some(store.nfts.len() as u64));
+        store.rebuild_uri_postings();
+        progress.add_completed(store.nfts.len() as u64);
+    }
     Ok(store)
 }
 
 fn validate_inputs(
     input_files: &[PathBuf],
+    options: &LoadOptions,
     progress: &dyn ProgressObserver,
 ) -> Result<Vec<ValidatedInput>, DedupError> {
     let results: Vec<Result<ValidatedInput, DedupError>> =
@@ -135,7 +165,7 @@ fn validate_inputs(
                     })?;
                 let schema = metadata.schema();
                 let mut root_projection = Vec::with_capacity(REQUIRED_COLUMNS.len());
-                for required in REQUIRED_COLUMNS {
+                for (column, required) in REQUIRED_COLUMNS.into_iter().enumerate() {
                     let Some((index, field)) = schema
                         .fields()
                         .iter()
@@ -156,7 +186,9 @@ fn validate_inputs(
                             ),
                         });
                     }
-                    root_projection.push(index);
+                    if options.loads_column(column) {
+                        root_projection.push(index);
+                    }
                 }
                 let row_count = metadata.metadata().file_metadata().num_rows().max(0) as u64;
                 progress.add_completed(1);
@@ -241,20 +273,21 @@ fn scan_row_group_to_shard(
     let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, input.metadata.clone())
         .with_projection(mask)
         .with_row_groups(vec![row_group])
-        .with_batch_size(8 * 1024)
+        .with_batch_size(64 * 1024)
         .build()
         .map_err(|error| DedupError::ParquetRead {
             path: input.path.clone(),
             message: error.to_string(),
         })?;
     let mut shard = EntityStore::with_options(options.metadata_anchors, &options.evm_chains);
+    shard.defer_unbounded_metadata_sort();
     let mut row_offset = 0_u64;
     for batch in reader {
         let batch = batch.map_err(|error| DedupError::ParquetRead {
             path: input.path.clone(),
             message: error.to_string(),
         })?;
-        let columns = ProjectedColumns::new(&batch, &input.path)?;
+        let columns = ProjectedColumns::new(&batch, &input.path, options)?;
         for row_index in 0..batch.num_rows() {
             let row = columns.decode(
                 row_index,
@@ -275,13 +308,16 @@ fn scan_row_group_to_shard(
 }
 
 struct ProjectedColumns {
-    columns: Vec<ArrayRef>,
+    columns: [Option<ArrayRef>; REQUIRED_COLUMNS.len()],
 }
 
 impl ProjectedColumns {
-    fn new(batch: &RecordBatch, path: &Path) -> Result<Self, DedupError> {
-        let mut columns = Vec::with_capacity(REQUIRED_COLUMNS.len());
-        for required in REQUIRED_COLUMNS {
+    fn new(batch: &RecordBatch, path: &Path, options: &LoadOptions) -> Result<Self, DedupError> {
+        let mut columns = std::array::from_fn(|_| None);
+        for (column, required) in REQUIRED_COLUMNS.into_iter().enumerate() {
+            if !options.loads_column(column) {
+                continue;
+            }
             let index =
                 batch
                     .schema()
@@ -291,21 +327,27 @@ impl ProjectedColumns {
                         message: error.to_string(),
                     })?;
             let source = batch.column(index);
-            let converted =
+            let converted = if source.data_type() == &DataType::Utf8 {
+                source.clone()
+            } else {
                 cast(source, &DataType::Utf8).map_err(|error| DedupError::ParquetSchema {
                     path: path.to_path_buf(),
                     message: format!(
                         "column `{required}` cannot be cast from {:?} to Utf8: {error}",
                         source.data_type()
                     ),
-                })?;
-            columns.push(converted);
+                })?
+            };
+            columns[column] = Some(converted);
         }
         Ok(Self { columns })
     }
 
     fn value(&self, column: usize, row: usize) -> &str {
-        let array = self.columns[column]
+        let Some(column) = &self.columns[column] else {
+            return "";
+        };
+        let array = column
             .as_any()
             .downcast_ref::<StringArray>()
             .expect("arrow cast to Utf8 must return StringArray");
@@ -386,6 +428,29 @@ mod tests {
         assert_eq!(store.nfts.len(), 1);
         assert_eq!(store.nfts[0].token_id, "42");
         assert_eq!(store.contracts[0].metadata_by_token.len(), 1);
+    }
+
+    #[test]
+    fn disabled_dimensions_are_not_materialized() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("identity-only.parquet");
+        write_mixed_schema(&path);
+        let mut options = LoadOptions::new(["ethereum".to_owned()], ["ethereum".to_owned()], None);
+        options.load_names = false;
+        options.load_token_uris = false;
+        options.load_image_uris = false;
+        options.load_metadata = false;
+
+        let store = load_entities_with_options(&[path], &options, &NoopProgress).unwrap();
+
+        assert_eq!(store.nfts.len(), 1);
+        assert!(store.strings.is_empty());
+        assert!(store.nfts[0].name_id.is_none());
+        assert!(store.nfts[0].token_uri_id.is_none());
+        assert!(store.nfts[0].image_uri_id.is_none());
+        assert!(store.contracts[0].metadata_by_token.is_empty());
+        assert!(store.token_uri_postings.is_empty());
+        assert!(store.image_uri_postings.is_empty());
     }
 
     #[test]

@@ -88,6 +88,8 @@ fn all_writes_summary_files() {
             "ethereum,base",
             "--progress",
             "off",
+            "--name-threshold",
+            "98",
             "--metadata-anchors",
             "2",
         ])
@@ -182,10 +184,7 @@ fn all_writes_summary_files() {
     assert!(manifest["metadata_direct"]["candidate_posting_bytes"].is_u64());
     assert!(manifest["metadata_direct"]["candidate_range_bytes"].is_u64());
     assert!(manifest["metadata_direct"]["candidate_index_bytes"].is_u64());
-    assert!(manifest["metadata_direct"]["candidate_posting_budget_ratio"].is_f64());
-    assert!(manifest["metadata_direct"]["candidate_index_budget_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["candidate_pair_bytes"].is_u64());
-    assert!(manifest["metadata_direct"]["candidate_pair_budget_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["candidate_prefix_terms"].is_u64());
     assert!(manifest["metadata_direct"]["candidate_prefix_term_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["candidate_pair_emissions"].is_u64());
@@ -195,9 +194,6 @@ fn all_writes_summary_files() {
     assert!(manifest["metadata_direct"]["candidate_profile_pair_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["candidate_zero_overlap_prunes"].is_u64());
     assert!(manifest["metadata_direct"]["candidate_zero_overlap_prune_ratio"].is_f64());
-    assert!(manifest["metadata_direct"]["candidate_generation_fallback"].is_boolean());
-    assert!(manifest["metadata_direct"]["full_prepass_pairs"].is_u64());
-    assert!(manifest["metadata_direct"]["full_prepass_pair_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["block_saturated_profile_pairs"].is_u64());
     assert!(manifest["metadata_direct"]["block_saturated_profile_pair_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["bm25_scores"].is_u64());
@@ -207,4 +203,56 @@ fn all_writes_summary_files() {
     assert!(manifest["metadata_direct"]["bm25_cache_bypass_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["bm25_upper_bound_prune_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["matched_profile_pair_ratio"].is_f64());
+    assert!(
+        manifest["interned_strings"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+    );
+    assert!(
+        manifest["token_uri_postings"]
+            .as_u64()
+            .is_some_and(|value| value > 0)
+    );
+}
+
+#[test]
+fn omitted_name_threshold_disables_name_and_omitted_anchors_are_unbounded() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input.parquet");
+    write_parquet(
+        &input,
+        &[[
+            "ethereum",
+            "0xa",
+            "1",
+            "name-is-not-loaded",
+            "",
+            "",
+            r#"{"name":"metadata"}"#,
+        ]],
+    );
+    let out = temp.path().join("out");
+    let status = Command::new(env!("CARGO_BIN_EXE_dedup"))
+        .args([
+            "all",
+            "--input",
+            input.to_str().unwrap(),
+            "--output-dir",
+            out.to_str().unwrap(),
+            "--evm-chains",
+            "ethereum",
+            "--progress",
+            "off",
+        ])
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    assert!(!out.join("name_summary.csv").exists());
+    assert!(!out.join("name_chain_matrix.csv").exists());
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("run_manifest.json")).unwrap()).unwrap();
+    assert!(manifest["name_threshold"].is_null());
+    assert!(manifest["metadata_anchors"].is_null());
+    assert_eq!(manifest["interned_strings"], 0);
 }

@@ -509,7 +509,6 @@ dependencies = [
  "arrow-array",
  "arrow-cast",
  "arrow-schema",
- "num-bigint",
  "parquet",
  "rapidfuzz",
  "rayon",

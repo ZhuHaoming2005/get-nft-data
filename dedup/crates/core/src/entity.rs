@@ -1,7 +1,7 @@
 use crate::error::DedupError;
 use crate::radix::sort_u32_triples;
 use ahash::{AHashMap, AHashSet};
-use num_bigint::BigUint;
+use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::cmp::Ordering;
 
@@ -31,7 +31,6 @@ pub struct InputRow {
 #[derive(Clone, Debug)]
 pub struct MetadataRecord {
     pub token_id: String,
-    pub json: String,
     pub canonical_json: String,
     pub source_order: SourceOrder,
 }
@@ -42,7 +41,7 @@ pub struct Contract {
     pub chain_id: ChainId,
     pub address: String,
     pub nft_count: u64,
-    /// Sorted, bounded metadata anchors. At most `EntityStore::metadata_anchor_limit`.
+    /// Sorted metadata records. A configured limit keeps only the first records.
     pub metadata_by_token: Vec<MetadataRecord>,
 }
 
@@ -93,18 +92,23 @@ pub struct EntityStore {
     pub image_uri_postings: Vec<UriPosting>,
     pub totals: AHashMap<ChainId, ChainTotals>,
     pub rows_loaded: u64,
-    metadata_anchor_limit: usize,
+    metadata_anchor_limit: Option<usize>,
+    defer_metadata_sort: bool,
     evm_chains: AHashSet<String>,
 }
 
 impl Default for EntityStore {
     fn default() -> Self {
-        Self::with_options(8, &AHashSet::default())
+        Self::with_options(None, &AHashSet::default())
     }
 }
 
 impl EntityStore {
-    pub fn with_options(metadata_anchor_limit: usize, evm_chains: &AHashSet<String>) -> Self {
+    pub fn with_options(
+        metadata_anchor_limit: impl Into<Option<usize>>,
+        evm_chains: &AHashSet<String>,
+    ) -> Self {
+        let metadata_anchor_limit = metadata_anchor_limit.into();
         Self {
             chains: Vec::new(),
             chain_ids: AHashMap::new(),
@@ -119,8 +123,33 @@ impl EntityStore {
             totals: AHashMap::new(),
             rows_loaded: 0,
             metadata_anchor_limit,
+            defer_metadata_sort: false,
             evm_chains: evm_chains.clone(),
         }
+    }
+
+    pub(crate) fn defer_unbounded_metadata_sort(&mut self) {
+        self.defer_metadata_sort = self.metadata_anchor_limit.is_none();
+    }
+
+    pub fn finalize_metadata_anchors(&mut self) {
+        if !self.defer_metadata_sort {
+            return;
+        }
+        let chains = &self.chains;
+        let evm_chains = &self.evm_chains;
+        self.contracts.par_iter_mut().for_each(|contract| {
+            let is_evm = evm_chains.contains(&chains[contract.chain_id as usize]);
+            contract.metadata_by_token.sort_unstable_by(|left, right| {
+                compare_token_ids(&left.token_id, &right.token_id, is_evm)
+                    .then_with(|| left.token_id.cmp(&right.token_id))
+                    .then_with(|| left.source_order.cmp(&right.source_order))
+            });
+            contract
+                .metadata_by_token
+                .dedup_by(|right, left| right.token_id == left.token_id);
+        });
+        self.defer_metadata_sort = false;
     }
 
     pub fn chain_name(&self, id: ChainId) -> &str {
@@ -202,7 +231,6 @@ impl EntityStore {
                 contract_id,
                 &row.chain,
                 row.token_id.clone(),
-                row.metadata_json.clone(),
                 canonical_json,
                 row.source_order,
             );
@@ -297,11 +325,20 @@ impl EntityStore {
         contract_id: ContractId,
         chain: &str,
         token_id: String,
-        json: String,
         canonical_json: String,
         source_order: SourceOrder,
     ) {
-        if self.metadata_anchor_limit == 0 {
+        if self.metadata_anchor_limit == Some(0) {
+            return;
+        }
+        if self.defer_metadata_sort {
+            self.contracts[contract_id as usize]
+                .metadata_by_token
+                .push(MetadataRecord {
+                    token_id,
+                    canonical_json,
+                    source_order,
+                });
             return;
         }
         let is_evm = self.evm_chains.contains(chain);
@@ -312,19 +349,23 @@ impl EntityStore {
         let insert_at = anchors
             .binary_search_by(|record| compare_token_ids(&record.token_id, &token_id, is_evm))
             .unwrap_or_else(|position| position);
-        if insert_at >= self.metadata_anchor_limit && anchors.len() >= self.metadata_anchor_limit {
+        if let Some(limit) = self.metadata_anchor_limit
+            && insert_at >= limit
+            && anchors.len() >= limit
+        {
             return;
         }
         anchors.insert(
             insert_at,
             MetadataRecord {
                 token_id,
-                json,
                 canonical_json,
                 source_order,
             },
         );
-        if anchors.len() > self.metadata_anchor_limit {
+        if let Some(limit) = self.metadata_anchor_limit
+            && anchors.len() > limit
+        {
             anchors.pop();
         }
     }
@@ -336,6 +377,31 @@ impl EntityStore {
         );
         self.token_uri_postings = token_uri_postings;
         self.image_uri_postings = image_uri_postings;
+    }
+
+    pub(crate) fn release_metadata(&mut self) {
+        self.contracts.par_iter_mut().for_each(|contract| {
+            contract.metadata_by_token = Vec::new();
+            contract.address = String::new();
+        });
+        self.nfts
+            .par_iter_mut()
+            .for_each(|nft| nft.token_id = String::new());
+        self.nft_index = AHashMap::new();
+    }
+
+    pub fn release_completed_dimension_data(&mut self) {
+        self.token_uri_postings = Vec::new();
+        self.image_uri_postings = Vec::new();
+        self.strings = Vec::new();
+        self.string_ids = AHashMap::new();
+        self.chain_ids = AHashMap::new();
+        self.contract_index = AHashMap::new();
+        self.nfts.par_iter_mut().for_each(|nft| {
+            nft.name_id = None;
+            nft.token_uri_id = None;
+            nft.image_uri_id = None;
+        });
     }
 
     pub fn merge_shard(&mut self, shard: EntityStore) -> Result<(), DedupError> {
@@ -384,7 +450,6 @@ impl EntityStore {
                     contract_id,
                     &chain_name,
                     record.token_id,
-                    record.json,
                     record.canonical_json,
                     record.source_order,
                 );
@@ -456,7 +521,7 @@ impl EntityStore {
                 .metadata_by_token
                 .iter()
                 .find(|record| record.token_id == nft.token_id)
-                .map(|record| record.json.clone())
+                .map(|record| record.canonical_json.clone())
                 .unwrap_or_default();
             replacement
                 .try_ingest_row(InputRow {
@@ -543,11 +608,8 @@ fn build_uri_postings(
 
 pub fn compare_token_ids(left: &str, right: &str, is_evm: bool) -> Ordering {
     if is_evm {
-        match (
-            BigUint::parse_bytes(left.trim().as_bytes(), 10),
-            BigUint::parse_bytes(right.trim().as_bytes(), 10),
-        ) {
-            (Some(a), Some(b)) => a.cmp(&b),
+        match (decimal_magnitude(left), decimal_magnitude(right)) {
+            (Some(a), Some(b)) => a.len().cmp(&b.len()).then_with(|| a.cmp(b)),
             (Some(_), None) => Ordering::Less,
             (None, Some(_)) => Ordering::Greater,
             (None, None) => left.cmp(right),
@@ -555,6 +617,15 @@ pub fn compare_token_ids(left: &str, right: &str, is_evm: bool) -> Ordering {
     } else {
         left.cmp(right)
     }
+}
+
+fn decimal_magnitude(token: &str) -> Option<&str> {
+    let trimmed = token.trim();
+    if trimmed.is_empty() || !trimmed.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    let magnitude = trimmed.trim_start_matches('0');
+    Some(if magnitude.is_empty() { "0" } else { magnitude })
 }
 
 pub fn is_valid_metadata(content: &str) -> bool {
@@ -618,6 +689,28 @@ mod tests {
         assert_eq!(store.rows_loaded, 1);
         assert_eq!(store.contracts[0].nft_count, 1);
         assert_eq!(store.nfts.len(), 1);
+    }
+
+    #[test]
+    fn completed_stage_data_releases_owned_strings_and_lookup_indexes() {
+        let mut store = EntityStore::default();
+        store
+            .try_ingest_row(row("1", "uri://one", r#"{"name":"one"}"#))
+            .unwrap();
+
+        store.release_completed_dimension_data();
+        assert!(store.strings.is_empty());
+        assert!(store.string_ids.is_empty());
+        assert!(store.chain_ids.is_empty());
+        assert!(store.contract_index.is_empty());
+        assert!(store.nfts[0].name_id.is_none());
+        assert!(store.nfts[0].token_uri_id.is_none());
+
+        store.release_metadata();
+        assert!(store.nft_index.is_empty());
+        assert!(store.contracts[0].metadata_by_token.is_empty());
+        assert!(store.contracts[0].address.is_empty());
+        assert!(store.nfts[0].token_id.is_empty());
     }
 
     #[test]
@@ -692,6 +785,62 @@ mod tests {
             .map(|record| record.token_id.as_str())
             .collect::<Vec<_>>();
         assert_eq!(tokens, ["1", "2"]);
+    }
+
+    #[test]
+    fn omitted_metadata_anchor_limit_keeps_every_valid_nft() {
+        let evm_chains = ["ethereum".to_owned()].into_iter().collect();
+        let mut store = EntityStore::with_options(None, &evm_chains);
+        for token in 0..32 {
+            store
+                .try_ingest_row(row(
+                    &token.to_string(),
+                    "",
+                    &format!(r#"{{"name":"{token}"}}"#),
+                ))
+                .unwrap();
+        }
+
+        assert_eq!(store.contracts[0].metadata_by_token.len(), 32);
+    }
+
+    #[test]
+    fn deferred_unbounded_metadata_is_sorted_and_deduplicated_once() {
+        let evm_chains = ["ethereum".to_owned()].into_iter().collect();
+        let mut store = EntityStore::with_options(None, &evm_chains);
+        store.defer_unbounded_metadata_sort();
+        for token in ["10", "2", "1", "2"] {
+            store
+                .try_ingest_row(row(token, "", &format!(r#"{{"name":"{token}"}}"#)))
+                .unwrap();
+        }
+
+        store.finalize_metadata_anchors();
+
+        let tokens = store.contracts[0]
+            .metadata_by_token
+            .iter()
+            .map(|record| record.token_id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(tokens, ["1", "2", "10"]);
+    }
+
+    #[test]
+    fn evm_token_comparison_avoids_precision_and_leading_zero_changes() {
+        assert_eq!(compare_token_ids("0002", "2", true), Ordering::Equal);
+        assert_eq!(compare_token_ids("9", "10", true), Ordering::Less);
+        assert_eq!(
+            compare_token_ids(
+                "999999999999999999999999",
+                "1000000000000000000000000",
+                true
+            ),
+            Ordering::Less
+        );
+        assert_eq!(
+            compare_token_ids("not-a-number", "10", true),
+            Ordering::Greater
+        );
     }
 
     #[test]

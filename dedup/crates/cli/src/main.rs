@@ -25,12 +25,18 @@ struct CommonArgs {
     chains: Vec<String>,
     #[arg(long, value_delimiter = ',')]
     evm_chains: Vec<String>,
-    #[arg(long, default_value_t = 98.0)]
-    name_threshold: f64,
+    #[arg(
+        long,
+        help = "Name similarity percentage; omission disables Name dedup"
+    )]
+    name_threshold: Option<f64>,
     #[arg(long, default_value_t = 0.6)]
     metadata_threshold: f64,
-    #[arg(long, default_value_t = 8)]
-    metadata_anchors: usize,
+    #[arg(
+        long,
+        help = "Metadata anchors per contract; omission keeps every valid NFT metadata record"
+    )]
+    metadata_anchors: Option<usize>,
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
     #[arg(long, default_value_t = 1_000)]

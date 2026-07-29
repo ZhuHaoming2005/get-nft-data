@@ -5,10 +5,10 @@ use crate::metadata::bm25::{
     similarity_at_least_after_overlap_filter,
 };
 use crate::progress::ProgressObserver;
-use crate::radix::{sort_u32_pairs_while, sort_u32_triples_while, sort_u64_while};
+use crate::radix::{sort_u32_pairs_while, sort_u32_triples_while};
 use crate::scope::{ScopeCounts, ScopeKey};
 use crate::stats::SummaryAccumulator;
-use ahash::{AHashMap, AHashSet, AHasher};
+use ahash::{AHashMap, AHasher};
 use rayon::prelude::*;
 use serde::Serialize;
 use std::collections::HashSet;
@@ -32,11 +32,6 @@ const PREPARE_BATCH: usize = 4096;
 const INLINE_ANCHORS: usize = 8;
 const TOKEN_MASK_WORDS: usize = 4;
 const CANDIDATE_SHARDS: usize = 64;
-const MAX_CANDIDATE_POSTING_BYTES: u64 = 256 << 30;
-const MAX_FULL_PREPASS_POSTING_BYTES: u64 = 8 << 30;
-const MAX_FULL_PREPASS_PAIRS: usize = 1 << 24;
-const DENSE_CANDIDATE_SEEN_BUDGET_BYTES: usize = 32 * 1024 * 1024 * 1024;
-const DENSE_TERM_FREQUENCY_BUDGET_BYTES: usize = 16 * 1024 * 1024 * 1024;
 const CANDIDATE_CANCEL_BATCH: u64 = 1 << 20;
 #[cfg(test)]
 const CANDIDATE_PAIR_CHUNK: usize = 4096;
@@ -62,10 +57,7 @@ pub struct MetadataStats {
     pub candidate_posting_bytes: u64,
     pub candidate_range_bytes: u64,
     pub candidate_index_bytes: u64,
-    pub candidate_posting_budget_ratio: f64,
-    pub candidate_index_budget_ratio: f64,
     pub candidate_pair_bytes: u64,
-    pub candidate_pair_budget_ratio: f64,
     pub candidate_prefix_terms: u64,
     pub candidate_prefix_term_ratio: f64,
     pub candidate_pair_emissions: u64,
@@ -75,10 +67,6 @@ pub struct MetadataStats {
     pub candidate_profile_pair_ratio: f64,
     pub candidate_zero_overlap_prunes: u64,
     pub candidate_zero_overlap_prune_ratio: f64,
-    pub candidate_generation_fallback: bool,
-    pub candidate_fallback_reason: Option<CandidateFallbackReason>,
-    pub full_prepass_pairs: u64,
-    pub full_prepass_pair_ratio: f64,
     pub saturated_profile_pairs: u64,
     pub saturated_profile_pair_ratio: f64,
     pub block_saturated_profile_pairs: u64,
@@ -98,14 +86,6 @@ pub struct MetadataStats {
     pub bm25_upper_bound_prune_ratio: f64,
     pub matched_profile_pairs: u64,
     pub matched_profile_pair_ratio: f64,
-}
-
-#[derive(Clone, Copy, Debug, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum CandidateFallbackReason {
-    ThresholdNonPositive,
-    PostingBudget,
-    IndexBudget,
 }
 
 #[derive(Debug, Hash, PartialEq, Eq)]
@@ -257,6 +237,7 @@ struct DirectIndex {
     anchors: Vec<(TokenKeyId, DocumentId)>,
     members: Vec<MetadataMember>,
     chain_counts: Vec<(ChainId, u32)>,
+    #[cfg(test)]
     chain_count: usize,
     query_profile_count: usize,
     eligible_contracts: u64,
@@ -299,25 +280,8 @@ impl DirectIndex {
 }
 
 enum CrossProfilePlan {
-    Full { exact_prepass: ExactPrepass },
+    Full,
     Indexed(ResidentCandidateIndex),
-}
-
-#[derive(Debug)]
-enum ExactPrepass {
-    None,
-    Pairs(Box<[u64]>),
-    Masks { values: Box<[u64]>, pair_count: u64 },
-}
-
-impl ExactPrepass {
-    fn pair_count(&self) -> u64 {
-        match self {
-            Self::None => 0,
-            Self::Pairs(pairs) => pairs.len() as u64,
-            Self::Masks { pair_count, .. } => *pair_count,
-        }
-    }
 }
 
 struct ResidentCandidateIndex {
@@ -342,10 +306,8 @@ impl ResidentCandidateIndex {
                 prefixes: &self.prefixes,
             },
             self.include_bm25,
-            u64::MAX,
             progress,
         )?;
-        assert!(!generated.abandoned);
         Ok(generated)
     }
 }
@@ -412,9 +374,6 @@ struct CandidatePlanStats {
     pair_emissions: u64,
     candidate_pairs: u64,
     candidate_zero_overlap_prunes: u64,
-    generation_fallback: bool,
-    fallback_reason: Option<CandidateFallbackReason>,
-    prepass_pairs: u64,
 }
 
 #[derive(Default)]
@@ -438,7 +397,7 @@ impl CrossProfilePlan {
     }
 
     fn needs_block_tracking(&self) -> bool {
-        matches!(self, Self::Full { .. })
+        matches!(self, Self::Full)
     }
 }
 
@@ -517,8 +476,12 @@ impl<'a> DocumentInterner<'a> {
                 .map_err(|_| DedupError::invalid("metadata", "document interner lock poisoned"))?;
             values.extend(shard.values);
         }
+        let mut ordered_values = vec![None; document_count];
+        for (id, value) in values {
+            ordered_values[id as usize] = Some(value);
+        }
         let terms = TermInterner::new();
-        let prepared_chunks = values
+        let prepared_chunks = ordered_values
             .par_chunks(PREPARE_BATCH)
             .map_init(
                 || (AHashMap::<&'a str, u32>::new(), Vec::<u32>::new()),
@@ -527,7 +490,10 @@ impl<'a> DocumentInterner<'a> {
                     local_terms.clear();
                     let mut documents = Vec::with_capacity(chunk.len());
                     let mut compact_terms = Vec::new();
-                    for &(id, value) in chunk {
+                    for &value in chunk {
+                        let value = value.ok_or_else(|| {
+                            DedupError::invalid("metadata", "missing interned metadata document")
+                        })?;
                         let local_term_start =
                             u32::try_from(compact_terms.len()).map_err(|_| {
                                 DedupError::invalid(
@@ -548,7 +514,7 @@ impl<'a> DocumentInterner<'a> {
                             scratch,
                             &mut compact_terms,
                         )?;
-                        documents.push((id, local_term_start, document));
+                        documents.push((local_term_start, document));
                     }
                     progress.add_completed(chunk.len() as u64);
                     Ok::<_, DedupError>((documents, compact_terms))
@@ -561,13 +527,13 @@ impl<'a> DocumentInterner<'a> {
             .iter()
             .map(|(_, terms)| terms.len())
             .sum::<usize>();
-        let mut documents = (0..document_count).map(|_| None).collect::<Vec<_>>();
+        let mut documents = Vec::with_capacity(document_count);
         let mut compact_terms = Vec::with_capacity(compact_term_count);
         for chunk in prepared_chunks {
             let (chunk_documents, mut chunk_terms) = chunk;
             let chunk_term_start = u32::try_from(compact_terms.len())
                 .map_err(|_| DedupError::invalid("metadata", "metadata term offset overflow"))?;
-            for (id, local_term_start, mut document) in chunk_documents {
+            for (local_term_start, mut document) in chunk_documents {
                 document.set_term_start(
                     chunk_term_start
                         .checked_add(local_term_start)
@@ -575,20 +541,18 @@ impl<'a> DocumentInterner<'a> {
                             DedupError::invalid("metadata", "metadata term offset overflow")
                         })?,
                 );
-                documents[id as usize] = Some(document);
+                documents.push(document);
             }
             compact_terms.append(&mut chunk_terms);
         }
-        let compact_documents = documents
-            .into_iter()
-            .map(|document| {
-                document.ok_or_else(|| {
-                    DedupError::invalid("metadata", "missing prepared metadata document")
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()?;
+        if documents.len() != document_count {
+            return Err(DedupError::invalid(
+                "metadata",
+                "prepared metadata document count mismatch",
+            ));
+        }
         Ok((
-            compact_documents,
+            documents,
             compact_terms,
             terms.next_id.load(Ordering::Relaxed),
         ))
@@ -992,15 +956,39 @@ impl LocalStats {
     }
 }
 
+#[cfg(test)]
 pub fn run_direct(
     store: &EntityStore,
     evm_chains: &HashSet<String>,
-    anchors_k: usize,
+    anchors_k: impl Into<Option<usize>>,
     threshold: f64,
     acc: &mut SummaryAccumulator,
     progress: &dyn ProgressObserver,
 ) -> Result<MetadataStats, DedupError> {
-    let index = build_index(store, evm_chains, anchors_k, progress)?;
+    let index = build_index(store, evm_chains, anchors_k.into(), progress)?;
+    run_prepared_direct(store, index, threshold, acc, progress)
+}
+
+pub fn run_direct_releasing(
+    store: &mut EntityStore,
+    evm_chains: &HashSet<String>,
+    anchors_k: impl Into<Option<usize>>,
+    threshold: f64,
+    acc: &mut SummaryAccumulator,
+    progress: &dyn ProgressObserver,
+) -> Result<MetadataStats, DedupError> {
+    let index = build_index(store, evm_chains, anchors_k.into(), progress)?;
+    store.release_metadata();
+    run_prepared_direct(store, index, threshold, acc, progress)
+}
+
+fn run_prepared_direct(
+    store: &EntityStore,
+    index: DirectIndex,
+    threshold: f64,
+    acc: &mut SummaryAccumulator,
+    progress: &dyn ProgressObserver,
+) -> Result<MetadataStats, DedupError> {
     let eligible_members = index.eligible_members;
     if eligible_members < 2 {
         return Ok(base_stats(store, &index, 0, 0, 0));
@@ -1021,7 +1009,6 @@ pub fn run_direct(
         cross_profile_plan.needs_block_tracking(),
     );
     let stats = AtomicStats::default();
-    seed_exact_prepass(&index, &hits, &cross_profile_plan, progress)?;
     let equivalent_work = equivalent_scoring_work(&index);
     progress.begin_phase("direct_bm25_equivalent", Some(equivalent_work));
     score_equivalent_profiles(&index, &hits, &stats, progress)?;
@@ -1178,14 +1165,9 @@ pub fn run_direct(
     result.candidate_index_bytes = candidate_stats
         .posting_bytes
         .saturating_add(candidate_stats.range_bytes);
-    result.candidate_posting_budget_ratio =
-        ratio(candidate_stats.posting_bytes, MAX_CANDIDATE_POSTING_BYTES);
-    result.candidate_index_budget_ratio =
-        ratio(result.candidate_index_bytes, MAX_CANDIDATE_POSTING_BYTES);
     // Candidate pairs are generated and scored immediately. Keep these
-    // serialized compatibility fields, but report no resident pair storage.
+    // measurements at zero because there is no resident pair storage.
     result.candidate_pair_bytes = 0;
-    result.candidate_pair_budget_ratio = 0.0;
     result.candidate_prefix_terms = candidate_stats.prefix_terms;
     result.candidate_prefix_term_ratio =
         ratio(candidate_stats.prefix_terms, candidate_stats.full_terms);
@@ -1207,13 +1189,6 @@ pub fn run_direct(
         candidate_stats
             .candidate_pairs
             .saturating_add(candidate_stats.candidate_zero_overlap_prunes),
-    );
-    result.candidate_generation_fallback = candidate_stats.generation_fallback;
-    result.candidate_fallback_reason = candidate_stats.fallback_reason;
-    result.full_prepass_pairs = candidate_stats.prepass_pairs;
-    result.full_prepass_pair_ratio = ratio(
-        candidate_stats.prepass_pairs,
-        exhaustive_cross_profile_tasks,
     );
     result.saturated_profile_pairs = stats.saturated_profile_pairs.load(Ordering::Relaxed);
     result.block_saturated_profile_pairs =
@@ -1243,9 +1218,10 @@ pub fn run_direct(
 fn build_index(
     store: &EntityStore,
     evm_chains: &HashSet<String>,
-    anchors_k: usize,
+    anchors_k: impl Into<Option<usize>>,
     progress: &dyn ProgressObserver,
 ) -> Result<DirectIndex, DedupError> {
+    let anchors_k = anchors_k.into();
     progress.begin_phase("prepare_direct", Some(store.contracts.len() as u64));
     let documents = DocumentInterner::new();
     let tokens = TokenInterner::new();
@@ -1263,7 +1239,9 @@ fn build_index(
             for contract in contracts {
                 let is_solana = store.is_solana_chain(contract.chain_id);
                 let is_evm = evm_chains.contains(store.chain_name(contract.chain_id));
-                let take = contract.metadata_by_token.len().min(anchors_k);
+                let take = anchors_k.map_or(contract.metadata_by_token.len(), |limit| {
+                    contract.metadata_by_token.len().min(limit)
+                });
                 if take == 0 {
                     continue;
                 }
@@ -1536,6 +1514,7 @@ fn build_index(
         anchors,
         members,
         chain_counts,
+        #[cfg(test)]
         chain_count: store.chains.len(),
         query_profile_count,
         eligible_contracts: eligible_contracts.load(Ordering::Relaxed),
@@ -1907,15 +1886,10 @@ fn build_global_full_index(
     }
     let posting_count = usize::try_from(posting_count)
         .map_err(|_| DedupError::invalid("metadata", "global posting size overflow"))?;
-    let bytes_per_lane = term_count
-        .checked_mul(std::mem::size_of::<usize>())
-        .ok_or_else(|| DedupError::invalid("metadata", "global posting cursor overflow"))?;
-    let max_budget_lanes = (DENSE_TERM_FREQUENCY_BUDGET_BYTES / bytes_per_lane).max(1);
     let average_reuse = posting_count.div_ceil(term_count).max(1);
     let desired_lanes = average_reuse.saturating_mul(2).max(8);
     let lane_count = rayon::current_num_threads()
         .min(index.profiles.len())
-        .min(max_budget_lanes)
         .min(desired_lanes)
         .max(1);
     let cursor_count = term_count
@@ -2039,311 +2013,6 @@ fn build_global_full_index(
     })
 }
 
-fn build_full_plan(
-    index: &DirectIndex,
-    mut stats: CandidatePlanStats,
-    progress: &dyn ProgressObserver,
-) -> Result<(CrossProfilePlan, CandidatePlanStats), DedupError> {
-    let exact_prepass = build_exact_prepass(index, progress)?;
-    stats.prepass_pairs = exact_prepass.pair_count();
-    Ok((CrossProfilePlan::Full { exact_prepass }, stats))
-}
-
-fn build_exact_prepass(
-    index: &DirectIndex,
-    progress: &dyn ProgressObserver,
-) -> Result<ExactPrepass, DedupError> {
-    let token_count = index
-        .profiles
-        .par_iter()
-        .filter(|profile| profile.is_evm)
-        .map(|profile| u64::from(profile.anchor_len))
-        .sum::<u64>();
-    let posting_bytes = token_count.saturating_mul(std::mem::size_of::<(u32, u32, u32)>() as u64);
-    if posting_bytes > MAX_FULL_PREPASS_POSTING_BYTES {
-        return Ok(ExactPrepass::None);
-    }
-
-    let token_capacity = usize::try_from(token_count)
-        .map_err(|_| DedupError::invalid("metadata", "exact prepass size overflow"))?;
-    let postings = Mutex::new(Vec::with_capacity(token_capacity));
-    progress.begin_phase("candidate_prepass_build", Some(index.profiles.len() as u64));
-    index
-        .profiles
-        .par_chunks(PREPARE_BATCH)
-        .enumerate()
-        .try_for_each(|(chunk_id, profiles)| {
-            progress.check_cancelled()?;
-            let mut token = Vec::new();
-            for (offset, profile) in profiles.iter().enumerate() {
-                let profile_id = u32::try_from(chunk_id * PREPARE_BATCH + offset)
-                    .map_err(|_| DedupError::invalid("metadata", "too many metadata profiles"))?;
-                if profile.is_evm {
-                    token.extend(
-                        index
-                            .anchors(profile)
-                            .iter()
-                            .map(|&(token, document)| (token, document, profile_id)),
-                    );
-                }
-            }
-            let mut target = postings.lock().map_err(|_| {
-                DedupError::invalid("metadata", "exact prepass posting lock poisoned")
-            })?;
-            target.append(&mut token);
-            progress.add_completed(profiles.len() as u64);
-            Ok::<(), DedupError>(())
-        })?;
-    let mut token = postings
-        .into_inner()
-        .map_err(|_| DedupError::invalid("metadata", "exact prepass posting lock poisoned"))?;
-    let sort_passes = u64::from(token.len() > 1) * 9;
-    progress.begin_phase("candidate_prepass_sort", Some(sort_passes));
-    if !sort_u32_triples_while(&mut token, || {
-        progress.add_completed(1);
-        progress.check_cancelled().is_ok()
-    }) {
-        return Err(DedupError::Interrupted);
-    }
-
-    let token_ranges = triple_posting_ranges(&token);
-    progress.begin_phase("candidate_prepass_count", Some(index.profiles.len() as u64));
-    let global_emissions = estimate_exact_document_emissions(&index.profiles, progress)?;
-    let token_emissions = estimate_pair_emissions(&token_ranges);
-    let global_target = global_emissions.min((MAX_FULL_PREPASS_PAIRS / 2) as u64) as usize;
-    let token_target =
-        token_emissions.min((MAX_FULL_PREPASS_PAIRS - global_target) as u64) as usize;
-    let raw_pairs = global_target.saturating_add(token_target);
-    progress.begin_phase("candidate_prepass_collect", Some(raw_pairs as u64));
-    let mut pairs = Vec::with_capacity(raw_pairs);
-    append_bounded_exact_document_pairs(&index.profiles, global_target, &mut pairs, progress)?;
-    append_bounded_symmetric_pairs_by(
-        &token,
-        &token_ranges,
-        |entry| entry.2,
-        global_target.saturating_add(token_target),
-        &mut pairs,
-        progress,
-    )?;
-    drop(token);
-    finalize_exact_prepass(index, pairs, progress)
-}
-
-fn finalize_exact_prepass(
-    index: &DirectIndex,
-    mut pairs: Vec<u64>,
-    progress: &dyn ProgressObserver,
-) -> Result<ExactPrepass, DedupError> {
-    let sort_passes = if pairs.len() > 1 { 6 } else { 0 };
-    progress.begin_phase("candidate_prepass_dedup", Some(sort_passes));
-    if !sort_u64_while(&mut pairs, || {
-        progress.add_completed(1);
-        progress.check_cancelled().is_ok()
-    }) {
-        return Err(DedupError::Interrupted);
-    }
-    pairs.dedup();
-    progress.begin_phase("candidate_prepass_validate", Some(pairs.len() as u64));
-    if index.chain_count <= 64 {
-        let masks = (0..index.profiles.len())
-            .map(|_| AtomicU64::new(0))
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
-        let pair_count = AtomicU64::new(0);
-        let cancelled = AtomicBool::new(false);
-        pairs.par_chunks(PREPARE_BATCH).for_each(|keys| {
-            if progress.check_cancelled().is_err() {
-                cancelled.store(true, Ordering::Relaxed);
-                return;
-            }
-            let mut exact = 0_u64;
-            for &key in keys {
-                let (left_id, right_id) = decode_profile_pair(key);
-                let left = &index.profiles[left_id];
-                let right = &index.profiles[right_id];
-                let (left_document, right_document) =
-                    selected_documents(left, index.anchors(left), right, index.anchors(right));
-                if left_document == right_document {
-                    masks[left_id].fetch_or(right.chain_mask, Ordering::Relaxed);
-                    masks[right_id].fetch_or(left.chain_mask, Ordering::Relaxed);
-                    exact += 1;
-                }
-            }
-            pair_count.fetch_add(exact, Ordering::Relaxed);
-            progress.add_completed(keys.len() as u64);
-        });
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(DedupError::Interrupted);
-        }
-        progress.begin_phase(
-            "candidate_prepass_compact",
-            Some(index.profiles.len() as u64),
-        );
-        let mask_count = masks.len();
-        let values = masks
-            .into_vec()
-            .into_par_iter()
-            .enumerate()
-            .map(|(profile_id, mask)| {
-                if profile_id % PREPARE_BATCH == 0 {
-                    progress.check_cancelled()?;
-                    progress.add_completed((mask_count - profile_id).min(PREPARE_BATCH) as u64);
-                }
-                Ok::<_, DedupError>(mask.load(Ordering::Relaxed))
-            })
-            .collect::<Result<Vec<_>, _>>()?
-            .into_boxed_slice();
-        return Ok(ExactPrepass::Masks {
-            values,
-            pair_count: pair_count.load(Ordering::Relaxed),
-        });
-    }
-    let chunks = pairs
-        .par_chunks(PREPARE_BATCH)
-        .map(|keys| {
-            progress.check_cancelled()?;
-            let exact = keys
-                .iter()
-                .copied()
-                .filter(|key| {
-                    let (left_id, right_id) = decode_profile_pair(*key);
-                    let left = &index.profiles[left_id];
-                    let right = &index.profiles[right_id];
-                    let (left_document, right_document) =
-                        selected_documents(left, index.anchors(left), right, index.anchors(right));
-                    left_document == right_document
-                })
-                .collect::<Vec<_>>();
-            progress.add_completed(keys.len() as u64);
-            Ok::<_, DedupError>(exact)
-        })
-        .collect::<Vec<_>>()
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
-    Ok(ExactPrepass::Pairs(
-        chunks
-            .into_par_iter()
-            .flatten()
-            .collect::<Vec<_>>()
-            .into_boxed_slice(),
-    ))
-}
-
-fn estimate_exact_document_emissions(
-    profiles: &[ContractProfile],
-    progress: &dyn ProgressObserver,
-) -> Result<u64, DedupError> {
-    let mut total = 0_u64;
-    let mut completed = 0_u64;
-    let mut start = 0;
-    progress.check_cancelled()?;
-    while start < profiles.len() {
-        let document = profiles[start].max_document();
-        let mut end = start + 1;
-        completed += 1;
-        if completed >= PREPARE_BATCH as u64 {
-            progress.add_completed(completed);
-            progress.check_cancelled()?;
-            completed = 0;
-        }
-        while end < profiles.len() && profiles[end].max_document() == document {
-            end += 1;
-            completed += 1;
-            if completed >= PREPARE_BATCH as u64 {
-                progress.add_completed(completed);
-                progress.check_cancelled()?;
-                completed = 0;
-            }
-        }
-        total = total.saturating_add(choose_two((end - start) as u64));
-        start = end;
-    }
-    progress.add_completed(completed);
-    Ok(total)
-}
-
-fn append_bounded_exact_document_pairs(
-    profiles: &[ContractProfile],
-    limit: usize,
-    pairs: &mut Vec<u64>,
-    progress: &dyn ProgressObserver,
-) -> Result<(), DedupError> {
-    progress.check_cancelled()?;
-    if pairs.len() >= limit {
-        return Ok(());
-    }
-    u32::try_from(profiles.len())
-        .map_err(|_| DedupError::invalid("metadata", "too many metadata profiles"))?;
-    let mut completed = 0_u64;
-    let mut scanned = 0_usize;
-    let mut start = 0;
-    'groups: while start < profiles.len() {
-        let document = profiles[start].max_document();
-        let mut end = start + 1;
-        scanned += 1;
-        if scanned >= PREPARE_BATCH {
-            progress.check_cancelled()?;
-            scanned = 0;
-        }
-        while end < profiles.len() && profiles[end].max_document() == document {
-            end += 1;
-            scanned += 1;
-            if scanned >= PREPARE_BATCH {
-                progress.check_cancelled()?;
-                scanned = 0;
-            }
-        }
-        for left in start..end.saturating_sub(1) {
-            for right in left + 1..end {
-                if pairs.len() == limit {
-                    break 'groups;
-                }
-                pairs.push(profile_pair_key(left as u32, right as u32));
-                completed += 1;
-                if completed == PREPARE_BATCH as u64 {
-                    progress.add_completed(completed);
-                    progress.check_cancelled()?;
-                    completed = 0;
-                }
-            }
-        }
-        start = end;
-    }
-    progress.add_completed(completed);
-    Ok(())
-}
-
-fn append_bounded_symmetric_pairs_by<T>(
-    entries: &[T],
-    ranges: &[(usize, usize)],
-    profile: impl Fn(&T) -> u32,
-    limit: usize,
-    pairs: &mut Vec<u64>,
-    progress: &dyn ProgressObserver,
-) -> Result<(), DedupError> {
-    let mut completed = 0_u64;
-    'ranges: for &(start, end) in ranges {
-        for left in start..end - 1 {
-            let left_profile = profile(&entries[left]);
-            for right_entry in entries.iter().take(end).skip(left + 1) {
-                if pairs.len() == limit {
-                    break 'ranges;
-                }
-                let right_profile = profile(right_entry);
-                pairs.push(profile_pair_key(left_profile, right_profile));
-                completed += 1;
-                if completed == PREPARE_BATCH as u64 {
-                    progress.add_completed(completed);
-                    progress.check_cancelled()?;
-                    completed = 0;
-                }
-            }
-        }
-    }
-    progress.add_completed(completed);
-    Ok(())
-}
-
 fn build_candidate_plan(
     index: &DirectIndex,
     threshold: f64,
@@ -2351,16 +2020,7 @@ fn build_candidate_plan(
     progress: &dyn ProgressObserver,
 ) -> Result<(CrossProfilePlan, CandidatePlanStats), DedupError> {
     if threshold <= 0.0 || exhaustive_pairs == 0 {
-        let mut stats = CandidatePlanStats::default();
-        if threshold <= 0.0 {
-            stats.fallback_reason = Some(CandidateFallbackReason::ThresholdNonPositive);
-        }
-        return Ok((
-            CrossProfilePlan::Full {
-                exact_prepass: ExactPrepass::None,
-            },
-            stats,
-        ));
+        return Ok((CrossProfilePlan::Full, CandidatePlanStats::default()));
     }
     let include_bm25 = !threshold.is_nan() && threshold <= 1.0;
     let counts = estimate_candidate_counts(index, include_bm25, "candidate_admission", progress)?;
@@ -2371,10 +2031,6 @@ fn build_candidate_plan(
         full_terms: counts.full_terms(),
         ..CandidatePlanStats::default()
     };
-    if projected_posting_bytes > MAX_CANDIDATE_POSTING_BYTES {
-        stats.fallback_reason = Some(CandidateFallbackReason::PostingBudget);
-        return build_full_plan(index, stats, progress);
-    }
     let prefixes = if include_bm25 {
         let term_ranks = build_term_ranks(index, progress)?;
         build_document_prefixes(index, &term_ranks, threshold, progress)?
@@ -2555,11 +2211,6 @@ fn build_candidate_plan(
                 .map(CompactCandidateEntries::range_bytes)
                 .fold(0_u64, u64::saturating_add),
         );
-    if stats.posting_bytes.saturating_add(stats.range_bytes) > MAX_CANDIDATE_POSTING_BYTES {
-        drop(shards);
-        stats.fallback_reason = Some(CandidateFallbackReason::IndexBudget);
-        return build_full_plan(index, stats, progress);
-    }
     Ok((
         CrossProfilePlan::Indexed(ResidentCandidateIndex {
             shards: shards.into_boxed_slice(),
@@ -2571,86 +2222,40 @@ fn build_candidate_plan(
     ))
 }
 
-enum CandidateSeen {
-    Dense {
-        generations: Vec<u32>,
-        generation: u32,
-    },
-    Sparse(AHashSet<u32>),
+struct CandidateSeen {
+    generations: Vec<u16>,
+    generation: u16,
 }
 
 impl CandidateSeen {
-    fn new(profile_count: usize, dense: bool) -> Self {
-        if dense {
-            Self::Dense {
-                generations: vec![0; profile_count],
-                generation: 0,
-            }
-        } else {
-            Self::Sparse(AHashSet::new())
+    fn new(profile_count: usize) -> Self {
+        Self {
+            generations: vec![0; profile_count],
+            generation: 0,
         }
     }
 
     fn begin_profile(&mut self) {
-        match self {
-            Self::Dense {
-                generations,
-                generation,
-            } => {
-                *generation = generation.wrapping_add(1);
-                if *generation == 0 {
-                    generations.fill(0);
-                    *generation = 1;
-                }
-            }
-            Self::Sparse(seen) => seen.clear(),
+        self.generation = self.generation.wrapping_add(1);
+        if self.generation == 0 {
+            self.generations.fill(0);
+            self.generation = 1;
         }
     }
 
     fn insert(&mut self, profile: u32) -> bool {
-        match self {
-            Self::Dense {
-                generations,
-                generation,
-            } => {
-                let slot = &mut generations[profile as usize];
-                if *slot == *generation {
-                    false
-                } else {
-                    *slot = *generation;
-                    true
-                }
-            }
-            Self::Sparse(seen) => seen.insert(profile),
+        let slot = &mut self.generations[profile as usize];
+        if *slot == self.generation {
+            false
+        } else {
+            *slot = self.generation;
+            true
         }
     }
 }
 
-fn candidate_seen_lanes(profile_count: usize, query_profile_count: usize) -> (usize, bool) {
-    candidate_seen_lanes_for_budget(
-        profile_count,
-        query_profile_count,
-        rayon::current_num_threads(),
-        DENSE_CANDIDATE_SEEN_BUDGET_BYTES,
-    )
-}
-
-fn candidate_seen_lanes_for_budget(
-    profile_count: usize,
-    query_profile_count: usize,
-    requested_lanes: usize,
-    budget_bytes: usize,
-) -> (usize, bool) {
-    let requested_lanes = requested_lanes.min(query_profile_count).max(1);
-    let bytes_per_dense_lane = profile_count.saturating_mul(std::mem::size_of::<u32>());
-    let max_dense_lanes = budget_bytes
-        .checked_div(bytes_per_dense_lane)
-        .unwrap_or(requested_lanes);
-    if max_dense_lanes == 0 {
-        (requested_lanes, false)
-    } else {
-        (requested_lanes.min(max_dense_lanes).max(1), true)
-    }
+fn candidate_seen_lanes(query_profile_count: usize) -> usize {
+    rayon::current_num_threads().min(query_profile_count).max(1)
 }
 
 #[cfg(test)]
@@ -2661,7 +2266,6 @@ struct CandidateGeneration {
     pair_emissions: u64,
     prefix_terms: u64,
     zero_overlap_prunes: u64,
-    abandoned: bool,
 }
 
 #[cfg(test)]
@@ -2676,7 +2280,6 @@ struct CandidatePairChunks {
     chunks: Vec<Box<[CandidatePair]>>,
     current: Vec<CandidatePair>,
     len: usize,
-    unreserved: u64,
 }
 
 #[cfg(test)]
@@ -2686,11 +2289,10 @@ impl CandidatePairChunks {
             chunks: Vec::new(),
             current: Vec::with_capacity(CANDIDATE_PAIR_CHUNK),
             len: 0,
-            unreserved: 0,
         }
     }
 
-    fn push(&mut self, pair: CandidatePair, budget: &CandidateBudget) -> bool {
+    fn push(&mut self, pair: CandidatePair) {
         if self.current.len() == CANDIDATE_PAIR_CHUNK {
             self.chunks
                 .push(std::mem::take(&mut self.current).into_boxed_slice());
@@ -2698,22 +2300,6 @@ impl CandidatePairChunks {
         }
         self.current.push(pair);
         self.len += 1;
-        self.unreserved += 1;
-        if self.unreserved == CANDIDATE_PAIR_CHUNK as u64 {
-            if !budget.reserve(self.unreserved) {
-                return false;
-            }
-            self.unreserved = 0;
-        }
-        true
-    }
-
-    fn reserve_remainder(&mut self, budget: &CandidateBudget) -> bool {
-        if self.unreserved == 0 {
-            return !budget.exceeded.load(Ordering::Relaxed);
-        }
-        let amount = std::mem::take(&mut self.unreserved);
-        budget.reserve(amount)
     }
 
     fn finish(mut self) -> (Vec<Box<[CandidatePair]>>, usize) {
@@ -2725,48 +2311,10 @@ impl CandidatePairChunks {
 }
 
 #[cfg(test)]
-struct CandidateBudget {
-    limit: u64,
-    reserved: AtomicU64,
-    exceeded: AtomicBool,
-}
-
-#[cfg(test)]
-impl CandidateBudget {
-    fn new(limit: u64) -> Self {
-        Self {
-            limit,
-            reserved: AtomicU64::new(0),
-            exceeded: AtomicBool::new(false),
-        }
-    }
-
-    fn reserve(&self, amount: u64) -> bool {
-        if self.exceeded.load(Ordering::Relaxed) {
-            return false;
-        }
-        let reserved =
-            self.reserved
-                .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-                    current
-                        .checked_add(amount)
-                        .filter(|next| *next <= self.limit)
-                });
-        if reserved.is_ok() {
-            true
-        } else {
-            self.exceeded.store(true, Ordering::Relaxed);
-            false
-        }
-    }
-}
-
-#[cfg(test)]
 fn generate_candidate_pairs(
     index: &DirectIndex,
     sources: CandidateSources<'_>,
     include_bm25: bool,
-    candidate_limit: u64,
     progress: &dyn ProgressObserver,
 ) -> Result<CandidateGeneration, DedupError> {
     let profile_count = index.profiles.len();
@@ -2779,17 +2327,15 @@ fn generate_candidate_pairs(
             pair_emissions: 0,
             prefix_terms: 0,
             zero_overlap_prunes: 0,
-            abandoned: false,
         });
     }
-    let (lane_count, dense_seen) = candidate_seen_lanes(profile_count, query_profile_count);
-    let budget = CandidateBudget::new(candidate_limit);
+    let lane_count = candidate_seen_lanes(query_profile_count);
     let next_left = AtomicUsize::new(0);
     progress.begin_phase("candidate_generate", Some(query_profile_count as u64));
     let lanes = (0..lane_count)
         .into_par_iter()
         .map(|_| {
-            let mut seen = CandidateSeen::new(profile_count, dense_seen);
+            let mut seen = CandidateSeen::new(profile_count);
             let mut pairs = CandidatePairChunks::new();
             let mut pair_emissions = 0_u64;
             let mut scoring_work = 0_u64;
@@ -2797,10 +2343,7 @@ fn generate_candidate_pairs(
             let mut zero_overlap_prunes = 0_u64;
             let mut unchecked_emissions = 0_u64;
             let mut completed = 0_u64;
-            'profiles: loop {
-                if budget.exceeded.load(Ordering::Relaxed) {
-                    break;
-                }
+            loop {
                 progress.check_cancelled()?;
                 let start = next_left.fetch_add(CANDIDATE_SCHEDULING_CHUNK, Ordering::Relaxed);
                 if start >= query_profile_count {
@@ -2810,14 +2353,11 @@ fn generate_candidate_pairs(
                     .saturating_add(CANDIDATE_SCHEDULING_CHUNK)
                     .min(query_profile_count);
                 for left_id in start..end {
-                    if budget.exceeded.load(Ordering::Relaxed) {
-                        break 'profiles;
-                    }
                     seen.begin_profile();
                     let left_profile = &index.profiles[left_id];
                     let left_id = left_id as u32;
                     let max_document = left_profile.max_document();
-                    if !append_owned_candidates(
+                    append_owned_candidates(
                         sources.shards[candidate_shard(max_document, 0)]
                             .global_exact_after(max_document, left_id),
                         left_id,
@@ -2834,16 +2374,13 @@ fn generate_candidate_pairs(
                         &mut pair_emissions,
                         &mut zero_overlap_prunes,
                         &mut unchecked_emissions,
-                        &budget,
                         progress,
-                    )? {
-                        break 'profiles;
-                    }
+                    )?;
                     if include_bm25 {
                         let prefix = sources.prefixes.get(max_document);
                         prefix_terms = prefix_terms.saturating_add(prefix.len() as u64);
                         for &term in prefix {
-                            if !append_owned_candidates(
+                            append_owned_candidates(
                                 sources.global_full.posting_after(term, left_id),
                                 left_id,
                                 |profile| *profile,
@@ -2859,16 +2396,13 @@ fn generate_candidate_pairs(
                                 &mut pair_emissions,
                                 &mut zero_overlap_prunes,
                                 &mut unchecked_emissions,
-                                &budget,
                                 progress,
-                            )? {
-                                break 'profiles;
-                            }
+                            )?;
                         }
                     }
                     if left_profile.is_evm {
                         for &(token, document) in index.anchors(left_profile) {
-                            if !append_owned_candidates(
+                            append_owned_candidates(
                                 sources.shards[candidate_shard(token, document)]
                                     .token_exact_after((token, document), left_id),
                                 left_id,
@@ -2885,16 +2419,13 @@ fn generate_candidate_pairs(
                                 &mut pair_emissions,
                                 &mut zero_overlap_prunes,
                                 &mut unchecked_emissions,
-                                &budget,
                                 progress,
-                            )? {
-                                break 'profiles;
-                            }
+                            )?;
                             if include_bm25 {
                                 let prefix = sources.prefixes.get(document);
                                 prefix_terms = prefix_terms.saturating_add(prefix.len() as u64);
                                 for &term in prefix {
-                                    if !append_owned_candidates(
+                                    append_owned_candidates(
                                         sources.shards[candidate_shard(token, term)]
                                             .token_full_after((token, term), left_id),
                                         left_id,
@@ -2920,11 +2451,8 @@ fn generate_candidate_pairs(
                                         &mut pair_emissions,
                                         &mut zero_overlap_prunes,
                                         &mut unchecked_emissions,
-                                        &budget,
                                         progress,
-                                    )? {
-                                        break 'profiles;
-                                    }
+                                    )?;
                                 }
                             }
                         }
@@ -2937,7 +2465,6 @@ fn generate_candidate_pairs(
                 }
             }
             progress.add_completed(completed);
-            let _ = pairs.reserve_remainder(&budget);
             let (chunks, pair_count) = pairs.finish();
             Ok::<_, DedupError>(CandidateGeneration {
                 chunks,
@@ -2946,7 +2473,6 @@ fn generate_candidate_pairs(
                 pair_emissions,
                 prefix_terms,
                 zero_overlap_prunes,
-                abandoned: budget.exceeded.load(Ordering::Relaxed),
             })
         })
         .collect::<Vec<_>>()
@@ -2965,7 +2491,6 @@ fn generate_candidate_pairs(
     let zero_overlap_prunes = lanes.iter().fold(0_u64, |total, lane| {
         total.saturating_add(lane.zero_overlap_prunes)
     });
-    let abandoned = budget.exceeded.load(Ordering::Relaxed);
     let chunks = lanes
         .into_iter()
         .flat_map(|lane| lane.chunks)
@@ -2977,7 +2502,6 @@ fn generate_candidate_pairs(
         pair_emissions,
         prefix_terms,
         zero_overlap_prunes,
-        abandoned,
     })
 }
 
@@ -2995,9 +2519,8 @@ fn append_owned_candidates<T>(
     pair_emissions: &mut u64,
     zero_overlap_prunes: &mut u64,
     unchecked_emissions: &mut u64,
-    budget: &CandidateBudget,
     progress: &dyn ProgressObserver,
-) -> Result<bool, DedupError> {
+) -> Result<(), DedupError> {
     for entry in posting {
         let right = profile(entry);
         debug_assert!(right > left);
@@ -3005,23 +2528,18 @@ fn append_owned_candidates<T>(
         *unchecked_emissions += 1;
         if *unchecked_emissions >= CANDIDATE_CANCEL_BATCH {
             progress.check_cancelled()?;
-            if budget.exceeded.load(Ordering::Relaxed) {
-                return Ok(false);
-            }
             *unchecked_emissions = 0;
         }
         if seen.insert(right) {
             if let Some(candidate) = prepare(right) {
-                if !pairs.push(candidate, budget) {
-                    return Ok(false);
-                }
+                pairs.push(candidate);
                 *scoring_work = scoring_work.saturating_add(candidate_work(right));
             } else {
                 *zero_overlap_prunes = zero_overlap_prunes.saturating_add(1);
             }
         }
     }
-    Ok(true)
+    Ok(())
 }
 
 #[cfg(test)]
@@ -3059,15 +2577,10 @@ fn build_term_ranks(
     if term_count == 0 {
         return Ok(Vec::new());
     }
-    let bytes_per_lane = term_count
-        .checked_mul(std::mem::size_of::<u32>())
-        .ok_or_else(|| DedupError::invalid("metadata", "metadata term frequency size overflow"))?;
-    let max_budget_lanes = (DENSE_TERM_FREQUENCY_BUDGET_BYTES / bytes_per_lane).max(1);
     let average_reuse = index.terms.len().div_ceil(term_count).max(1);
     let desired_lanes = average_reuse.saturating_mul(2).max(8);
     let lane_count = rayon::current_num_threads()
         .min(index.documents.len())
-        .min(max_budget_lanes)
         .min(desired_lanes)
         .max(1);
 
@@ -3259,29 +2772,6 @@ fn build_document_prefixes(
     Ok(DocumentPrefixes {
         offsets: offsets.into_boxed_slice(),
         terms,
-    })
-}
-
-fn triple_posting_ranges(entries: &[(u32, u32, u32)]) -> Vec<(usize, usize)> {
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    while start < entries.len() {
-        let key = (entries[start].0, entries[start].1);
-        let mut end = start + 1;
-        while end < entries.len() && (entries[end].0, entries[end].1) == key {
-            end += 1;
-        }
-        if end - start > 1 {
-            ranges.push((start, end));
-        }
-        start = end;
-    }
-    ranges
-}
-
-fn estimate_pair_emissions(ranges: &[(usize, usize)]) -> u64 {
-    ranges.iter().fold(0_u64, |total, &(start, end)| {
-        total.saturating_add(choose_two((end - start) as u64))
     })
 }
 
@@ -3504,67 +2994,6 @@ fn compact_solana_profiles(
         });
     }
     Ok((profiles, anchors, members, chain_counts))
-}
-
-fn seed_exact_prepass(
-    index: &DirectIndex,
-    hits: &ProfileHits,
-    plan: &CrossProfilePlan,
-    progress: &dyn ProgressObserver,
-) -> Result<(), DedupError> {
-    let exact_prepass = match plan {
-        CrossProfilePlan::Full { exact_prepass } => exact_prepass,
-        CrossProfilePlan::Indexed(_) => return Ok(()),
-    };
-    let (pairs, masks) = match exact_prepass {
-        ExactPrepass::None => return Ok(()),
-        ExactPrepass::Pairs(pairs) => (Some(pairs.as_ref()), None),
-        ExactPrepass::Masks { values, .. } => (None, Some(values.as_ref())),
-    };
-    let total = pairs.map_or_else(
-        || masks.map_or(0, <[u64]>::len) as u64,
-        |pairs| pairs.len() as u64,
-    );
-    progress.begin_phase("direct_bm25_exact_prepass", Some(total));
-    let cancelled = AtomicBool::new(false);
-    if let Some(masks) = masks {
-        masks
-            .par_chunks(PREPARE_BATCH)
-            .enumerate()
-            .for_each(|(chunk_id, values)| {
-                if progress.check_cancelled().is_err() {
-                    cancelled.store(true, Ordering::Relaxed);
-                    return;
-                }
-                let start = chunk_id * PREPARE_BATCH;
-                for (offset, &mask) in values.iter().enumerate() {
-                    if mask != 0 {
-                        hits.insert_mask(start + offset, mask);
-                    }
-                }
-                progress.add_completed(values.len() as u64);
-            });
-    } else if let Some(pairs) = pairs {
-        pairs.par_chunks(PREPARE_BATCH).for_each(|keys| {
-            if progress.check_cancelled().is_err() {
-                cancelled.store(true, Ordering::Relaxed);
-                return;
-            }
-            for &key in keys {
-                let (left_id, right_id) = decode_profile_pair(key);
-                let left = &index.profiles[left_id];
-                let right = &index.profiles[right_id];
-                hits.insert_profile_chains(left_id, right, index.chains(right));
-                hits.insert_profile_chains(right_id, left, index.chains(left));
-            }
-            progress.add_completed(keys.len() as u64);
-        });
-    }
-    if cancelled.load(Ordering::Relaxed) {
-        Err(DedupError::Interrupted)
-    } else {
-        Ok(())
-    }
 }
 
 fn score_equivalent_profiles(
@@ -4184,7 +3613,7 @@ fn score_candidate_sources(
     if query_profile_count == 0 || profile_count < 2 {
         return Ok(CandidateScoreSummary::default());
     }
-    let (lane_count, dense_seen) = candidate_seen_lanes(profile_count, query_profile_count);
+    let lane_count = candidate_seen_lanes(query_profile_count);
     let fine_tail = lane_count
         .saturating_mul(CANDIDATE_FINE_TAIL_PER_LANE)
         .min(query_profile_count);
@@ -4268,7 +3697,6 @@ fn score_candidate_sources(
                             &mut left,
                             &mut seen,
                             profile_count,
-                            dense_seen,
                             &mut scorer,
                             &mut summary,
                             &mut unchecked_emissions,
@@ -4309,7 +3737,6 @@ fn score_candidate_postings<'a>(
     left: &mut IndexedLeftContext<'a>,
     seen: &mut Option<CandidateSeen>,
     profile_count: usize,
-    dense_seen: bool,
     scorer: &mut WorkerScorer<'a>,
     summary: &mut CandidateScoreSummary,
     unchecked_emissions: &mut u64,
@@ -4339,7 +3766,7 @@ fn score_candidate_postings<'a>(
             progress,
         ),
         _ => {
-            let seen = seen.get_or_insert_with(|| CandidateSeen::new(profile_count, dense_seen));
+            let seen = seen.get_or_insert_with(|| CandidateSeen::new(profile_count));
             seen.begin_profile();
             for posting in postings.iter() {
                 score_seen_candidate_posting(
@@ -4892,6 +4319,7 @@ fn document_pair_key(left: DocumentId, right: DocumentId) -> u64 {
     (u64::from(left) << 32) | u64::from(right)
 }
 
+#[cfg(test)]
 fn profile_pair_key(left: u32, right: u32) -> u64 {
     let (left, right) = if left <= right {
         (left, right)
@@ -4901,6 +4329,7 @@ fn profile_pair_key(left: u32, right: u32) -> u64 {
     (u64::from(left) << 32) | u64::from(right)
 }
 
+#[cfg(test)]
 fn decode_profile_pair(key: u64) -> (usize, usize) {
     ((key >> 32) as usize, key as u32 as usize)
 }
@@ -5029,7 +4458,6 @@ mod tests {
     fn record(token_id: &str, canonical_json: &str) -> MetadataRecord {
         MetadataRecord {
             token_id: token_id.to_owned(),
-            json: canonical_json.to_owned(),
             canonical_json: canonical_json.to_owned(),
             source_order: SourceOrder {
                 file_ordinal: 0,
@@ -5241,7 +4669,6 @@ mod tests {
             &mut left,
             &mut seen,
             index.profiles.len(),
-            true,
             &mut scorer,
             &mut summary,
             &mut unchecked,
@@ -5251,35 +4678,15 @@ mod tests {
     }
 
     #[test]
-    fn candidate_seen_limits_dense_workers_to_the_memory_budget() {
-        let bytes_per_lane = 1_000 * std::mem::size_of::<u32>();
-        assert_eq!(
-            candidate_seen_lanes_for_budget(1_000, 128, 128, bytes_per_lane * 3),
-            (3, true)
-        );
-        assert_eq!(
-            candidate_seen_lanes_for_budget(1_000, 128, 128, bytes_per_lane - 1),
-            (128, false)
-        );
-        assert_eq!(
-            candidate_seen_lanes_for_budget(1_000, 2, 128, usize::MAX),
-            (2, true)
-        );
-        assert_eq!(DENSE_CANDIDATE_SEEN_BUDGET_BYTES, 32 << 30);
-        assert_eq!(MAX_CANDIDATE_POSTING_BYTES, 256_u64 << 30);
-    }
-
-    #[test]
     fn owned_candidate_generation_deduplicates_and_checks_cancellation() {
         let entries = vec![(7, 1), (7, 1), (7, 2)];
-        let mut seen = CandidateSeen::new(3, true);
+        let mut seen = CandidateSeen::new(3);
         seen.begin_profile();
         let mut pairs = CandidatePairChunks::new();
         let mut scoring_work = 0;
         let mut emissions = 0;
         let mut zero_overlap_prunes = 0;
         let mut unchecked = 0;
-        let budget = CandidateBudget::new(u64::MAX);
         append_owned_candidates(
             &entries,
             0,
@@ -5292,7 +4699,6 @@ mod tests {
             &mut emissions,
             &mut zero_overlap_prunes,
             &mut unchecked,
-            &budget,
             &NoopProgress,
         )
         .unwrap();
@@ -5310,7 +4716,7 @@ mod tests {
         assert_eq!(zero_overlap_prunes, 0);
         assert_eq!(scoring_work, 2);
 
-        let mut seen = CandidateSeen::new(3, false);
+        let mut seen = CandidateSeen::new(3);
         seen.begin_profile();
         let mut unchecked = CANDIDATE_CANCEL_BATCH - 1;
         let mut scoring_work = 0;
@@ -5327,7 +4733,6 @@ mod tests {
                 &mut 0,
                 &mut 0,
                 &mut unchecked,
-                &budget,
                 &CancelledProgress,
             ),
             Err(DedupError::Interrupted)
@@ -5338,17 +4743,12 @@ mod tests {
     fn candidate_pairs_stay_in_bounded_zero_copy_score_chunks() {
         let expected_len = CANDIDATE_PAIR_CHUNK * 2 + 7;
         let mut builder = CandidatePairChunks::new();
-        let budget = CandidateBudget::new(u64::MAX);
         for pair in 0..expected_len as u64 {
-            assert!(builder.push(
-                CandidatePair {
-                    profile_key: pair,
-                    document_key: pair,
-                },
-                &budget,
-            ));
+            builder.push(CandidatePair {
+                profile_key: pair,
+                document_key: pair,
+            });
         }
-        assert!(builder.reserve_remainder(&budget));
         let (chunks, len) = builder.finish();
         let pairs = IndexedPairs::new(chunks, len);
         assert_eq!(pairs.len(), expected_len);
@@ -5365,27 +4765,6 @@ mod tests {
                 .collect::<Vec<_>>(),
             (0..expected_len as u64).collect::<Vec<_>>()
         );
-    }
-
-    #[test]
-    fn candidate_pair_budget_stops_at_a_chunk_boundary() {
-        let budget = CandidateBudget::new(CANDIDATE_PAIR_CHUNK as u64 - 1);
-        let mut builder = CandidatePairChunks::new();
-        for pair in 0..CANDIDATE_PAIR_CHUNK {
-            let admitted = builder.push(
-                CandidatePair {
-                    profile_key: pair as u64,
-                    document_key: pair as u64,
-                },
-                &budget,
-            );
-            if pair + 1 == CANDIDATE_PAIR_CHUNK {
-                assert!(!admitted);
-            } else {
-                assert!(admitted);
-            }
-        }
-        assert!(budget.exceeded.load(Ordering::Relaxed));
     }
 
     #[test]
@@ -5767,7 +5146,6 @@ mod tests {
             &mut left,
             &mut seen,
             index.profiles.len(),
-            true,
             &mut scorer,
             &mut summary,
             &mut unchecked,
@@ -5836,7 +5214,6 @@ mod tests {
             &mut left,
             &mut seen,
             index.profiles.len(),
-            true,
             &mut scorer,
             &mut summary,
             &mut unchecked,
@@ -5903,7 +5280,7 @@ mod tests {
                 let source_refs = sources.iter().map(Vec::as_slice).collect::<Vec<_>>();
                 let raw_emissions = sources.iter().map(Vec::len).sum::<usize>() as u64;
                 let nonempty_sources = sources.iter().filter(|source| !source.is_empty()).count();
-                let mut reference = CandidateSeen::new(PROFILE_COUNT, false);
+                let mut reference = CandidateSeen::new(PROFILE_COUNT);
                 reference.begin_profile();
                 let mut unique = 0_u64;
                 for source in &sources {
@@ -6302,6 +5679,50 @@ mod tests {
     }
 
     #[test]
+    fn unbounded_anchors_include_matches_beyond_the_previous_default() {
+        let evm = ["ethereum".to_owned()].into_iter().collect::<HashSet<_>>();
+        let mut store = EntityStore::with_options(None, &evm.iter().cloned().collect());
+        for address in ["0xa", "0xb"] {
+            for token in 1..=8 {
+                let metadata = format!(r#"{{"{address}_{token}":"{address}_{token}"}}"#);
+                store
+                    .try_ingest_row(input("ethereum", address, &token.to_string(), &metadata))
+                    .unwrap();
+            }
+            store
+                .try_ingest_row(input(
+                    "ethereum",
+                    address,
+                    "9",
+                    r#"{"shared":"match beyond eight"}"#,
+                ))
+                .unwrap();
+        }
+        assert!(
+            store
+                .contracts
+                .iter()
+                .all(|contract| contract.metadata_by_token.len() == 9)
+        );
+
+        let ethereum = store.chain_ids["ethereum"];
+        let mut acc = SummaryAccumulator::default();
+        run_direct(&store, &evm, None, 0.6, &mut acc, &NoopProgress).unwrap();
+        let counts = acc
+            .counts()
+            .iter()
+            .find(|(key, _)| {
+                key.kind == ScopeKind::IntraChain
+                    && key.primary_chain == ethereum
+                    && key.dimension == Dimension::Metadata
+            })
+            .map(|(_, counts)| counts)
+            .unwrap();
+        assert_eq!(counts.duplicate_contract_count, 2);
+        assert_eq!(counts.duplicate_nft_count, 18);
+    }
+
+    #[test]
     fn solana_participates_intra_and_cross_chain_per_nft() {
         let evm = ["ethereum".to_owned()].into_iter().collect::<HashSet<_>>();
         let mut store = EntityStore::with_options(8, &evm.iter().cloned().collect());
@@ -6425,9 +5846,7 @@ mod tests {
             0.6,
             &full_stats,
             &NoopProgress,
-            &CrossProfilePlan::Full {
-                exact_prepass: ExactPrepass::None,
-            },
+            &CrossProfilePlan::Full,
         )
         .unwrap();
         let solana = store.chain_ids["solana"];
@@ -6580,110 +5999,6 @@ mod tests {
                 + stats.bm25_scores,
             stats.profile_pair_tasks + stats.equivalent_profile_tasks
         );
-    }
-
-    #[test]
-    fn exact_prepass_reuses_profiles_sorted_by_max_document() {
-        let evm = ["ethereum".to_owned()].into_iter().collect::<HashSet<_>>();
-        let mut store = EntityStore::with_options(1, &evm.iter().cloned().collect());
-        for (contract, token) in [("left", "1"), ("right", "2")] {
-            store
-                .try_ingest_row(input(
-                    "ethereum",
-                    contract,
-                    token,
-                    r#"{"selected":"identical"}"#,
-                ))
-                .unwrap();
-        }
-        let index = build_index(&store, &evm, 1, &NoopProgress).unwrap();
-        assert_eq!(index.profiles.len(), 2);
-        assert_eq!(
-            index.profiles[0].max_document(),
-            index.profiles[1].max_document()
-        );
-
-        let progress = PhaseProgress::default();
-        let exact_prepass = build_exact_prepass(&index, &progress).unwrap();
-        assert!(matches!(
-            exact_prepass,
-            ExactPrepass::Masks { pair_count: 1, .. }
-        ));
-        for phase in [
-            "candidate_prepass_build",
-            "candidate_prepass_sort",
-            "candidate_prepass_count",
-            "candidate_prepass_collect",
-            "candidate_prepass_dedup",
-            "candidate_prepass_validate",
-            "candidate_prepass_compact",
-        ] {
-            progress.assert_complete(phase);
-        }
-    }
-
-    #[test]
-    fn exact_document_runs_cross_batch_boundaries_and_remain_cancellable() {
-        let mut profiles = (0..PREPARE_BATCH - 1)
-            .map(|document| profile(false, &[(0, document as u32)]))
-            .collect::<Vec<_>>();
-        profiles.push(profile(false, &[(0, (PREPARE_BATCH - 1) as u32)]));
-        profiles.push(profile(false, &[(0, (PREPARE_BATCH - 1) as u32)]));
-
-        let progress = PhaseProgress::default();
-        progress.begin_phase("exact_run_count", Some(profiles.len() as u64));
-        assert_eq!(
-            estimate_exact_document_emissions(&profiles, &progress).unwrap(),
-            1
-        );
-        progress.assert_complete("exact_run_count");
-        let mut pairs = Vec::new();
-        append_bounded_exact_document_pairs(&profiles, 1, &mut pairs, &NoopProgress).unwrap();
-        assert_eq!(
-            pairs,
-            vec![profile_pair_key(
-                (PREPARE_BATCH - 1) as u32,
-                PREPARE_BATCH as u32
-            )]
-        );
-
-        let unique_profiles = (0..=PREPARE_BATCH)
-            .map(|document| profile(false, &[(0, document as u32)]))
-            .collect::<Vec<_>>();
-        assert!(matches!(
-            estimate_exact_document_emissions(&unique_profiles, &CancelAfterChecks::new(1)),
-            Err(DedupError::Interrupted)
-        ));
-        assert!(matches!(
-            append_bounded_exact_document_pairs(
-                &unique_profiles,
-                usize::MAX,
-                &mut Vec::new(),
-                &CancelAfterChecks::new(1),
-            ),
-            Err(DedupError::Interrupted)
-        ));
-    }
-
-    #[test]
-    fn narrow_exact_prepass_compacts_pairs_into_profile_masks() {
-        let evm = ["ethereum".to_owned()].into_iter().collect::<HashSet<_>>();
-        let mut store = EntityStore::with_options(16, &evm.iter().cloned().collect());
-        for (contract, token) in [("left", "1"), ("right", "2")] {
-            store
-                .try_ingest_row(input(
-                    "ethereum",
-                    contract,
-                    token,
-                    r#"{"selected":"identical"}"#,
-                ))
-                .unwrap();
-        }
-        let index = build_index(&store, &evm, 16, &NoopProgress).unwrap();
-        assert_eq!(index.profiles.len(), 2);
-        let prepass =
-            finalize_exact_prepass(&index, vec![profile_pair_key(0, 1)], &NoopProgress).unwrap();
-        assert!(matches!(prepass, ExactPrepass::Masks { pair_count: 1, .. }));
     }
 
     #[test]

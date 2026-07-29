@@ -15,15 +15,15 @@ pub struct MetadataRunResult {
 }
 
 pub fn run_metadata(
-    store: &EntityStore,
+    store: &mut EntityStore,
     evm_chains: &std::collections::HashSet<String>,
-    anchors_k: usize,
+    anchors_k: Option<usize>,
     content_threshold: f64,
     acc: &mut SummaryAccumulator,
     progress: &dyn ProgressObserver,
 ) -> Result<MetadataRunResult, DedupError> {
     progress.set_stage("metadata");
-    let stats = direct::run_direct(
+    let stats = direct::run_direct_releasing(
         store,
         evm_chains,
         anchors_k,

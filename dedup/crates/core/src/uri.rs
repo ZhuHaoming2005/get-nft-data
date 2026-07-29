@@ -8,16 +8,6 @@ use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[derive(Clone)]
-struct UriScopeHit {
-    contract_id: ContractId,
-    uri_id: StringId,
-    nft_ids: Vec<NftId>,
-    dimension: Dimension,
-    kind: ScopeKind,
-    secondary_chain: Option<ChainId>,
-}
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 struct UriUnitKey {
     contract_id: ContractId,
@@ -33,16 +23,23 @@ struct LocalUriAccumulator {
 }
 
 impl LocalUriAccumulator {
-    fn add(&mut self, hit: &UriScopeHit) {
+    fn add(
+        &mut self,
+        posting: &UriPosting,
+        nft_count: u64,
+        dimension: Dimension,
+        kind: ScopeKind,
+        secondary_chain: Option<ChainId>,
+    ) {
         self.units
             .entry(UriUnitKey {
-                contract_id: hit.contract_id,
-                uri_id: hit.uri_id,
-                dimension: hit.dimension,
-                kind: hit.kind,
-                secondary_chain: hit.secondary_chain,
+                contract_id: posting.contract_id,
+                uri_id: posting.uri_id,
+                dimension,
+                kind,
+                secondary_chain,
             })
-            .or_insert(hit.nft_ids.len() as u64);
+            .or_insert(nft_count);
     }
 
     fn merge(&mut self, mut other: Self) {
@@ -77,17 +74,23 @@ struct TokenWorker {
 }
 
 impl TokenWorker {
-    fn add(&mut self, hit: UriScopeHit) {
-        match hit.kind {
-            ScopeKind::IntraChain => self.intra.extend(&hit.nft_ids),
-            ScopeKind::CrossChainSummary => self.cross_summary.extend(&hit.nft_ids),
+    fn add(&mut self, posting: &UriPosting, kind: ScopeKind, secondary_chain: Option<ChainId>) {
+        match kind {
+            ScopeKind::IntraChain => self.intra.extend_from_slice(&posting.nft_ids),
+            ScopeKind::CrossChainSummary => self.cross_summary.extend_from_slice(&posting.nft_ids),
             ScopeKind::ChainMatrix => {
-                let secondary = hit.secondary_chain.expect("matrix hit has secondary chain");
+                let secondary = secondary_chain.expect("matrix hit has secondary chain");
                 self.matrix
-                    .extend(hit.nft_ids.iter().map(|&nft_id| (nft_id, secondary)));
+                    .extend(posting.nft_ids.iter().map(|&nft_id| (nft_id, secondary)));
             }
         }
-        self.uri.add(&hit);
+        self.uri.add(
+            posting,
+            posting.nft_ids.len() as u64,
+            Dimension::TokenUri,
+            kind,
+            secondary_chain,
+        );
     }
 
     fn merge(&mut self, mut other: Self) {
@@ -160,9 +163,7 @@ pub fn run_uri(
                 cancelled.store(true, Ordering::Relaxed);
                 return worker;
             }
-            for hit in token_scope_hits(&store.token_uri_postings[range.clone()]) {
-                worker.add(hit);
-            }
+            accumulate_token_scope_hits(&store.token_uri_postings[range.clone()], &mut worker);
             progress.add_completed(1);
             worker
         })
@@ -195,9 +196,11 @@ pub fn run_uri(
                 cancelled.store(true, Ordering::Relaxed);
                 return local;
             }
-            for hit in image_scope_hits(&store.image_uri_postings[range.clone()], &token_hits) {
-                local.add(&hit);
-            }
+            accumulate_image_scope_hits(
+                &store.image_uri_postings[range.clone()],
+                &token_hits,
+                &mut local,
+            );
             progress.add_completed(1);
             local
         })
@@ -235,62 +238,54 @@ fn postings_by_chain(members: &[UriPosting]) -> AHashMap<ChainId, Vec<&UriPostin
     by_chain
 }
 
-fn token_scope_hits(members: &[UriPosting]) -> Vec<UriScopeHit> {
+fn accumulate_token_scope_hits(members: &[UriPosting], worker: &mut TokenWorker) {
     let by_chain = postings_by_chain(members);
     let chains: Vec<ChainId> = by_chain.keys().copied().collect();
-    let mut hits = Vec::new();
     for (&chain, postings) in &by_chain {
         if postings.len() >= 2 {
-            hits.extend(postings.iter().map(|posting| {
-                scope_hit(posting, Dimension::TokenUri, ScopeKind::IntraChain, None)
-            }));
+            for posting in postings {
+                worker.add(posting, ScopeKind::IntraChain, None);
+            }
         }
         if chains.len() >= 2 {
-            hits.extend(postings.iter().map(|posting| {
-                scope_hit(
-                    posting,
-                    Dimension::TokenUri,
-                    ScopeKind::CrossChainSummary,
-                    None,
-                )
-            }));
+            for posting in postings {
+                worker.add(posting, ScopeKind::CrossChainSummary, None);
+            }
         }
         for &other_chain in &chains {
             if other_chain == chain {
                 continue;
             }
-            hits.extend(postings.iter().map(|posting| {
-                scope_hit(
-                    posting,
-                    Dimension::TokenUri,
-                    ScopeKind::ChainMatrix,
-                    Some(other_chain),
-                )
-            }));
+            for posting in postings {
+                worker.add(posting, ScopeKind::ChainMatrix, Some(other_chain));
+            }
         }
     }
-    hits
 }
 
-fn image_scope_hits(members: &[UriPosting], token_hits: &TokenHits) -> Vec<UriScopeHit> {
+fn accumulate_image_scope_hits(
+    members: &[UriPosting],
+    token_hits: &TokenHits,
+    output: &mut LocalUriAccumulator,
+) {
     let by_chain = postings_by_chain(members);
     let chains: Vec<ChainId> = by_chain.keys().copied().collect();
-    let mut hits = Vec::new();
 
     for (&chain, postings) in &by_chain {
-        let intra = filtered_postings(postings, |nft_id| !token_hits.intra.contains(nft_id));
+        let intra = filtered_posting_counts(postings, |nft_id| !token_hits.intra.contains(nft_id));
         if intra.len() >= 2 {
-            hits.extend(intra.into_iter().map(|(posting, nft_ids)| UriScopeHit {
-                contract_id: posting.contract_id,
-                uri_id: posting.uri_id,
-                nft_ids,
-                dimension: Dimension::ImageUri,
-                kind: ScopeKind::IntraChain,
-                secondary_chain: None,
-            }));
+            for (posting, nft_count) in intra {
+                output.add(
+                    posting,
+                    nft_count,
+                    Dimension::ImageUri,
+                    ScopeKind::IntraChain,
+                    None,
+                );
+            }
         }
 
-        let primary_cross = filtered_postings(postings, |nft_id| {
+        let primary_cross = filtered_posting_counts(postings, |nft_id| {
             !token_hits.cross_summary.contains(nft_id)
         });
         let has_other_cross = chains.iter().any(|&other_chain| {
@@ -303,25 +298,22 @@ fn image_scope_hits(members: &[UriPosting], token_hits: &TokenHits) -> Vec<UriSc
                 })
         });
         if !primary_cross.is_empty() && has_other_cross {
-            hits.extend(
-                primary_cross
-                    .into_iter()
-                    .map(|(posting, nft_ids)| UriScopeHit {
-                        contract_id: posting.contract_id,
-                        uri_id: posting.uri_id,
-                        nft_ids,
-                        dimension: Dimension::ImageUri,
-                        kind: ScopeKind::CrossChainSummary,
-                        secondary_chain: None,
-                    }),
-            );
+            for (posting, nft_count) in primary_cross {
+                output.add(
+                    posting,
+                    nft_count,
+                    Dimension::ImageUri,
+                    ScopeKind::CrossChainSummary,
+                    None,
+                );
+            }
         }
 
         for &other_chain in &chains {
             if other_chain == chain {
                 continue;
             }
-            let primary_matrix = filtered_postings(postings, |nft_id| {
+            let primary_matrix = filtered_posting_counts(postings, |nft_id| {
                 !token_hits.matrix.contains(&(nft_id, other_chain))
             });
             let other_has_match = by_chain[&other_chain].iter().any(|posting| {
@@ -331,56 +323,36 @@ fn image_scope_hits(members: &[UriPosting], token_hits: &TokenHits) -> Vec<UriSc
                     .any(|nft_id| !token_hits.matrix.contains(&(*nft_id, chain)))
             });
             if !primary_matrix.is_empty() && other_has_match {
-                hits.extend(
-                    primary_matrix
-                        .into_iter()
-                        .map(|(posting, nft_ids)| UriScopeHit {
-                            contract_id: posting.contract_id,
-                            uri_id: posting.uri_id,
-                            nft_ids,
-                            dimension: Dimension::ImageUri,
-                            kind: ScopeKind::ChainMatrix,
-                            secondary_chain: Some(other_chain),
-                        }),
-                );
+                for (posting, nft_count) in primary_matrix {
+                    output.add(
+                        posting,
+                        nft_count,
+                        Dimension::ImageUri,
+                        ScopeKind::ChainMatrix,
+                        Some(other_chain),
+                    );
+                }
             }
         }
     }
-    hits
 }
 
-fn filtered_postings<'a>(
+fn filtered_posting_counts<'a>(
     postings: &[&'a UriPosting],
     keep: impl Fn(NftId) -> bool,
-) -> Vec<(&'a UriPosting, Vec<NftId>)> {
+) -> Vec<(&'a UriPosting, u64)> {
     postings
         .iter()
         .filter_map(|posting| {
-            let nft_ids = posting
+            let nft_count = posting
                 .nft_ids
                 .iter()
                 .copied()
                 .filter(|&nft_id| keep(nft_id))
-                .collect::<Vec<_>>();
-            (!nft_ids.is_empty()).then_some((*posting, nft_ids))
+                .count() as u64;
+            (nft_count != 0).then_some((*posting, nft_count))
         })
         .collect()
-}
-
-fn scope_hit(
-    posting: &UriPosting,
-    dimension: Dimension,
-    kind: ScopeKind,
-    secondary_chain: Option<ChainId>,
-) -> UriScopeHit {
-    UriScopeHit {
-        contract_id: posting.contract_id,
-        uri_id: posting.uri_id,
-        nft_ids: posting.nft_ids.clone(),
-        dimension,
-        kind,
-        secondary_chain,
-    }
 }
 
 #[cfg(test)]
