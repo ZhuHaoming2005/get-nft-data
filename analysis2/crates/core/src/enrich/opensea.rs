@@ -314,6 +314,19 @@ pub async fn fetch_contract_sales_with_slug(
             }
         }
     };
+    // Some provider profiles use the EVM contract address as a placeholder
+    // collection identifier. OpenSea's collection-events route requires a real
+    // slug and deterministically returns 404 for that placeholder. Preserve
+    // Failed market-evidence semantics without spending a rate-limited request.
+    if !chain.eq_ignore_ascii_case("solana") && valid_evm_address(&slug) {
+        return FetchOutcome::failed(
+            "opensea",
+            "opensea_sales",
+            format!(
+                "OpenSea collection slug unresolved for {contract}: provider returned contract address"
+            ),
+        );
+    }
     let base_url = format!(
         "{}/api/v2/events/collection/{}?event_type=sale&limit={EVENT_PAGE_SIZE}",
         base_url.trim_end_matches('/'),
@@ -801,5 +814,36 @@ mod tests {
         assert!(outcome.failure.is_some());
         assert_eq!(contract.hits(), 1);
         assert_eq!(sales.hits(), 1);
+    }
+
+    #[tokio::test]
+    async fn evm_address_placeholder_slug_skips_collection_events_request() {
+        let server = MockServer::start_async().await;
+        let events = server
+            .mock_async(|when, then| {
+                when.method(GET).path_contains("/api/v2/events/collection/");
+                then.status(500);
+            })
+            .await;
+        let client = HttpClient::with_retries(1, 0).unwrap();
+        let contract = "0xaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let outcome = fetch_contract_sales_with_slug(
+            &client,
+            &server.base_url(),
+            Some("key"),
+            "base",
+            contract,
+            5,
+            Some(contract),
+        )
+        .await;
+        assert_eq!(outcome.status, EvidenceStatus::Failed);
+        assert!(
+            outcome
+                .failure
+                .as_deref()
+                .is_some_and(|failure| { failure.contains("provider returned contract address") })
+        );
+        assert_eq!(events.hits(), 0);
     }
 }

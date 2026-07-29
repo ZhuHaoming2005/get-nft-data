@@ -122,6 +122,10 @@ Successful non-price provider JSON responses are durably cached under
 `intermediate/api_success_cache/`. Cache identities exclude API secrets and are
 independent of the derived evidence-cache version. Failed responses are retried;
 Alchemy spot-price responses remain day-refreshed rather than permanent.
+Candidate controller and Solana collection-identity probes are additionally
+checkpointed by stable chain/address under
+`intermediate/candidate_identity_cache.json`, so changing HTTP batch boundaries
+does not invalidate successful identity work. Transient failures are not reused.
 
 ```powershell
 cargo run --manifest-path analysis2/Cargo.toml --release -- run `

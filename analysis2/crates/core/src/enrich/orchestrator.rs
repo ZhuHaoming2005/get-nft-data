@@ -1854,8 +1854,8 @@ mod tests {
         );
         assert_eq!(
             progress.completed.load(Ordering::Relaxed),
-            4,
-            "seed, candidate identity, relation, and full enrichment must each advance progress"
+            5,
+            "seed, identity prefetch, candidate identity, relation, and full enrichment must each advance progress"
         );
         assert_eq!(
             *progress.stages.lock().unwrap(),
@@ -1866,6 +1866,7 @@ mod tests {
             *progress.phases.lock().unwrap(),
             [
                 "seed_caches",
+                "candidate_identity_prefetch",
                 "candidate_identity",
                 "relations",
                 "enrich_candidates"

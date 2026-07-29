@@ -30,7 +30,6 @@ static CACHE_TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 #[derive(Clone, Debug)]
 struct SuccessResponseCache {
     root: PathBuf,
-    io: Arc<Mutex<()>>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -41,10 +40,7 @@ struct SuccessCacheEntry {
 
 impl SuccessResponseCache {
     fn new(root: PathBuf) -> Self {
-        Self {
-            root,
-            io: Arc::new(Mutex::new(())),
-        }
+        Self { root }
     }
 
     fn path(&self, provider: &str, identity: &str) -> PathBuf {
@@ -54,16 +50,12 @@ impl SuccessResponseCache {
     }
 
     fn load(&self, provider: &str, identity: &str) -> Option<Value> {
-        let _guard = self.io.lock().ok()?;
         let body = fs::read(self.path(provider, identity)).ok()?;
         let entry: SuccessCacheEntry = serde_json::from_slice(&body).ok()?;
         (entry.request_identity == identity).then_some(entry.response)
     }
 
-    fn store(&self, provider: &str, identity: &str, response: &Value) {
-        let Ok(_guard) = self.io.lock() else {
-            return;
-        };
+    fn store(&self, provider: &str, identity: &str, response: Value) {
         let path = self.path(provider, identity);
         let Some(parent) = path.parent() else {
             return;
@@ -73,7 +65,7 @@ impl SuccessResponseCache {
         }
         let entry = SuccessCacheEntry {
             request_identity: identity.to_owned(),
-            response: response.clone(),
+            response,
         };
         let Ok(body) = serde_json::to_vec(&entry) else {
             return;
@@ -405,13 +397,14 @@ impl HttpClient {
         let endpoint = redact_endpoint(url);
         let cache_identity = success_cache_identity(&method, &endpoint, body);
         let cacheable = success_response_is_cacheable(&endpoint, body);
-        if cacheable
-            && let Some(value) = self
-                .success_cache
-                .as_ref()
-                .and_then(|cache| cache.load(lane.name, &cache_identity))
-        {
-            return Ok(value);
+        if cacheable && let Some(cache) = self.success_cache.clone() {
+            let provider = lane.name;
+            let identity = cache_identity.clone();
+            if let Ok(Some(value)) =
+                tokio::task::spawn_blocking(move || cache.load(provider, &identity)).await
+            {
+                return Ok(value);
+            }
         }
         let mut last_error = None;
         for attempt in 0..=self.retries {
@@ -460,9 +453,15 @@ impl HttpClient {
                     }
                     if cacheable
                         && response_is_fully_successful(&value)
-                        && let Some(cache) = &self.success_cache
+                        && let Some(cache) = self.success_cache.clone()
                     {
-                        cache.store(lane.name, &cache_identity, &value);
+                        let provider = lane.name;
+                        let identity = cache_identity.clone();
+                        let cached_value = value.clone();
+                        let _ = tokio::task::spawn_blocking(move || {
+                            cache.store(provider, &identity, cached_value);
+                        })
+                        .await;
                     }
                     return Ok(value);
                 }

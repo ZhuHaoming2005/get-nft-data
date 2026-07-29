@@ -469,6 +469,9 @@ pub struct HttpLimits {
     /// Durable raw JSON cache for successful, non-volatile provider requests.
     /// API secrets are excluded from cache identities.
     pub success_response_cache_dir: Option<std::path::PathBuf>,
+    /// Candidate-scoped controller/collection identity checkpoint. Unlike the
+    /// raw response cache, this remains reusable when batch boundaries change.
+    pub candidate_identity_cache_path: Option<std::path::PathBuf>,
     pub endpoints: ProviderEndpoints,
 }
 
@@ -487,6 +490,7 @@ impl Default for HttpLimits {
             max_history_assets: 20,
             max_signatures_per_asset: 50,
             success_response_cache_dir: None,
+            candidate_identity_cache_path: None,
             endpoints: ProviderEndpoints::default(),
         }
     }

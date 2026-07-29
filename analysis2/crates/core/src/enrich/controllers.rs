@@ -1,9 +1,11 @@
 //! Fill `EvidenceBundle.controllers` from Alchemy / on-chain (EVM) and Helius (Solana).
 
+use futures_util::{StreamExt, stream};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
 
 use crate::entity::ContractId;
+use crate::progress::ProgressObserver;
 
 use super::alchemy::FetchOutcome;
 use super::http::HttpClient;
@@ -12,7 +14,7 @@ use super::types::ProviderEndpoints;
 const EIP1967_ADMIN_SLOT: &str =
     "0xb53127684a568b3173ae13b9f8a6016e243e63b6e8ee1178d6a717850b5d6103";
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct EvmControllerEvidence {
     pub addresses: Vec<String>,
     pub deployed_block: Option<u64>,
@@ -143,14 +145,19 @@ pub async fn fetch_evm_controllers_batch(
     endpoints: &ProviderEndpoints,
     api_key: Option<&str>,
     requests: &[(ContractId, String, String)],
+    concurrency: usize,
+    progress: &dyn ProgressObserver,
 ) -> ahash::AHashMap<ContractId, FetchOutcome<EvmControllerEvidence>> {
-    const CONTRACTS_PER_BATCH: usize = 100;
+    // Each contract contributes four JSON-RPC calls. Keep the resulting RPC
+    // batch below 50 calls, then run several small batches concurrently.
+    const CONTRACTS_PER_BATCH: usize = 12;
 
     let mut out = ahash::AHashMap::with_capacity(requests.len());
     let Some(api_key) = api_key else {
         for (id, _, _) in requests {
             out.insert(*id, FetchOutcome::skipped("contract_controllers"));
         }
+        progress.add_completed(requests.len() as u64);
         return out;
     };
 
@@ -162,35 +169,54 @@ pub async fn fetch_evm_controllers_batch(
             .push((*id, contract.clone()));
     }
 
-    for (chain, rows) in by_chain {
-        for chunk in rows.chunks(CONTRACTS_PER_BATCH) {
-            if chunk.len() == 1 {
-                let (id, contract) = &chunk[0];
-                out.insert(
-                    *id,
-                    fetch_evm_controllers(client, endpoints, Some(api_key), &chain, contract).await,
-                );
-                continue;
-            }
-            match fetch_controller_chunk(client, endpoints, api_key, &chain, chunk).await {
-                Some(chunk_rows) => out.extend(chunk_rows),
-                None => {
-                    for (id, contract) in chunk {
-                        out.insert(
-                            *id,
-                            fetch_evm_controllers(
-                                client,
-                                endpoints,
-                                Some(api_key),
-                                &chain,
-                                contract,
-                            )
-                            .await,
-                        );
-                    }
-                }
-            }
+    let jobs = by_chain
+        .into_iter()
+        .flat_map(|(chain, rows)| {
+            rows.chunks(CONTRACTS_PER_BATCH)
+                .map(|chunk| (chain.clone(), chunk.to_vec()))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    // Each batch starts metadata and RPC requests together. Reserving two
+    // provider slots per job prevents the outer scheduler from flooding the
+    // shared Alchemy lane.
+    let batch_concurrency = (concurrency.max(1) / 2).max(1);
+    let mut results = stream::iter(jobs.into_iter().map(|(chain, chunk)| async move {
+        if chunk.len() == 1 {
+            let (id, contract) = &chunk[0];
+            return ahash::AHashMap::from_iter([(
+                *id,
+                fetch_evm_controllers(client, endpoints, Some(api_key), &chain, contract).await,
+            )]);
         }
+        if let Some(rows) = fetch_controller_chunk(client, endpoints, api_key, &chain, &chunk).await
+        {
+            return rows;
+        }
+
+        // A malformed/unusable provider batch must not serialize the whole
+        // chunk. Retry its candidates independently under the same HTTP lane.
+        let mut fallback = stream::iter(chunk.into_iter().map(|(id, contract)| {
+            let chain = chain.clone();
+            async move {
+                (
+                    id,
+                    fetch_evm_controllers(client, endpoints, Some(api_key), &chain, &contract)
+                        .await,
+                )
+            }
+        }))
+        .buffer_unordered(concurrency.max(1));
+        let mut rows = ahash::AHashMap::new();
+        while let Some((id, outcome)) = fallback.next().await {
+            rows.insert(id, outcome);
+        }
+        rows
+    }))
+    .buffer_unordered(batch_concurrency);
+    while let Some(rows) = results.next().await {
+        progress.add_completed(rows.len() as u64);
+        out.extend(rows);
     }
     out
 }
@@ -669,6 +695,8 @@ mod tests {
                 (1, "ethereum".into(), first.into()),
                 (2, "ethereum".into(), second.into()),
             ],
+            4,
+            &crate::progress::NoopProgress,
         )
         .await;
 

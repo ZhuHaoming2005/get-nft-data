@@ -28,7 +28,7 @@ pub struct NativeTransfer {
 const ZERO: &str = "0x0000000000000000000000000000000000000000";
 const MAX_COUNT_HEX: &str = "0x3e8";
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct FetchOutcome<T> {
     pub value: T,
     pub status: EvidenceStatus,

@@ -14,6 +14,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, Notify};
 
 use crate::error::Analysis2Error;
+use crate::progress::ProgressObserver;
 
 use super::alchemy::{FetchOutcome, is_open_license_payload};
 use super::controllers::solana_authorities_from_asset;
@@ -182,6 +183,60 @@ pub async fn fetch_collection_identity(
     (!trimmed.is_empty()).then(|| trimmed.to_owned())
 }
 
+/// Lightweight collection identity used by the legitimacy preflight. This
+/// deliberately excludes collection-member assets; deep enrichment fetches
+/// those only for candidates that survive the legitimacy gate.
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+pub struct CollectionIdentityProbe {
+    pub identity: Option<String>,
+    pub authorities: Vec<String>,
+}
+
+fn collection_authorities_from_asset(asset: &Value, collection: &str) -> Vec<String> {
+    let mut authorities = solana_authorities_from_asset(asset, asset, collection);
+    if let Some(rows) = asset.get("authorities").and_then(Value::as_array) {
+        for row in rows {
+            if let Some(address) = row.get("address").and_then(Value::as_str) {
+                let address = address.trim();
+                if !address.is_empty() {
+                    authorities.push(address.to_owned());
+                }
+            }
+        }
+    }
+    authorities.sort();
+    authorities.dedup();
+    authorities
+}
+
+async fn fetch_collection_identity_probe(
+    client: &HttpClient,
+    rpc_url: &str,
+    api_key: &str,
+    collection: &str,
+) -> CollectionIdentityProbe {
+    let url = with_api_key(rpc_url, api_key);
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": format!("collection-id-{collection}"),
+        "method": "getAsset",
+        "params": {"id": collection}
+    });
+    let Some(result) = client
+        .post_json_helius(&url, &[], &body)
+        .await
+        .ok()
+        .and_then(|payload| payload.get("result").cloned())
+    else {
+        return CollectionIdentityProbe::default();
+    };
+    CollectionIdentityProbe {
+        identity: parse_collection_metadata_identity(&result)
+            .or_else(|| Some(collection.to_owned())),
+        authorities: collection_authorities_from_asset(&result, collection),
+    }
+}
+
 /// Resolve many collection identities through the DAS `getAssetBatch`
 /// endpoint. Missing or malformed batch members fall back to `getAsset`
 /// individually, preserving the previous result semantics.
@@ -190,65 +245,93 @@ pub async fn fetch_collection_identities_batch(
     rpc_url: &str,
     api_key: Option<&str>,
     collections: &[String],
-) -> AHashMap<String, Option<String>> {
+    concurrency: usize,
+    progress: &dyn ProgressObserver,
+) -> AHashMap<String, CollectionIdentityProbe> {
+    const COLLECTIONS_PER_BATCH: usize = 100;
+
     let mut out = AHashMap::with_capacity(collections.len());
     let Some(api_key) = api_key else {
         for collection in collections {
-            out.insert(collection.clone(), None);
+            out.insert(collection.clone(), CollectionIdentityProbe::default());
         }
+        progress.add_completed(collections.len() as u64);
         return out;
     };
     let url = with_api_key(rpc_url, api_key);
-    for chunk in collections.chunks(1_000) {
-        if chunk.len() == 1 {
-            let collection = &chunk[0];
-            out.insert(
-                collection.clone(),
-                fetch_collection_identity(client, rpc_url, Some(api_key), collection).await,
-            );
-            continue;
-        }
-        let body = json!({
-            "jsonrpc": "2.0",
-            "id": "collection-identities",
-            "method": "getAssetBatch",
-            "params": {"ids": chunk}
-        });
-        let batch = client
-            .post_json_helius(&url, &[], &body)
-            .await
-            .ok()
-            .and_then(|payload| {
-                payload
-                    .get("result")
-                    .and_then(Value::as_array)
-                    .or_else(|| payload.as_array())
-                    .cloned()
+    let jobs = collections
+        .chunks(COLLECTIONS_PER_BATCH)
+        .map(<[String]>::to_vec)
+        .collect::<Vec<_>>();
+    let mut batches = stream::iter(jobs.into_iter().map(|chunk| {
+        let url = url.clone();
+        async move {
+            let mut rows_out = AHashMap::with_capacity(chunk.len());
+            if chunk.len() == 1 {
+                let collection = &chunk[0];
+                rows_out.insert(
+                    collection.clone(),
+                    fetch_collection_identity_probe(client, rpc_url, api_key, collection).await,
+                );
+                return rows_out;
+            }
+            let body = json!({
+                "jsonrpc": "2.0",
+                "id": "collection-identities",
+                "method": "getAssetBatch",
+                "params": {"ids": &chunk}
             });
-        let mut resolved = AHashSet::new();
-        if let Some(rows) = batch {
-            for row in rows {
-                let Some(id) = row.get("id").and_then(Value::as_str) else {
-                    continue;
-                };
-                if !chunk.iter().any(|collection| collection == id) {
-                    continue;
+            let batch = client
+                .post_json_helius(&url, &[], &body)
+                .await
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("result")
+                        .and_then(Value::as_array)
+                        .or_else(|| payload.as_array())
+                        .cloned()
+                });
+            let mut resolved = AHashSet::new();
+            if let Some(rows) = batch {
+                for row in rows {
+                    let Some(id) = row.get("id").and_then(Value::as_str) else {
+                        continue;
+                    };
+                    if !chunk.iter().any(|collection| collection == id) {
+                        continue;
+                    }
+                    rows_out.insert(
+                        id.to_owned(),
+                        CollectionIdentityProbe {
+                            identity: parse_collection_metadata_identity(&row)
+                                .or_else(|| Some(id.to_owned())),
+                            authorities: collection_authorities_from_asset(&row, id),
+                        },
+                    );
+                    resolved.insert(id.to_owned());
                 }
-                let identity =
-                    parse_collection_metadata_identity(&row).or_else(|| Some(id.to_owned()));
-                out.insert(id.to_owned(), identity);
-                resolved.insert(id.to_owned());
             }
-        }
-        for collection in chunk {
-            if resolved.contains(collection) {
-                continue;
+            let unresolved = chunk
+                .into_iter()
+                .filter(|collection| !resolved.contains(collection))
+                .collect::<Vec<_>>();
+            let mut fallback = stream::iter(unresolved.into_iter().map(|collection| async move {
+                let probe =
+                    fetch_collection_identity_probe(client, rpc_url, api_key, &collection).await;
+                (collection, probe)
+            }))
+            .buffer_unordered(concurrency.max(1));
+            while let Some((collection, probe)) = fallback.next().await {
+                rows_out.insert(collection, probe);
             }
-            out.insert(
-                collection.clone(),
-                fetch_collection_identity(client, rpc_url, Some(api_key), collection).await,
-            );
+            rows_out
         }
+    }))
+    .buffer_unordered(concurrency.max(1));
+    while let Some(rows) = batches.next().await {
+        progress.add_completed(rows.len() as u64);
+        out.extend(rows);
     }
     out
 }

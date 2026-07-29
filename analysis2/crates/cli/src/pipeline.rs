@@ -1144,6 +1144,12 @@ fn run_inner(config: &RunConfig, progress: &dyn ProgressObserver) -> Result<(), 
                 .join(INTERMEDIATE_DIR)
                 .join("api_success_cache"),
         ),
+        candidate_identity_cache_path: Some(
+            config
+                .output_dir
+                .join(INTERMEDIATE_DIR)
+                .join("candidate_identity_cache.json"),
+        ),
         ..HttpLimits::default()
     };
     let evidence_path = evidence_cache_path(config);
