@@ -2,7 +2,6 @@
 
 use serde::de::{self, Deserialize, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Number, Value};
-use std::collections::BTreeSet;
 use std::fmt;
 
 const MAX_METADATA_BYTES: usize = 64 * 1024;
@@ -97,7 +96,6 @@ impl<'de> Visitor<'de> for StrictVisitor {
     where
         A: MapAccess<'de>,
     {
-        let mut keys = BTreeSet::new();
         let mut output = Map::new();
         let Some(first_key) = map.next_key::<String>()? else {
             return Ok(StrictValue(Value::Object(output)));
@@ -115,10 +113,9 @@ impl<'de> Visitor<'de> for StrictVisitor {
                 .map(StrictValue)
                 .map_err(de::Error::custom);
         }
-        keys.insert(first_key.clone());
         output.insert(first_key, map.next_value::<StrictValue>()?.0);
         while let Some(key) = map.next_key::<String>()? {
-            if !keys.insert(key.clone()) {
+            if output.contains_key(&key) {
                 return Err(de::Error::custom(format!(
                     "duplicate JSON object key `{key}`"
                 )));

@@ -13,28 +13,28 @@ use crate::entity::{
 };
 use crate::parquet::LoadOptions;
 use crate::parquet::metadata::validated_metadata;
-use crate::parquet::pass1::{ProjectedUtf8Columns, normalize_chain};
+use crate::parquet::pass1::{ProjectedUtf8Columns, normalized_chain};
 use crate::parquet::validate::{PASS2_COLUMNS, ValidatedInput};
 use crate::progress::ProgressObserver;
 
 /// Per-file metadata records. `metadata_anchors = None` keeps all valid rows.
 #[derive(Default)]
 struct ShardAnchors {
-    by_contract: AHashMap<(String, String), Vec<MetadataRecord>>,
+    by_chain: AHashMap<String, AHashMap<String, Vec<MetadataRecord>>>,
 }
 
 /// Exact subset needed by the seed-scoped metadata alignment algorithm.
 pub struct MetadataQuerySelection<'a> {
     seed_contracts: AHashMap<String, AHashSet<String>>,
-    evm_seed_token_ids: AHashSet<&'a str>,
-    evm_seed_token_sets: Vec<AHashSet<&'a str>>,
+    evm_seed_count: usize,
+    evm_seed_indices_by_token: AHashMap<&'a str, Vec<usize>>,
 }
 
 impl<'a> MetadataQuerySelection<'a> {
     pub fn new(store: &'a ResidentStore, seeds: &[ContractId]) -> Self {
         let mut seed_contracts = AHashMap::<String, AHashSet<String>>::new();
-        let mut evm_seed_token_ids = AHashSet::new();
-        let mut evm_seed_token_sets = Vec::new();
+        let mut evm_seed_indices_by_token = AHashMap::<&str, Vec<usize>>::new();
+        let mut evm_seed_count = 0;
         for &seed in seeds {
             let contract = &store.contracts[seed as usize];
             let chain = store.chain_name(contract.chain_id);
@@ -43,21 +43,22 @@ impl<'a> MetadataQuerySelection<'a> {
                 .or_default()
                 .insert(contract.address.clone());
             if store.is_evm_chain(chain) {
-                let mut seed_token_ids = AHashSet::new();
                 for &nft in store.nfts_for_contract(seed) {
                     let token = normalized_evm_token_slice(
                         store.string(store.nfts[nft as usize].token_id_id),
                     );
-                    evm_seed_token_ids.insert(token);
-                    seed_token_ids.insert(token);
+                    let seed_indices = evm_seed_indices_by_token.entry(token).or_default();
+                    if seed_indices.last().copied() != Some(evm_seed_count) {
+                        seed_indices.push(evm_seed_count);
+                    }
                 }
-                evm_seed_token_sets.push(seed_token_ids);
+                evm_seed_count += 1;
             }
         }
         Self {
             seed_contracts,
-            evm_seed_token_ids,
-            evm_seed_token_sets,
+            evm_seed_count,
+            evm_seed_indices_by_token,
         }
     }
 
@@ -68,28 +69,79 @@ impl<'a> MetadataQuerySelection<'a> {
     }
 
     fn is_shared_evm_token(&self, token_id: &str) -> bool {
-        self.evm_seed_token_ids
-            .contains(normalized_evm_token_slice(token_id))
+        self.evm_seed_indices_by_token
+            .contains_key(normalized_evm_token_slice(token_id))
     }
 }
 
 impl ShardAnchors {
+    /// Cheap lossless gate before strict JSON parsing/canonicalization. A row
+    /// can be skipped only when already-valid anchors prove it cannot affect
+    /// the bounded/alignment selection.
+    fn could_accept(
+        &self,
+        chain: &str,
+        contract_address: &str,
+        token_id: &str,
+        options: &LoadOptions,
+        selection: Option<&MetadataQuerySelection<'_>>,
+    ) -> bool {
+        let Some(anchors) = self
+            .by_chain
+            .get(chain)
+            .and_then(|contracts| contracts.get(contract_address))
+        else {
+            return true;
+        };
+        if options.metadata_anchors.is_none() && selection.is_none() {
+            return true;
+        }
+        let is_seed_contract =
+            selection.is_some_and(|selection| selection.is_seed_contract(chain, contract_address));
+        let is_evm = options.evm_chains.contains(chain);
+        if options.metadata_anchors.is_none()
+            && let Some(selection) = selection
+            && !is_seed_contract
+        {
+            let shared = is_evm && selection.is_shared_evm_token(token_id);
+            if !shared
+                && let Some(prior) = anchors
+                    .iter()
+                    .find(|record| !is_evm || !selection.is_shared_evm_token(&record.token_id))
+            {
+                return compare_token_ids_desc(token_id, &prior.token_id, is_evm)
+                    == std::cmp::Ordering::Less;
+            }
+        }
+        if anchors.iter().any(|record| record.token_id == token_id) {
+            return false;
+        }
+        let insert_at = anchors
+            .binary_search_by(|record| compare_token_ids_desc(&record.token_id, token_id, is_evm))
+            .unwrap_or_else(|position| position);
+        !options
+            .metadata_anchors
+            .is_some_and(|limit| insert_at >= limit && anchors.len() >= limit)
+    }
+
     #[allow(clippy::too_many_arguments)] // Fields are moved directly into a bounded metadata record.
     fn insert(
         &mut self,
-        chain: String,
-        contract_address: String,
+        chain: &str,
+        contract_address: &str,
         token_id: String,
         canonical_json: String,
         source_order: SourceOrder,
         options: &LoadOptions,
         selection: Option<&MetadataQuerySelection<'_>>,
     ) {
-        let is_seed_contract = selection
-            .is_some_and(|selection| selection.is_seed_contract(&chain, &contract_address));
+        let is_seed_contract =
+            selection.is_some_and(|selection| selection.is_seed_contract(chain, contract_address));
         let anchors = self
-            .by_contract
-            .entry((chain.clone(), contract_address))
+            .by_chain
+            .entry(chain.to_owned())
+            .or_default()
+            .entry(contract_address.to_owned())
             .or_default();
         if options.metadata_anchors.is_none() && selection.is_none() {
             anchors.push(MetadataRecord {
@@ -99,7 +151,7 @@ impl ShardAnchors {
             });
             return;
         }
-        let is_evm = options.evm_chains.contains(&chain);
+        let is_evm = options.evm_chains.contains(chain);
         if options.metadata_anchors.is_none()
             && let Some(selection) = selection
             && !is_seed_contract
@@ -161,17 +213,19 @@ impl ShardAnchors {
         options: &LoadOptions,
         selection: Option<&MetadataQuerySelection<'_>>,
     ) {
-        for ((chain, contract_address), records) in other.by_contract {
-            for record in records {
-                self.insert(
-                    chain.clone(),
-                    contract_address.clone(),
-                    record.token_id,
-                    record.canonical_json,
-                    record.source_order,
-                    options,
-                    selection,
-                );
+        for (chain, contracts) in other.by_chain {
+            for (contract_address, records) in contracts {
+                for record in records {
+                    self.insert(
+                        &chain,
+                        &contract_address,
+                        record.token_id,
+                        record.canonical_json,
+                        record.source_order,
+                        options,
+                        selection,
+                    );
+                }
             }
         }
     }
@@ -181,33 +235,39 @@ impl ShardAnchors {
         options: &LoadOptions,
         selection: &MetadataQuerySelection<'_>,
     ) {
-        for ((chain, contract), anchors) in &mut self.by_contract {
-            if options.metadata_anchors.is_some()
-                || selection.is_seed_contract(chain, contract)
-                || !options.evm_chains.contains(chain)
-                || anchors.len() <= 1
-            {
-                continue;
-            }
-            let mut unresolved = vec![true; selection.evm_seed_token_sets.len()];
-            let mut retained = Vec::with_capacity(unresolved.len().saturating_add(1));
-            for (position, record) in anchors.drain(..).enumerate() {
-                let token = normalized_evm_token_slice(&record.token_id);
-                let mut required = position == 0;
-                for (seed_index, seed_tokens) in selection.evm_seed_token_sets.iter().enumerate() {
-                    if unresolved[seed_index] && seed_tokens.contains(token) {
-                        unresolved[seed_index] = false;
-                        required = true;
+        for (chain, contracts) in &mut self.by_chain {
+            for (contract, anchors) in contracts {
+                if options.metadata_anchors.is_some()
+                    || selection.is_seed_contract(chain, contract)
+                    || !options.evm_chains.contains(chain)
+                    || anchors.len() <= 1
+                {
+                    continue;
+                }
+                let mut unresolved = vec![true; selection.evm_seed_count];
+                let mut unresolved_count = unresolved.len();
+                let mut retained = Vec::with_capacity(unresolved.len().saturating_add(1));
+                for (position, record) in anchors.drain(..).enumerate() {
+                    let token = normalized_evm_token_slice(&record.token_id);
+                    let mut required = position == 0;
+                    if let Some(seed_indices) = selection.evm_seed_indices_by_token.get(token) {
+                        for &seed_index in seed_indices {
+                            if unresolved[seed_index] {
+                                unresolved[seed_index] = false;
+                                unresolved_count -= 1;
+                                required = true;
+                            }
+                        }
+                    }
+                    if required {
+                        retained.push(record);
+                    }
+                    if unresolved_count == 0 {
+                        break;
                     }
                 }
-                if required {
-                    retained.push(record);
-                }
-                if unresolved.iter().all(|pending| !pending) {
-                    break;
-                }
+                *anchors = retained;
             }
-            *anchors = retained;
         }
     }
 }
@@ -215,7 +275,7 @@ impl ShardAnchors {
 /// Collected pass-2 anchors prior to store ingestion.
 #[derive(Default)]
 pub struct CollectedPass2Anchors {
-    by_contract: AHashMap<(String, String), Vec<MetadataRecord>>,
+    by_chain: AHashMap<String, AHashMap<String, Vec<MetadataRecord>>>,
 }
 
 /// Scan + merge pass-2 metadata without touching the resident store.
@@ -237,7 +297,7 @@ pub fn collect_pass2_anchors(
         shard.prune_to_alignment_anchors(options, selection);
     }
     Ok(CollectedPass2Anchors {
-        by_contract: shard.by_contract,
+        by_chain: shard.by_chain,
     })
 }
 
@@ -246,8 +306,10 @@ pub fn apply_pass2_anchors(
     store: &mut ResidentStore,
     anchors: CollectedPass2Anchors,
 ) -> Result<(), Analysis2Error> {
-    for ((chain, contract_address), records) in anchors.by_contract {
-        store.ingest_metadata_records(&chain, &contract_address, records)?;
+    for (chain, contracts) in anchors.by_chain {
+        for (contract_address, records) in contracts {
+            store.ingest_metadata_records(&chain, &contract_address, records)?;
+        }
     }
     Ok(())
 }
@@ -332,16 +394,18 @@ fn scan_row_group_pass2(
         })?;
         let columns = ProjectedUtf8Columns::new(&batch, &input.path, &PASS2_COLUMNS)?;
         for row_index in 0..batch.num_rows() {
-            let chain = normalize_chain(columns.value_at(0, row_index));
-            let contract_address = columns.value_at(1, row_index).trim().to_owned();
-            let token_id = columns.value_at(2, row_index).trim().to_owned();
+            let chain = normalized_chain(columns.value_at(0, row_index));
+            let contract_address = columns.value_at(1, row_index).trim();
+            let token_id = columns.value_at(2, row_index).trim();
             let metadata_raw = columns.value_at(3, row_index).trim();
             let source_order = SourceOrder {
                 file_ordinal: input.file_ordinal,
                 file_row_number: row_start + row_offset,
             };
             row_offset += 1;
-            if !options.allowed_chains.is_empty() && !options.allowed_chains.contains(&chain) {
+            if !options.allowed_chains.is_empty()
+                && !options.allowed_chains.contains(chain.as_ref())
+            {
                 continue;
             }
             if chain.is_empty() || contract_address.is_empty() || token_id.is_empty() {
@@ -354,13 +418,22 @@ fn scan_row_group_pass2(
             {
                 continue;
             }
+            if !shard.could_accept(
+                chain.as_ref(),
+                contract_address,
+                token_id,
+                options,
+                selection,
+            ) {
+                continue;
+            }
             let Some(canonical_json) = validated_metadata(metadata_raw) else {
                 continue;
             };
             shard.insert(
-                chain,
+                chain.as_ref(),
                 contract_address,
-                token_id,
+                token_id.to_owned(),
                 canonical_json,
                 source_order,
                 options,
@@ -379,8 +452,8 @@ mod tests {
     fn record(shard: &mut ShardAnchors, token: &str, selection: &MetadataQuerySelection<'_>) {
         let options = LoadOptions::new(["ethereum".to_owned()], ["ethereum".to_owned()], None);
         shard.insert(
-            "ethereum".to_owned(),
-            "0xcandidate".to_owned(),
+            "ethereum",
+            "0xcandidate",
             token.to_owned(),
             format!(r#"{{"token":"{token}"}}"#),
             SourceOrder {
@@ -397,14 +470,14 @@ mod tests {
         let shared = "2";
         let selection = MetadataQuerySelection {
             seed_contracts: AHashMap::new(),
-            evm_seed_token_ids: AHashSet::from([shared]),
-            evm_seed_token_sets: vec![AHashSet::from([shared])],
+            evm_seed_count: 1,
+            evm_seed_indices_by_token: AHashMap::from([(shared, vec![0])]),
         };
         let mut shard = ShardAnchors::default();
         for token in ["1", "2", "3", "4"] {
             record(&mut shard, token, &selection);
         }
-        let anchors = &shard.by_contract[&("ethereum".to_owned(), "0xcandidate".to_owned())];
+        let anchors = &shard.by_chain["ethereum"]["0xcandidate"];
         assert_eq!(
             anchors
                 .iter()
@@ -415,12 +488,36 @@ mod tests {
     }
 
     #[test]
+    fn bounded_selection_rejects_losing_rows_before_json_validation() {
+        let options = LoadOptions::new(["ethereum".to_owned()], ["ethereum".to_owned()], Some(2));
+        let mut shard = ShardAnchors::default();
+        for token in ["10", "9"] {
+            shard.insert(
+                "ethereum",
+                "0xcandidate",
+                token.to_owned(),
+                format!(r#"{{"token":"{token}"}}"#),
+                SourceOrder {
+                    file_ordinal: 0,
+                    file_row_number: token.parse().unwrap(),
+                },
+                &options,
+                None,
+            );
+        }
+
+        assert!(!shard.could_accept("ethereum", "0xcandidate", "1", &options, None));
+        assert!(!shard.could_accept("ethereum", "0xcandidate", "9", &options, None));
+        assert!(shard.could_accept("ethereum", "0xcandidate", "11", &options, None));
+    }
+
+    #[test]
     fn ordered_merge_discards_row_group_local_fallbacks() {
         let shared = "2";
         let selection = MetadataQuerySelection {
             seed_contracts: AHashMap::new(),
-            evm_seed_token_ids: AHashSet::from([shared]),
-            evm_seed_token_sets: vec![AHashSet::from([shared])],
+            evm_seed_count: 1,
+            evm_seed_indices_by_token: AHashMap::from([(shared, vec![0])]),
         };
         let options = LoadOptions::new(["ethereum".to_owned()], ["ethereum".to_owned()], None);
         let mut left = ShardAnchors::default();
@@ -429,7 +526,7 @@ mod tests {
         record(&mut right, "2", &selection);
         record(&mut right, "7", &selection);
         left.merge_ordered(right, &options, Some(&selection));
-        let anchors = &left.by_contract[&("ethereum".to_owned(), "0xcandidate".to_owned())];
+        let anchors = &left.by_chain["ethereum"]["0xcandidate"];
         assert_eq!(
             anchors
                 .iter()
@@ -443,8 +540,13 @@ mod tests {
     fn final_prune_keeps_only_largest_shared_token_per_seed() {
         let selection = MetadataQuerySelection {
             seed_contracts: AHashMap::new(),
-            evm_seed_token_ids: AHashSet::from(["2", "3", "4", "5"]),
-            evm_seed_token_sets: vec![AHashSet::from(["2", "4"]), AHashSet::from(["3", "5"])],
+            evm_seed_count: 2,
+            evm_seed_indices_by_token: AHashMap::from([
+                ("2", vec![0]),
+                ("4", vec![0]),
+                ("3", vec![1]),
+                ("5", vec![1]),
+            ]),
         };
         let options = LoadOptions::new(["ethereum".to_owned()], ["ethereum".to_owned()], None);
         let mut shard = ShardAnchors::default();
@@ -452,7 +554,7 @@ mod tests {
             record(&mut shard, token, &selection);
         }
         shard.prune_to_alignment_anchors(&options, &selection);
-        let anchors = &shard.by_contract[&("ethereum".to_owned(), "0xcandidate".to_owned())];
+        let anchors = &shard.by_chain["ethereum"]["0xcandidate"];
         assert_eq!(
             anchors
                 .iter()

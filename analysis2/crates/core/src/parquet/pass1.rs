@@ -171,7 +171,7 @@ pub(crate) fn normalize_chain(value: &str) -> String {
     normalized_chain(value).into_owned()
 }
 
-fn normalized_chain(value: &str) -> Cow<'_, str> {
+pub(crate) fn normalized_chain(value: &str) -> Cow<'_, str> {
     let trimmed = value.trim();
     if trimmed.bytes().any(|byte| byte.is_ascii_uppercase()) {
         Cow::Owned(trimmed.to_ascii_lowercase())

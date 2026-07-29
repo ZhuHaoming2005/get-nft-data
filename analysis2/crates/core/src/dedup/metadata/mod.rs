@@ -15,8 +15,9 @@ pub use bm25::{
     similarity_score_if_at_least,
 };
 
-use ahash::{AHashMap, AHashSet};
+use ahash::AHashMap;
 use rayon::prelude::*;
+use std::sync::RwLock;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use crate::dedup::hits::{Dimension, HitEdge, HitGraph};
@@ -30,6 +31,15 @@ use self::bm25::{lossless_prefix_len, visit_tokens};
 /// Default BM25 cosine threshold.
 pub const DEFAULT_METADATA_THRESHOLD: f64 = 0.6;
 const PARALLEL_METADATA_CANDIDATE_CHUNK: usize = 64;
+const MAX_METADATA_CANDIDATE_CHUNK: usize = 4 * 1024;
+
+fn metadata_candidate_chunk(candidate_count: usize) -> usize {
+    let target_chunks = rayon::current_num_threads().saturating_mul(4).max(1);
+    candidate_count.div_ceil(target_chunks).clamp(
+        PARALLEL_METADATA_CANDIDATE_CHUNK,
+        MAX_METADATA_CANDIDATE_CHUNK,
+    )
+}
 
 #[derive(Clone, Debug)]
 struct DenseCsr<T> {
@@ -47,21 +57,6 @@ impl<T> Default for DenseCsr<T> {
 }
 
 impl<T> DenseCsr<T> {
-    fn from_rows(mut rows: Vec<Vec<T>>) -> Result<Self, Analysis2Error> {
-        let total = rows.iter().map(Vec::len).sum();
-        let mut offsets = Vec::with_capacity(rows.len() + 1);
-        let mut values = Vec::with_capacity(total);
-        offsets.push(0);
-        for row in &mut rows {
-            values.append(row);
-            offsets.push(
-                u32::try_from(values.len())
-                    .map_err(|_| Analysis2Error::invalid("dense CSR exceeds u32 capacity"))?,
-            );
-        }
-        Ok(Self { offsets, values })
-    }
-
     fn values_for(&self, key: u32) -> Option<&[T]> {
         let index = key as usize;
         let start = *self.offsets.get(index)? as usize;
@@ -77,6 +72,31 @@ impl<T> DenseCsr<T> {
         self.offsets
             .windows(2)
             .map(|pair| &self.values[pair[0] as usize..pair[1] as usize])
+    }
+}
+
+impl DenseCsr<ContractId> {
+    fn from_first_and_extras(
+        first: Vec<ContractId>,
+        mut extras: AHashMap<u32, Vec<ContractId>>,
+    ) -> Result<Self, Analysis2Error> {
+        let total = first
+            .len()
+            .saturating_add(extras.values().map(Vec::len).sum::<usize>());
+        let mut offsets = Vec::with_capacity(first.len() + 1);
+        let mut values = Vec::with_capacity(total);
+        offsets.push(0);
+        for (document_id, first_contract) in first.into_iter().enumerate() {
+            values.push(first_contract);
+            if let Some(mut contracts) = extras.remove(&(document_id as u32)) {
+                values.append(&mut contracts);
+            }
+            offsets.push(
+                u32::try_from(values.len())
+                    .map_err(|_| Analysis2Error::invalid("dense CSR exceeds u32 capacity"))?,
+            );
+        }
+        Ok(Self { offsets, values })
     }
 }
 
@@ -127,7 +147,10 @@ impl DenseAtomicCsr {
 /// Reusable per-worker Metadata candidate buffers.
 #[derive(Default)]
 pub struct MetadataQueryScratch {
-    candidates: AHashSet<ContractId>,
+    /// Dense bit marks replace per-seed hash-set insertion. Contract ids are
+    /// contiguous; one bit per contract remains bounded even with one scratch
+    /// per Rayon worker.
+    candidate_bits: Vec<u64>,
     ordered_terms: Vec<(u32, u32, u32)>,
     frequencies: Vec<u32>,
     seed_documents: Vec<u32>,
@@ -135,6 +158,29 @@ pub struct MetadataQueryScratch {
     /// Cached BM25 decisions for aligned `(left_doc, right_doc)` pairs this seed.
     /// `None` means scored below threshold.
     score_cache: AHashMap<(u32, u32), Option<f64>>,
+}
+
+impl MetadataQueryScratch {
+    fn begin_candidates(&mut self, contract_count: usize) {
+        for contract_id in self.output.drain(..) {
+            let index = contract_id as usize;
+            self.candidate_bits[index / 64] &= !(1_u64 << (index % 64));
+        }
+        let words = contract_count.div_ceil(64);
+        if self.candidate_bits.len() < words {
+            self.candidate_bits.resize(words, 0);
+        }
+    }
+}
+
+fn mark_candidate(bits: &mut [u64], output: &mut Vec<ContractId>, contract_id: ContractId) {
+    let index = contract_id as usize;
+    let mask = 1_u64 << (index % 64);
+    let word = &mut bits[index / 64];
+    if *word & mask == 0 {
+        *word |= mask;
+        output.push(contract_id);
+    }
 }
 
 struct MetadataSeedQuery<'a> {
@@ -250,16 +296,116 @@ struct RawMetadataDocument<'a> {
     terms: Vec<(&'a str, u32)>,
 }
 
+const INLINE_METADATA_TERMS: usize = 16;
+
+const TERM_INTERNER_SHARDS: usize = 256;
+
+/// Read-mostly sharded term catalog. Common JSON keys are looked up under a
+/// shared read lock, while genuinely new terms only serialize within one of
+/// 256 independent shards.
+struct ParallelTermInterner<'a> {
+    shards: Box<[RwLock<AHashMap<&'a str, u32>>]>,
+    hash_builder: ahash::RandomState,
+    next_id: AtomicU32,
+}
+
+impl<'a> ParallelTermInterner<'a> {
+    fn new() -> Self {
+        let shards = (0..TERM_INTERNER_SHARDS)
+            .map(|_| RwLock::new(AHashMap::new()))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
+        Self {
+            shards,
+            hash_builder: ahash::RandomState::with_seeds(1, 2, 3, 4),
+            next_id: AtomicU32::new(0),
+        }
+    }
+
+    fn intern(&self, term: &'a str) -> Result<u32, Analysis2Error> {
+        debug_assert!(self.shards.len().is_power_of_two());
+        let shard_index = self.hash_builder.hash_one(term) as usize & (self.shards.len() - 1);
+        let shard = &self.shards[shard_index];
+        if let Some(&id) = shard
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(term)
+        {
+            return Ok(id);
+        }
+        let mut terms = shard
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(&id) = terms.get(term) {
+            return Ok(id);
+        }
+        let id = self
+            .next_id
+            .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |next| {
+                (next < u32::MAX).then_some(next + 1)
+            })
+            .map_err(|_| Analysis2Error::invalid("too many BM25 terms for u32"))?;
+        terms.insert(term, id);
+        Ok(id)
+    }
+
+    fn len(&self) -> usize {
+        self.next_id.load(Ordering::Relaxed) as usize
+    }
+}
+
+struct InternedMetadataDocument {
+    document: PreparedDocument,
+    terms: Vec<(u32, u32)>,
+}
+
+fn tokenize_and_intern_metadata_document<'a>(
+    canonical: &'a str,
+    interner: &ParallelTermInterner<'a>,
+) -> Result<InternedMetadataDocument, Analysis2Error> {
+    let raw = tokenize_metadata_document(canonical);
+    let mut terms = Vec::with_capacity(raw.terms.len());
+    for (term, frequency) in raw.terms {
+        terms.push((interner.intern(term)?, frequency));
+    }
+    terms.sort_unstable_by_key(|&(term, _)| term);
+    let document = PreparedDocument::from_compact_terms(&terms);
+    Ok(InternedMetadataDocument { document, terms })
+}
+
 fn tokenize_metadata_document(canonical: &str) -> RawMetadataDocument<'_> {
-    let mut positions = AHashMap::<&str, usize>::new();
+    // Most canonical metadata anchors are small. Avoid a separate hash-table
+    // allocation until a document actually exceeds the inline linear-scan
+    // window; larger documents retain O(1) frequency updates.
+    let mut positions = None::<AHashMap<&str, usize>>;
     let mut terms = Vec::<(&str, u32)>::new();
     visit_tokens(canonical, |term| {
-        if let Some(&position) = positions.get(term) {
+        let existing = positions
+            .as_ref()
+            .and_then(|positions| positions.get(term).copied())
+            .or_else(|| {
+                positions
+                    .is_none()
+                    .then(|| terms.iter().position(|&(candidate, _)| candidate == term))
+                    .flatten()
+            });
+        if let Some(position) = existing {
             terms[position].1 = terms[position].1.saturating_add(1);
-        } else {
-            positions.insert(term, terms.len());
-            terms.push((term, 1));
+            return Ok::<_, std::convert::Infallible>(());
         }
+        if terms.len() == INLINE_METADATA_TERMS {
+            positions = Some(
+                terms
+                    .iter()
+                    .enumerate()
+                    .map(|(position, &(candidate, _))| (candidate, position))
+                    .collect(),
+            );
+        }
+        if let Some(positions) = &mut positions {
+            positions.insert(term, terms.len());
+        }
+        terms.push((term, 1));
         Ok::<_, std::convert::Infallible>(())
     })
     .expect("infallible metadata tokenizer");
@@ -289,10 +435,15 @@ pub fn finalize_metadata_index_with_progress(
     // duplicated every unique canonical document and token id during finalize.
     let mut canonical_to_doc: AHashMap<&str, u32> = AHashMap::with_capacity(anchor_count);
     let mut canonical_documents: Vec<&str> = Vec::with_capacity(anchor_count);
-    let mut doc_contracts: Vec<Vec<ContractId>> = Vec::with_capacity(anchor_count);
+    // Most canonical documents occur in one contract. Store that common case
+    // inline and allocate a side vector only for actual cross-contract reuse.
+    let mut doc_first_contract = Vec::<ContractId>::with_capacity(anchor_count);
+    let mut doc_extra_contracts = AHashMap::<u32, Vec<ContractId>>::new();
     let mut token_keys: AHashMap<&str, u32> = AHashMap::with_capacity(anchor_count);
 
-    let mut contract_anchors: Vec<Vec<AnchorRef>> = vec![Vec::new(); n_contracts];
+    let mut contract_anchor_offsets = Vec::with_capacity(n_contracts + 1);
+    let mut contract_anchor_values = Vec::with_capacity(anchor_count);
+    contract_anchor_offsets.push(0);
     let mut contract_is_evm: Vec<bool> = vec![false; n_contracts];
 
     progress.begin_phase("metadata_catalog", Some(n_contracts as u64));
@@ -304,7 +455,6 @@ pub fn finalize_metadata_index_with_progress(
         let chain = store.chain_name(contract.chain_id);
         let is_evm = store.is_evm_chain(chain);
         contract_is_evm[contract.id as usize] = is_evm;
-        let mut anchors = Vec::with_capacity(contract.metadata_by_token.len());
         for record in &contract.metadata_by_token {
             let canonical = record.canonical_json.as_str();
             let document_id = if let Some(&id) = canonical_to_doc.get(canonical) {
@@ -313,15 +463,18 @@ pub fn finalize_metadata_index_with_progress(
                 let id = u32::try_from(canonical_documents.len())
                     .map_err(|_| Analysis2Error::invalid("too many metadata documents for u32"))?;
                 canonical_documents.push(canonical);
-                doc_contracts.push(Vec::new());
+                doc_first_contract.push(contract.id);
                 canonical_to_doc.insert(canonical, id);
                 id
             };
-            let contracts = &mut doc_contracts[document_id as usize];
-            if contracts.last().copied() != Some(contract.id) {
-                // Contracts are visited in id order, so this also keeps every
-                // document's posting sorted without a later sort/dedup pass.
-                contracts.push(contract.id);
+            let first_contract = doc_first_contract[document_id as usize];
+            if first_contract != contract.id {
+                let contracts = doc_extra_contracts.entry(document_id).or_default();
+                if contracts.last().copied() != Some(contract.id) {
+                    // Contracts are visited in id order, so this also keeps
+                    // every document posting sorted without a later sort.
+                    contracts.push(contract.id);
+                }
             }
 
             let token = if is_evm {
@@ -339,12 +492,15 @@ pub fn finalize_metadata_index_with_progress(
                 token_keys.insert(token, key);
                 key
             };
-            anchors.push(AnchorRef {
+            contract_anchor_values.push(AnchorRef {
                 token_key,
                 document_id,
             });
         }
-        contract_anchors[contract.id as usize] = anchors;
+        contract_anchor_offsets.push(
+            u32::try_from(contract_anchor_values.len())
+                .map_err(|_| Analysis2Error::invalid("too many metadata anchors for u32"))?,
+        );
         pending_progress += 1;
         if pending_progress as usize == PROGRESS_BATCH {
             progress.add_completed(pending_progress);
@@ -364,32 +520,22 @@ pub fn finalize_metadata_index_with_progress(
     // every document until a second pass made peak RSS grow with the complete
     // metadata corpus (tens of millions of documents in production).
     progress.begin_phase("metadata_tokenize", Some(canonical_documents.len() as u64));
-    let mut term_ids = AHashMap::<&str, u32>::new();
+    let term_interner = ParallelTermInterner::new();
     let mut documents = Vec::with_capacity(canonical_documents.len());
     let mut terms = Vec::new();
     let mut document_frequency = Vec::<u32>::new();
     for canonical_batch in canonical_documents.chunks(TOKENIZE_BATCH) {
         progress.check_cancelled()?;
-        let raw_batch = canonical_batch
+        let prepared_batch = canonical_batch
             .par_iter()
-            .map(|&canonical| tokenize_metadata_document(canonical))
+            .map(|&canonical| tokenize_and_intern_metadata_document(canonical, &term_interner))
             .collect::<Vec<_>>();
-        for raw in raw_batch {
-            let mut document_terms = Vec::with_capacity(raw.terms.len());
-            for (term, frequency) in raw.terms {
-                let term_id = if let Some(&id) = term_ids.get(term) {
-                    id
-                } else {
-                    let id = u32::try_from(term_ids.len())
-                        .map_err(|_| Analysis2Error::invalid("too many BM25 terms for u32"))?;
-                    term_ids.insert(term, id);
-                    document_frequency.push(0);
-                    id
-                };
-                document_terms.push((term_id, frequency));
-            }
-            document_terms.sort_unstable_by_key(|&(term, _)| term);
-            let mut document = PreparedDocument::from_compact_terms(&document_terms);
+        document_frequency.resize(term_interner.len(), 0);
+        for prepared in prepared_batch {
+            let InternedMetadataDocument {
+                mut document,
+                terms: document_terms,
+            } = prepared?;
             let term_start = u32::try_from(terms.len())
                 .map_err(|_| Analysis2Error::invalid("too many metadata terms for u32"))?;
             document.set_term_start(term_start);
@@ -402,7 +548,7 @@ pub fn finalize_metadata_index_with_progress(
         }
         progress.add_completed(canonical_batch.len() as u64);
     }
-    drop(term_ids);
+    drop(term_interner);
     drop(canonical_documents);
     store.clear_metadata_anchors();
 
@@ -418,8 +564,11 @@ pub fn finalize_metadata_index_with_progress(
     store.metadata_index = MetadataIndex {
         documents,
         terms,
-        doc_contracts: DenseCsr::from_rows(doc_contracts)?,
-        contract_anchors: DenseCsr::from_rows(contract_anchors)?,
+        doc_contracts: DenseCsr::from_first_and_extras(doc_first_contract, doc_extra_contracts)?,
+        contract_anchors: DenseCsr {
+            offsets: contract_anchor_offsets,
+            values: contract_anchor_values,
+        },
         contract_is_evm,
         term_postings,
     };
@@ -562,19 +711,20 @@ pub fn query_metadata_for_seed_with_scratch(
         && crate::dedup::inner_query_parallel_allowed()
         && rayon::current_num_threads() > 1
     {
+        let chunk_size = metadata_candidate_chunk(scratch.output.len());
         let chunks = scratch
             .output
-            .par_chunks(PARALLEL_METADATA_CANDIDATE_CHUNK)
+            .par_chunks(chunk_size)
             .map(|candidates| {
+                progress.check_cancelled()?;
                 let mut edges = Vec::new();
-                let mut local_cache = AHashMap::new();
+                let mut local_cache = AHashMap::with_capacity(candidates.len());
                 for &candidate in candidates {
-                    progress.check_cancelled()?;
                     if let Some(edge) = query.edge_for_candidate(candidate, &mut local_cache) {
                         edges.push(edge);
                     }
-                    progress.add_completed(1);
                 }
+                progress.add_completed(candidates.len() as u64);
                 Ok::<_, Analysis2Error>(edges)
             })
             .collect::<Vec<_>>();
@@ -588,12 +738,20 @@ pub fn query_metadata_for_seed_with_scratch(
         return Ok(());
     }
 
-    for &candidate in &scratch.output {
-        progress.check_cancelled()?;
+    for (position, &candidate) in scratch.output.iter().enumerate() {
+        if position % 256 == 0 {
+            progress.check_cancelled()?;
+        }
         if let Some(edge) = query.edge_for_candidate(candidate, &mut scratch.score_cache) {
             graph.push(edge);
         }
-        progress.add_completed(1);
+        if position % 256 == 255 {
+            progress.add_completed(256);
+        }
+    }
+    let remainder = scratch.output.len() % 256;
+    if remainder > 0 {
+        progress.add_completed(remainder as u64);
     }
     Ok(())
 }
@@ -605,8 +763,7 @@ fn collect_candidates(
     threshold: f64,
     scratch: &mut MetadataQueryScratch,
 ) {
-    scratch.candidates.clear();
-    scratch.output.clear();
+    scratch.begin_candidates(index.contract_is_evm.len());
     scratch.seed_documents.clear();
     for anchor in seed_anchors {
         if !scratch.seed_documents.contains(&anchor.document_id) {
@@ -619,14 +776,17 @@ fn collect_candidates(
         if let Some(contracts) = index.doc_contracts.values_for(document_id) {
             for &contract_id in contracts {
                 if contract_id != seed {
-                    scratch.candidates.insert(contract_id);
+                    mark_candidate(
+                        &mut scratch.candidate_bits,
+                        &mut scratch.output,
+                        contract_id,
+                    );
                 }
             }
         }
     }
 
     if threshold.is_nan() || threshold > 1.0 {
-        scratch.output.extend(scratch.candidates.iter().copied());
         scratch.output.sort_unstable();
         return;
     }
@@ -635,10 +795,13 @@ fn collect_candidates(
         // Every other contract with anchors can match.
         for (contract_id, anchors) in index.contract_anchors.iter().enumerate() {
             if contract_id as ContractId != seed && !anchors.is_empty() {
-                scratch.candidates.insert(contract_id as ContractId);
+                mark_candidate(
+                    &mut scratch.candidate_bits,
+                    &mut scratch.output,
+                    contract_id as ContractId,
+                );
             }
         }
-        scratch.output.extend(scratch.candidates.iter().copied());
         scratch.output.sort_unstable();
         return;
     }
@@ -672,7 +835,11 @@ fn collect_candidates(
                     if let Some(contracts) = index.doc_contracts.values_for(document_id) {
                         for &contract_id in contracts {
                             if contract_id != seed {
-                                scratch.candidates.insert(contract_id);
+                                mark_candidate(
+                                    &mut scratch.candidate_bits,
+                                    &mut scratch.output,
+                                    contract_id,
+                                );
                             }
                         }
                     }
@@ -681,7 +848,6 @@ fn collect_candidates(
         }
     }
 
-    scratch.output.extend(scratch.candidates.iter().copied());
     scratch.output.sort_unstable();
 }
 
