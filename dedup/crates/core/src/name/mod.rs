@@ -4,7 +4,7 @@
 
 mod candidate_bounds;
 
-use crate::entity::{ChainId, ContractId, Dimension, EntityStore, NftId, ScopeKind};
+use crate::entity::{ChainId, ContractId, Dimension, EntityStore, NftId, ScopeKind, StringId};
 use crate::error::DedupError;
 use crate::progress::ProgressObserver;
 use crate::radix::{sort_u32_pairs_while, sort_u32_triples_while, sort_u64_while};
@@ -76,7 +76,7 @@ struct NameHit {
 
 #[derive(Clone, Debug)]
 struct CanonicalName {
-    text: String,
+    name_id: StringId,
     characters: Vec<char>,
     atoms: Vec<NameAtom>,
 }
@@ -105,37 +105,36 @@ impl ResidentNameIndex {
             .par_chunks(INDEX_CHUNK)
             .map(|chunk| {
                 progress.check_cancelled()?;
-                let documents = chunk
-                    .iter()
-                    .map(|name| {
-                        let mut occurrences: AHashMap<char, u32> = AHashMap::new();
-                        name.characters
-                            .iter()
-                            .map(|&character| {
-                                let rank = occurrences.entry(character).or_default();
-                                let key = (u64::from(character as u32) << 32) | u64::from(*rank);
-                                *rank += 1;
-                                key
-                            })
-                            .collect()
-                    })
-                    .collect::<Vec<Vec<u64>>>();
+                let mut lengths = Vec::with_capacity(chunk.len());
+                let mut tokens = Vec::new();
+                for name in chunk {
+                    let start = tokens.len();
+                    let mut occurrences: AHashMap<char, u32> = AHashMap::new();
+                    for &character in &name.characters {
+                        let rank = occurrences.entry(character).or_default();
+                        tokens.push((u64::from(character as u32) << 32) | u64::from(*rank));
+                        *rank += 1;
+                    }
+                    lengths.push(tokens.len() - start);
+                }
                 progress.add_completed(chunk.len() as u64);
-                Ok::<_, DedupError>(documents)
+                Ok::<_, DedupError>((lengths, tokens))
             })
             .collect::<Vec<_>>();
-        let mut raw_documents = Vec::with_capacity(names.len());
-        for chunk in raw_document_chunks {
-            raw_documents.extend(chunk?);
-        }
-
-        let mut document_offsets = Vec::with_capacity(raw_documents.len() + 1);
+        let token_occurrences = raw_document_chunks
+            .iter()
+            .filter_map(|chunk| chunk.as_ref().ok())
+            .map(|(_, tokens)| tokens.len())
+            .sum();
+        let mut document_offsets = Vec::with_capacity(names.len() + 1);
         document_offsets.push(0);
-        let token_occurrences = raw_documents.iter().map(Vec::len).sum();
         let mut raw_tokens = Vec::with_capacity(token_occurrences);
-        for document in raw_documents {
-            raw_tokens.extend(document);
-            document_offsets.push(raw_tokens.len());
+        for chunk in raw_document_chunks {
+            let (lengths, mut tokens) = chunk?;
+            for length in lengths {
+                document_offsets.push(document_offsets.last().copied().unwrap_or(0) + length);
+            }
+            raw_tokens.append(&mut tokens);
         }
 
         let mut unique_tokens = raw_tokens.clone();
@@ -507,10 +506,9 @@ fn atomize(
             grouped += (selected_index - start) as u64;
             flush_progress(&mut grouped, progress)?;
         }
-        let text = store.string(name_id).to_owned();
-        let characters = text.chars().collect();
+        let characters = store.string(name_id).chars().collect();
         names.push(CanonicalName {
-            text,
+            name_id,
             characters,
             atoms,
         });
@@ -522,7 +520,7 @@ fn atomize(
         a.characters
             .len()
             .cmp(&b.characters.len())
-            .then_with(|| a.text.cmp(&b.text))
+            .then_with(|| store.string(a.name_id).cmp(store.string(b.name_id)))
     });
     Ok(names)
 }

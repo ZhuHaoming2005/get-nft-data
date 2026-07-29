@@ -1,25 +1,24 @@
-use crate::entity::{
-    ChainId, ContractId, Dimension, EntityStore, NftId, ScopeKind, StringId, UriPosting,
-};
+use crate::entity::{ChainId, ContractId, Dimension, EntityStore, NftId, ScopeKind, UriPosting};
 use crate::error::DedupError;
 use crate::progress::ProgressObserver;
+use crate::scope::{ScopeCounts, ScopeKey};
 use crate::stats::SummaryAccumulator;
 use ahash::{AHashMap, AHashSet};
 use rayon::prelude::*;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-struct UriUnitKey {
-    contract_id: ContractId,
-    uri_id: StringId,
-    dimension: Dimension,
-    kind: ScopeKind,
-    secondary_chain: Option<ChainId>,
+const URI_PROGRESS_BATCH: u64 = 64;
+const URI_TASKS_PER_THREAD: usize = 8;
+
+#[derive(Default)]
+struct ScopeAggregate {
+    contracts: AHashSet<ContractId>,
+    nft_rows: u64,
 }
 
 #[derive(Default)]
 struct LocalUriAccumulator {
-    units: AHashMap<UriUnitKey, u64>,
+    scopes: AHashMap<ScopeKey, ScopeAggregate>,
 }
 
 impl LocalUriAccumulator {
@@ -31,83 +30,208 @@ impl LocalUriAccumulator {
         kind: ScopeKind,
         secondary_chain: Option<ChainId>,
     ) {
-        self.units
-            .entry(UriUnitKey {
-                contract_id: posting.contract_id,
-                uri_id: posting.uri_id,
-                dimension,
+        let aggregate = self
+            .scopes
+            .entry(ScopeKey {
                 kind,
+                primary_chain: posting.chain_id,
                 secondary_chain,
+                dimension,
             })
-            .or_insert(nft_count);
+            .or_default();
+        aggregate.contracts.insert(posting.contract_id);
+        aggregate.nft_rows = aggregate.nft_rows.saturating_add(nft_count);
     }
 
-    fn merge(&mut self, mut other: Self) {
-        if self.units.len() < other.units.len() {
-            std::mem::swap(&mut self.units, &mut other.units);
-        }
-        for (key, nft_rows) in other.units {
-            self.units.entry(key).or_insert(nft_rows);
+    fn merge(&mut self, other: Self) {
+        for (key, mut source) in other.scopes {
+            let target = self.scopes.entry(key).or_default();
+            if target.contracts.len() < source.contracts.len() {
+                std::mem::swap(&mut target.contracts, &mut source.contracts);
+            }
+            target.contracts.extend(source.contracts);
+            target.nft_rows = target.nft_rows.saturating_add(source.nft_rows);
         }
     }
 
-    fn flush(self, store: &EntityStore, acc: &mut SummaryAccumulator) {
-        for (key, nft_rows) in self.units {
-            acc.mark_uri_scope_hit(
-                store,
-                key.contract_id,
-                key.uri_id,
-                nft_rows,
-                key.dimension,
-                (key.kind, key.secondary_chain),
-            );
+    fn add_group(
+        &mut self,
+        primary_chain: ChainId,
+        contracts: &[ContractId],
+        nft_rows: u64,
+        dimension: Dimension,
+        kind: ScopeKind,
+        secondary_chain: Option<ChainId>,
+    ) {
+        if nft_rows == 0 {
+            return;
         }
+        let aggregate = self
+            .scopes
+            .entry(ScopeKey {
+                kind,
+                primary_chain,
+                secondary_chain,
+                dimension,
+            })
+            .or_default();
+        aggregate.contracts.extend(contracts.iter().copied());
+        aggregate.nft_rows = aggregate.nft_rows.saturating_add(nft_rows);
+    }
+
+    fn flush(self, acc: &mut SummaryAccumulator, dimension: Dimension) {
+        acc.merge_completed_dimension_counts(
+            dimension,
+            self.scopes
+                .into_iter()
+                .map(|(key, aggregate)| {
+                    (
+                        key,
+                        ScopeCounts {
+                            duplicate_contract_count: aggregate.contracts.len() as u64,
+                            duplicate_nft_count: aggregate.nft_rows,
+                        },
+                    )
+                })
+                .collect(),
+        );
     }
 }
 
-#[derive(Default)]
 struct TokenWorker {
     uri: LocalUriAccumulator,
     intra: Vec<NftId>,
     cross_summary: Vec<NftId>,
-    matrix: AHashSet<(NftId, ChainId)>,
+    matrix: MatrixWorkerHits,
+}
+
+enum MatrixWorkerHits {
+    Compact(Vec<(NftId, u64)>),
+    Wide(Vec<(NftId, ChainId)>),
 }
 
 impl TokenWorker {
-    fn add(&mut self, posting: &UriPosting, kind: ScopeKind, secondary_chain: Option<ChainId>) {
-        match kind {
-            ScopeKind::IntraChain => self.intra.extend_from_slice(&posting.nft_ids),
-            ScopeKind::CrossChainSummary => self.cross_summary.extend_from_slice(&posting.nft_ids),
-            ScopeKind::ChainMatrix => {
-                let secondary = secondary_chain.expect("matrix hit has secondary chain");
-                self.matrix
-                    .extend(posting.nft_ids.iter().map(|&nft_id| (nft_id, secondary)));
-            }
+    fn new(chain_count: usize) -> Self {
+        Self {
+            uri: LocalUriAccumulator::default(),
+            intra: Vec::new(),
+            cross_summary: Vec::new(),
+            matrix: if chain_count <= u64::BITS as usize {
+                MatrixWorkerHits::Compact(Vec::new())
+            } else {
+                MatrixWorkerHits::Wide(Vec::new())
+            },
         }
+    }
+
+    fn add_intra(&mut self, posting: &UriPosting) {
+        self.intra.extend_from_slice(&posting.nft_ids);
         self.uri.add(
             posting,
             posting.nft_ids.len() as u64,
             Dimension::TokenUri,
-            kind,
-            secondary_chain,
+            ScopeKind::IntraChain,
+            None,
         );
+    }
+
+    fn add_cross_summary(&mut self, posting: &UriPosting) {
+        self.cross_summary.extend_from_slice(&posting.nft_ids);
+        self.uri.add(
+            posting,
+            posting.nft_ids.len() as u64,
+            Dimension::TokenUri,
+            ScopeKind::CrossChainSummary,
+            None,
+        );
+    }
+
+    fn add_matrix(&mut self, posting: &UriPosting, peer_chains: &[ChainId]) {
+        for &secondary in peer_chains {
+            if secondary != posting.chain_id {
+                self.uri.add(
+                    posting,
+                    posting.nft_ids.len() as u64,
+                    Dimension::TokenUri,
+                    ScopeKind::ChainMatrix,
+                    Some(secondary),
+                );
+            }
+        }
+        match &mut self.matrix {
+            MatrixWorkerHits::Compact(entries) => {
+                let peer_mask = peer_chains.iter().fold(0_u64, |mask, &chain| {
+                    if chain == posting.chain_id {
+                        mask
+                    } else {
+                        mask | (1_u64 << usize::from(chain))
+                    }
+                });
+                entries.extend(posting.nft_ids.iter().map(|&nft_id| (nft_id, peer_mask)));
+            }
+            MatrixWorkerHits::Wide(entries) => {
+                for &secondary in peer_chains {
+                    if secondary != posting.chain_id {
+                        entries.extend(posting.nft_ids.iter().map(|&nft_id| (nft_id, secondary)));
+                    }
+                }
+            }
+        }
     }
 
     fn merge(&mut self, mut other: Self) {
         self.uri.merge(other.uri);
         self.intra.append(&mut other.intra);
         self.cross_summary.append(&mut other.cross_summary);
-        if self.matrix.len() < other.matrix.len() {
-            std::mem::swap(&mut self.matrix, &mut other.matrix);
+        match (&mut self.matrix, &mut other.matrix) {
+            (MatrixWorkerHits::Compact(left), MatrixWorkerHits::Compact(right)) => {
+                left.append(right);
+            }
+            (MatrixWorkerHits::Wide(left), MatrixWorkerHits::Wide(right)) => {
+                left.append(right);
+            }
+            _ => unreachable!("all URI workers use the same chain width"),
         }
-        self.matrix.extend(other.matrix);
     }
 }
 
 struct TokenHits {
     intra: DenseNftSet,
     cross_summary: DenseNftSet,
-    matrix: AHashSet<(NftId, ChainId)>,
+    matrix: MatrixNftSet,
+}
+
+enum MatrixNftSet {
+    Compact(Vec<u64>),
+    Wide(AHashSet<(NftId, ChainId)>),
+}
+
+impl MatrixNftSet {
+    fn new(nft_count: usize, chain_count: usize) -> Self {
+        if chain_count <= u64::BITS as usize {
+            Self::Compact(vec![0; nft_count])
+        } else {
+            Self::Wide(AHashSet::new())
+        }
+    }
+
+    fn insert(&mut self, nft_id: NftId, chain_id: ChainId) {
+        match self {
+            Self::Compact(masks) => {
+                masks[nft_id as usize] |= 1_u64 << usize::from(chain_id);
+            }
+            Self::Wide(entries) => {
+                entries.insert((nft_id, chain_id));
+            }
+        }
+    }
+
+    fn contains(&self, nft_id: NftId, chain_id: ChainId) -> bool {
+        match self {
+            Self::Compact(masks) => masks[nft_id as usize] & (1_u64 << usize::from(chain_id)) != 0,
+            Self::Wide(entries) => entries.contains(&(nft_id, chain_id)),
+        }
+    }
 }
 
 struct DenseNftSet {
@@ -135,11 +259,11 @@ impl DenseNftSet {
 }
 
 impl TokenHits {
-    fn new(nft_count: usize) -> Self {
+    fn new(nft_count: usize, chain_count: usize) -> Self {
         Self {
             intra: DenseNftSet::with_capacity(nft_count),
             cross_summary: DenseNftSet::with_capacity(nft_count),
-            matrix: AHashSet::new(),
+            matrix: MatrixNftSet::new(nft_count, chain_count),
         }
     }
 }
@@ -150,84 +274,150 @@ pub fn run_uri(
     progress: &dyn ProgressObserver,
 ) -> Result<(), DedupError> {
     progress.set_stage("uri");
-    let token_ranges = group_ranges(&store.token_uri_postings);
-    progress.begin_phase("token_uri", Some(token_ranges.len() as u64));
+    let token_groups = group_count(&store.token_uri_postings);
+    progress.begin_phase("token_uri", Some(token_groups));
     let cancelled = AtomicBool::new(false);
-    let token_worker = token_ranges
-        .par_iter()
-        .fold(TokenWorker::default, |mut worker, range| {
-            if cancelled.load(Ordering::Relaxed) {
-                return worker;
-            }
-            if progress.check_cancelled().is_err() {
-                cancelled.store(true, Ordering::Relaxed);
-                return worker;
-            }
-            accumulate_token_scope_hits(&store.token_uri_postings[range.clone()], &mut worker);
-            progress.add_completed(1);
-            worker
-        })
-        .reduce(TokenWorker::default, |mut left, right| {
+    let token_worker = process_group_chunks(
+        &store.token_uri_postings,
+        || TokenWorker::new(store.chains.len()),
+        |worker, members| accumulate_token_scope_hits(members, worker),
+        |mut left, right| {
             left.merge(right);
             left
-        });
+        },
+        progress,
+        &cancelled,
+    );
     if cancelled.load(Ordering::Relaxed) {
         return Err(DedupError::Interrupted);
     }
-    let mut token_hits = TokenHits::new(store.nfts.len());
-    for nft_id in token_worker.intra {
+    let TokenWorker {
+        uri,
+        intra,
+        cross_summary,
+        matrix,
+    } = token_worker;
+    let mut token_hits = TokenHits::new(store.nfts.len(), store.chains.len());
+    for nft_id in intra {
         token_hits.intra.insert(nft_id);
     }
-    for nft_id in token_worker.cross_summary {
+    for nft_id in cross_summary {
         token_hits.cross_summary.insert(nft_id);
     }
-    token_hits.matrix = token_worker.matrix;
-    token_worker.uri.flush(store, acc);
+    match matrix {
+        MatrixWorkerHits::Compact(entries) => {
+            let MatrixNftSet::Compact(masks) = &mut token_hits.matrix else {
+                unreachable!("compact URI worker requires compact token hits");
+            };
+            for (nft_id, peer_mask) in entries {
+                masks[nft_id as usize] |= peer_mask;
+            }
+        }
+        MatrixWorkerHits::Wide(entries) => {
+            for (nft_id, chain_id) in entries {
+                token_hits.matrix.insert(nft_id, chain_id);
+            }
+        }
+    }
+    uri.flush(acc, Dimension::TokenUri);
 
-    let image_ranges = group_ranges(&store.image_uri_postings);
-    progress.begin_phase("image_uri", Some(image_ranges.len() as u64));
-    let image_acc = image_ranges
-        .par_iter()
-        .fold(LocalUriAccumulator::default, |mut local, range| {
-            if cancelled.load(Ordering::Relaxed) {
-                return local;
-            }
-            if progress.check_cancelled().is_err() {
-                cancelled.store(true, Ordering::Relaxed);
-                return local;
-            }
-            accumulate_image_scope_hits(
-                &store.image_uri_postings[range.clone()],
-                &token_hits,
-                &mut local,
-            );
-            progress.add_completed(1);
-            local
-        })
-        .reduce(LocalUriAccumulator::default, |mut left, right| {
+    let image_groups = group_count(&store.image_uri_postings);
+    progress.begin_phase("image_uri", Some(image_groups));
+    let image_acc = process_group_chunks(
+        &store.image_uri_postings,
+        LocalUriAccumulator::default,
+        |local, members| {
+            accumulate_image_scope_hits(members, &token_hits, store.chains.len(), local)
+        },
+        |mut left, right| {
             left.merge(right);
             left
-        });
+        },
+        progress,
+        &cancelled,
+    );
     if cancelled.load(Ordering::Relaxed) {
         return Err(DedupError::Interrupted);
     }
-    image_acc.flush(store, acc);
+    image_acc.flush(acc, Dimension::ImageUri);
     Ok(())
 }
 
-fn group_ranges(postings: &[UriPosting]) -> Vec<std::ops::Range<usize>> {
-    let mut ranges = Vec::new();
-    let mut start = 0;
-    while start < postings.len() {
-        let uri_id = postings[start].uri_id;
-        let mut end = start + 1;
-        while end < postings.len() && postings[end].uri_id == uri_id {
-            end += 1;
-        }
-        ranges.push(start..end);
-        start = end;
+fn group_count(postings: &[UriPosting]) -> u64 {
+    if postings.is_empty() {
+        return 0;
     }
-    ranges
+    1 + postings
+        .par_windows(2)
+        .filter(|pair| pair[0].uri_id != pair[1].uri_id)
+        .count() as u64
+}
+
+fn process_group_chunks<W, New, Process, Merge>(
+    postings: &[UriPosting],
+    new_worker: New,
+    process: Process,
+    merge: Merge,
+    progress: &dyn ProgressObserver,
+    cancelled: &AtomicBool,
+) -> W
+where
+    W: Send,
+    New: Fn() -> W + Send + Sync,
+    Process: Fn(&mut W, &[UriPosting]) + Send + Sync,
+    Merge: Fn(W, W) -> W + Send + Sync,
+{
+    if postings.is_empty() {
+        return new_worker();
+    }
+    let target_tasks = rayon::current_num_threads()
+        .saturating_mul(URI_TASKS_PER_THREAD)
+        .max(1);
+    let chunk_size = postings.len().div_ceil(target_tasks).max(1);
+    let task_count = postings.len().div_ceil(chunk_size);
+    (0..task_count)
+        .into_par_iter()
+        .map(|task| {
+            let mut worker = new_worker();
+            if progress.check_cancelled().is_err() {
+                cancelled.store(true, Ordering::Relaxed);
+                return worker;
+            }
+            let chunk_start = task * chunk_size;
+            let chunk_end = (chunk_start + chunk_size).min(postings.len());
+            let mut start = chunk_start;
+            if start > 0 && postings[start - 1].uri_id == postings[start].uri_id {
+                let continued_uri = postings[start].uri_id;
+                start +=
+                    postings[start..].partition_point(|posting| posting.uri_id == continued_uri);
+            }
+            let mut pending = 0_u64;
+            while start < chunk_end && !cancelled.load(Ordering::Relaxed) {
+                let uri_id = postings[start].uri_id;
+                let mut end = start + 1;
+                while end < postings.len() && postings[end].uri_id == uri_id {
+                    end += 1;
+                }
+                process(&mut worker, &postings[start..end]);
+                pending += 1;
+                if pending >= URI_PROGRESS_BATCH {
+                    progress.add_completed(pending);
+                    pending = 0;
+                    if progress.check_cancelled().is_err() {
+                        cancelled.store(true, Ordering::Relaxed);
+                    }
+                }
+                start = end;
+            }
+            if pending != 0 {
+                progress.add_completed(pending);
+                if progress.check_cancelled().is_err() {
+                    cancelled.store(true, Ordering::Relaxed);
+                }
+            }
+            worker
+        })
+        .reduce(&new_worker, merge)
 }
 
 fn postings_by_chain(members: &[UriPosting]) -> AHashMap<ChainId, Vec<&UriPosting>> {
@@ -239,31 +429,225 @@ fn postings_by_chain(members: &[UriPosting]) -> AHashMap<ChainId, Vec<&UriPostin
 }
 
 fn accumulate_token_scope_hits(members: &[UriPosting], worker: &mut TokenWorker) {
+    if members.len() < 2 {
+        return;
+    }
+    if matches!(&worker.matrix, MatrixWorkerHits::Compact(_)) {
+        let mut posting_counts = [0_usize; u64::BITS as usize];
+        let mut present_mask = 0_u64;
+        for posting in members {
+            posting_counts[usize::from(posting.chain_id)] += 1;
+            present_mask |= 1_u64 << usize::from(posting.chain_id);
+        }
+        let mut chains = Vec::with_capacity(present_mask.count_ones() as usize);
+        let mut remaining = present_mask;
+        while remaining != 0 {
+            let chain = remaining.trailing_zeros() as ChainId;
+            chains.push(chain);
+            remaining &= remaining - 1;
+        }
+        for posting in members {
+            if posting_counts[usize::from(posting.chain_id)] >= 2 {
+                worker.add_intra(posting);
+            }
+            if chains.len() >= 2 {
+                worker.add_cross_summary(posting);
+                worker.add_matrix(posting, &chains);
+            }
+        }
+        return;
+    }
+
     let by_chain = postings_by_chain(members);
     let chains: Vec<ChainId> = by_chain.keys().copied().collect();
     for (&chain, postings) in &by_chain {
         if postings.len() >= 2 {
             for posting in postings {
-                worker.add(posting, ScopeKind::IntraChain, None);
+                worker.add_intra(posting);
             }
         }
         if chains.len() >= 2 {
             for posting in postings {
-                worker.add(posting, ScopeKind::CrossChainSummary, None);
+                worker.add_cross_summary(posting);
             }
         }
-        for &other_chain in &chains {
-            if other_chain == chain {
-                continue;
-            }
+        if chains.len() >= 2 {
             for posting in postings {
-                worker.add(posting, ScopeKind::ChainMatrix, Some(other_chain));
+                debug_assert_eq!(posting.chain_id, chain);
+                worker.add_matrix(posting, &chains);
             }
         }
     }
 }
 
 fn accumulate_image_scope_hits(
+    members: &[UriPosting],
+    token_hits: &TokenHits,
+    chain_count: usize,
+    output: &mut LocalUriAccumulator,
+) {
+    if members.len() < 2 {
+        return;
+    }
+    if chain_count <= u64::BITS as usize {
+        accumulate_image_scope_hits_compact(members, token_hits, output);
+    } else {
+        accumulate_image_scope_hits_wide(members, token_hits, output);
+    }
+}
+
+#[derive(Default)]
+struct GroupScopeAggregate {
+    contracts: Vec<ContractId>,
+    nft_rows: u64,
+    posting_count: usize,
+}
+
+impl GroupScopeAggregate {
+    fn add_posting(&mut self, contract_id: ContractId, nft_rows: u64) {
+        if nft_rows == 0 {
+            return;
+        }
+        self.contracts.push(contract_id);
+        self.nft_rows = self.nft_rows.saturating_add(nft_rows);
+        self.posting_count += 1;
+    }
+}
+
+fn accumulate_image_scope_hits_compact(
+    members: &[UriPosting],
+    token_hits: &TokenHits,
+    output: &mut LocalUriAccumulator,
+) {
+    let mut present_mask = 0_u64;
+    for posting in members {
+        present_mask |= 1_u64 << usize::from(posting.chain_id);
+    }
+    let mut chains = Vec::with_capacity(present_mask.count_ones() as usize);
+    let mut remaining = present_mask;
+    while remaining != 0 {
+        let chain = remaining.trailing_zeros() as ChainId;
+        chains.push(chain);
+        remaining &= remaining - 1;
+    }
+    if chains.len() == 1 {
+        let mut intra = GroupScopeAggregate::default();
+        for posting in members {
+            let nft_rows = posting
+                .nft_ids
+                .iter()
+                .filter(|&&nft_id| !token_hits.intra.contains(nft_id))
+                .count() as u64;
+            intra.add_posting(posting.contract_id, nft_rows);
+        }
+        if intra.posting_count >= 2 {
+            output.add_group(
+                chains[0],
+                &intra.contracts,
+                intra.nft_rows,
+                Dimension::ImageUri,
+                ScopeKind::IntraChain,
+                None,
+            );
+        }
+        return;
+    }
+    let mut local_index = [usize::MAX; u64::BITS as usize];
+    for (index, &chain) in chains.iter().enumerate() {
+        local_index[usize::from(chain)] = index;
+    }
+    let width = chains.len();
+    let mut intra = (0..width)
+        .map(|_| GroupScopeAggregate::default())
+        .collect::<Vec<_>>();
+    let mut cross = (0..width)
+        .map(|_| GroupScopeAggregate::default())
+        .collect::<Vec<_>>();
+    let mut matrix = (0..width.saturating_mul(width))
+        .map(|_| GroupScopeAggregate::default())
+        .collect::<Vec<_>>();
+
+    for posting in members {
+        let primary = local_index[usize::from(posting.chain_id)];
+        let mut intra_count = 0_u64;
+        let mut cross_count = 0_u64;
+        let mut matrix_counts = [0_u64; u64::BITS as usize];
+        for &nft_id in &posting.nft_ids {
+            if !token_hits.intra.contains(nft_id) {
+                intra_count += 1;
+            }
+            if !token_hits.cross_summary.contains(nft_id) {
+                cross_count += 1;
+            }
+            for (secondary, &secondary_chain) in chains.iter().enumerate() {
+                if secondary != primary && !token_hits.matrix.contains(nft_id, secondary_chain) {
+                    matrix_counts[secondary] += 1;
+                }
+            }
+        }
+        intra[primary].add_posting(posting.contract_id, intra_count);
+        cross[primary].add_posting(posting.contract_id, cross_count);
+        for secondary in 0..width {
+            if secondary != primary {
+                matrix[primary * width + secondary]
+                    .add_posting(posting.contract_id, matrix_counts[secondary]);
+            }
+        }
+    }
+
+    for (primary, aggregate) in intra.iter().enumerate() {
+        if aggregate.posting_count >= 2 {
+            output.add_group(
+                chains[primary],
+                &aggregate.contracts,
+                aggregate.nft_rows,
+                Dimension::ImageUri,
+                ScopeKind::IntraChain,
+                None,
+            );
+        }
+    }
+
+    if cross
+        .iter()
+        .filter(|aggregate| aggregate.nft_rows != 0)
+        .count()
+        >= 2
+    {
+        for (primary, aggregate) in cross.iter().enumerate() {
+            output.add_group(
+                chains[primary],
+                &aggregate.contracts,
+                aggregate.nft_rows,
+                Dimension::ImageUri,
+                ScopeKind::CrossChainSummary,
+                None,
+            );
+        }
+    }
+
+    for primary in 0..width {
+        for secondary in 0..width {
+            if primary == secondary {
+                continue;
+            }
+            let aggregate = &matrix[primary * width + secondary];
+            let reciprocal = &matrix[secondary * width + primary];
+            if aggregate.nft_rows != 0 && reciprocal.nft_rows != 0 {
+                output.add_group(
+                    chains[primary],
+                    &aggregate.contracts,
+                    aggregate.nft_rows,
+                    Dimension::ImageUri,
+                    ScopeKind::ChainMatrix,
+                    Some(chains[secondary]),
+                );
+            }
+        }
+    }
+}
+
+fn accumulate_image_scope_hits_wide(
     members: &[UriPosting],
     token_hits: &TokenHits,
     output: &mut LocalUriAccumulator,
@@ -314,13 +698,13 @@ fn accumulate_image_scope_hits(
                 continue;
             }
             let primary_matrix = filtered_posting_counts(postings, |nft_id| {
-                !token_hits.matrix.contains(&(nft_id, other_chain))
+                !token_hits.matrix.contains(nft_id, other_chain)
             });
             let other_has_match = by_chain[&other_chain].iter().any(|posting| {
                 posting
                     .nft_ids
                     .iter()
-                    .any(|nft_id| !token_hits.matrix.contains(&(*nft_id, chain)))
+                    .any(|&nft_id| !token_hits.matrix.contains(nft_id, chain))
             });
             if !primary_matrix.is_empty() && other_has_match {
                 for (posting, nft_count) in primary_matrix {
@@ -377,6 +761,107 @@ mod tests {
         }
     }
 
+    #[test]
+    fn compact_image_chain_masks_match_wide_reference() {
+        let postings = vec![
+            UriPosting {
+                contract_id: 0,
+                chain_id: 0,
+                uri_id: 0,
+                nft_ids: vec![0, 1],
+            },
+            UriPosting {
+                contract_id: 1,
+                chain_id: 0,
+                uri_id: 0,
+                nft_ids: vec![2],
+            },
+            UriPosting {
+                contract_id: 2,
+                chain_id: 1,
+                uri_id: 0,
+                nft_ids: vec![3, 4],
+            },
+            UriPosting {
+                contract_id: 3,
+                chain_id: 2,
+                uri_id: 0,
+                nft_ids: vec![5],
+            },
+        ];
+        let mut compact = TokenHits::new(6, 3);
+        let mut wide = TokenHits {
+            intra: DenseNftSet::with_capacity(6),
+            cross_summary: DenseNftSet::with_capacity(6),
+            matrix: MatrixNftSet::Wide(AHashSet::new()),
+        };
+        for nft_id in [1, 4] {
+            compact.intra.insert(nft_id);
+            wide.intra.insert(nft_id);
+        }
+        for nft_id in [2, 5] {
+            compact.cross_summary.insert(nft_id);
+            wide.cross_summary.insert(nft_id);
+        }
+        for (nft_id, chain_id) in [(0, 1), (3, 0), (4, 2)] {
+            compact.matrix.insert(nft_id, chain_id);
+            wide.matrix.insert(nft_id, chain_id);
+        }
+
+        let mut actual = LocalUriAccumulator::default();
+        accumulate_image_scope_hits_compact(&postings, &compact, &mut actual);
+        let mut expected = LocalUriAccumulator::default();
+        accumulate_image_scope_hits_wide(&postings, &wide, &mut expected);
+
+        assert_eq!(actual.scopes.len(), expected.scopes.len());
+        for (key, actual) in actual.scopes {
+            let expected = &expected.scopes[&key];
+            assert_eq!(actual.nft_rows, expected.nft_rows, "scope {key:?}");
+            assert_eq!(actual.contracts, expected.contracts, "scope {key:?}");
+        }
+    }
+
+    #[test]
+    fn boundary_aware_group_chunks_process_every_uri_once() {
+        let mut postings = (0..50)
+            .map(|contract_id| UriPosting {
+                contract_id,
+                chain_id: 0,
+                uri_id: 0,
+                nft_ids: vec![contract_id],
+            })
+            .collect::<Vec<_>>();
+        postings.extend((1..=46).map(|uri_id| UriPosting {
+            contract_id: 49 + uri_id,
+            chain_id: 0,
+            uri_id,
+            nft_ids: vec![49 + uri_id],
+        }));
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(4)
+            .build()
+            .unwrap();
+        let cancelled = AtomicBool::new(false);
+        let mut groups = pool.install(|| {
+            process_group_chunks(
+                &postings,
+                Vec::<u32>::new,
+                |seen, members| seen.push(members[0].uri_id),
+                |mut left, mut right| {
+                    left.append(&mut right);
+                    left
+                },
+                &NoopProgress,
+                &cancelled,
+            )
+        });
+        groups.sort_unstable();
+
+        assert!(!cancelled.load(Ordering::Relaxed));
+        assert_eq!(group_count(&postings), 47);
+        assert_eq!(groups, (0..=46).collect::<Vec<_>>());
+    }
+
     fn prepared(rows: impl IntoIterator<Item = InputRow>) -> EntityStore {
         let mut store = EntityStore::default();
         for row in rows {
@@ -426,6 +911,22 @@ mod tests {
             ),
             2
         );
+    }
+
+    #[test]
+    fn rerunning_uri_on_the_same_accumulator_is_idempotent() {
+        let store = prepared([
+            row("ethereum", "a", "1", "same", "image"),
+            row("ethereum", "b", "2", "same", "image"),
+            row("base", "c", "3", "same", "image"),
+        ]);
+        let mut acc = SummaryAccumulator::default();
+        run_uri(&store, &mut acc, &NoopProgress).unwrap();
+        let once = acc.counts().clone();
+
+        run_uri(&store, &mut acc, &NoopProgress).unwrap();
+
+        assert_eq!(acc.counts(), &once);
     }
 
     #[test]

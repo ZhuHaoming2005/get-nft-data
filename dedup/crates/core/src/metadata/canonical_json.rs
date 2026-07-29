@@ -137,7 +137,7 @@ fn normalize_value(value: Value) -> Option<Value> {
             if let Some((_, Value::Array(attributes))) =
                 entries.iter_mut().find(|(key, _)| key == "attributes")
             {
-                attributes.sort_by_key(attr_key);
+                sort_attributes(attributes);
             }
             entries.sort_by(|left, right| left.0.cmp(&right.0));
             Some(Value::Object(entries.into_iter().collect()))
@@ -245,19 +245,53 @@ fn attr_key(value: &Value) -> (String, String) {
     }
 }
 
+fn sort_attributes(attributes: &mut Vec<Value>) {
+    if attributes.len() < 2 {
+        return;
+    }
+    let mut keyed = std::mem::take(attributes)
+        .into_iter()
+        .map(|value| (attr_key(&value), value))
+        .collect::<Vec<_>>();
+    keyed.sort_by(|left, right| left.0.cmp(&right.0));
+    attributes.extend(keyed.into_iter().map(|(_, value)| value));
+}
+
 fn normalize_string(input: &str) -> String {
-    input
-        .nfkc()
-        .collect::<String>()
-        .to_lowercase()
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
+    // Keep `str::to_lowercase` as a whole-string operation: unlike
+    // `char::to_lowercase`, it implements context-sensitive mappings such as
+    // Greek final sigma.
+    let normalized = input.nfkc().collect::<String>().to_lowercase();
+    let mut output = String::with_capacity(input.len());
+    let mut pending_space = false;
+    for character in normalized.chars() {
+        if character.is_whitespace() {
+            pending_space = !output.is_empty();
+        } else {
+            if pending_space {
+                output.push(' ');
+                pending_space = false;
+            }
+            output.push(character);
+        }
+    }
+    output
 }
 
 #[cfg(test)]
 mod tests {
-    use super::canonicalize_json;
+    use super::{canonicalize_json, normalize_string};
+    use unicode_normalization::UnicodeNormalization;
+
+    fn reference_normalize_string(input: &str) -> String {
+        input
+            .nfkc()
+            .collect::<String>()
+            .to_lowercase()
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 
     #[test]
     fn rejects_duplicate_raw_keys() {
@@ -294,5 +328,32 @@ mod tests {
 
         assert_eq!(plain, exponent);
         assert_eq!(plain, r#"{"value":12345678901234567890.5}"#);
+    }
+
+    #[test]
+    fn fused_string_normalization_matches_reference_pipeline() {
+        for input in [
+            "",
+            "  Hello\tWORLD  ",
+            "Ｆｕｌｌ　Ｗｉｄｔｈ",
+            "Straße\nCAFÉ",
+            "A\u{2003}\u{2009}B",
+            "İ  Σ  K",
+            "ΟΣ ΟΣΑ",
+        ] {
+            assert_eq!(normalize_string(input), reference_normalize_string(input));
+        }
+    }
+
+    #[test]
+    fn attribute_sort_keys_are_computed_without_changing_stable_order() {
+        let canonical = canonicalize_json(
+            r#"{"attributes":[{"trait_type":"b","value":2},{"trait_type":"a","value":1},{"trait_type":"a","value":1,"extra":"kept"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            canonical,
+            r#"{"attributes":[{"trait_type":"a","value":1},{"extra":"kept","trait_type":"a","value":1},{"trait_type":"b","value":2}]}"#
+        );
     }
 }

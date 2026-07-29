@@ -288,7 +288,7 @@ fn similarity_at_least_impl(
         || right_terms.len().saturating_mul(4) < left_terms.len();
     let check_iterative_bound = left_terms.len().min(right_terms.len()) >= 16;
     let all_unit_frequencies = left.all_unit_frequencies() && right.all_unit_frequencies();
-    if imbalanced || !check_iterative_bound {
+    if !all_unit_frequencies || imbalanced || !check_iterative_bound {
         let mut shared = SharedWeights::default();
         if all_unit_frequencies {
             let unit = weights.unit_weights();
@@ -303,78 +303,7 @@ fn similarity_at_least_impl(
         return decision_at_least(&weights, shared, threshold, false);
     }
 
-    if all_unit_frequencies {
-        return similarity_at_least_unit_iterative(&weights, left_terms, right_terms, threshold);
-    }
-
-    similarity_at_least_iterative(&weights, left_terms, right_terms, threshold)
-}
-
-fn similarity_at_least_iterative(
-    weights: &PairWeights,
-    left_terms: &[(u32, u32)],
-    right_terms: &[(u32, u32)],
-    threshold: f64,
-) -> ThresholdDecision {
-    let mut left_pos = 0;
-    let mut right_pos = 0;
-    let mut processed_left_norm = 0.0;
-    let mut processed_right_norm = 0.0;
-    let mut shared = SharedWeights::default();
-    let mut comparisons = 0_u32;
-    let mut iterative_bound = None::<Option<IterativeBound>>;
-    let mut next_bound_check = 8_u32;
-    while left_pos < left_terms.len() && right_pos < right_terms.len() {
-        let (left_term, left_tf) = &left_terms[left_pos];
-        let (right_term, right_tf) = &right_terms[right_pos];
-        match left_term.cmp(right_term) {
-            std::cmp::Ordering::Equal => {
-                let left_once = weights.left_once(*left_tf);
-                let right_once = weights.right_once(*right_tf);
-                let left_squared = left_once * left_once;
-                let right_squared = right_once * right_once;
-                processed_left_norm += left_squared;
-                processed_right_norm += right_squared;
-                shared.add_with_norms(left_once, right_once, left_squared, right_squared);
-                left_pos += 1;
-                right_pos += 1;
-            }
-            std::cmp::Ordering::Less => {
-                let left_once = weights.left_once(*left_tf);
-                processed_left_norm += left_once * left_once;
-                left_pos += 1;
-            }
-            std::cmp::Ordering::Greater => {
-                let right_once = weights.right_once(*right_tf);
-                processed_right_norm += right_once * right_once;
-                right_pos += 1;
-            }
-        }
-        comparisons += 1;
-        if comparisons == next_bound_check {
-            let bound = *iterative_bound.get_or_insert_with(|| weights.iterative_bound(threshold));
-            if bound.is_some_and(|bound| {
-                weights.upper_bound_below_threshold(
-                    bound,
-                    shared,
-                    processed_left_norm,
-                    processed_right_norm,
-                )
-            }) {
-                return ThresholdDecision {
-                    matched: false,
-                    zero_overlap_pruned: false,
-                    upper_bound_pruned: true,
-                };
-            }
-            next_bound_check = if next_bound_check < 64 {
-                next_bound_check * 2
-            } else {
-                next_bound_check.saturating_add(32)
-            };
-        }
-    }
-    decision_at_least(weights, shared, threshold, false)
+    similarity_at_least_unit_iterative(&weights, left_terms, right_terms, threshold)
 }
 
 fn similarity_at_least_unit_iterative(

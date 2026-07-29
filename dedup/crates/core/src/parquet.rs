@@ -2,7 +2,7 @@ use crate::entity::{EntityStore, InputRow, SourceOrder};
 use crate::error::DedupError;
 use crate::progress::ProgressObserver;
 use ahash::AHashSet;
-use arrow_array::{Array, ArrayRef, RecordBatch, StringArray};
+use arrow_array::{Array, RecordBatch, StringArray};
 use arrow_cast::{can_cast_types, cast};
 use arrow_schema::DataType;
 use parquet::arrow::ProjectionMask;
@@ -210,22 +210,33 @@ fn scan_file_to_shard(
     options: &LoadOptions,
     progress: &dyn ProgressObserver,
 ) -> Result<EntityStore, DedupError> {
-    let mut row_start = 0_u64;
-    let mut row_groups = Vec::with_capacity(input.row_group_count);
+    let mut row_starts = Vec::with_capacity(input.row_group_count + 1);
+    row_starts.push(0_u64);
     for row_group in 0..input.row_group_count {
-        row_groups.push((row_group, row_start));
         let rows = input
             .metadata
             .metadata()
             .row_group(row_group)
             .num_rows()
             .max(0) as u64;
-        row_start = row_start.saturating_add(rows);
+        row_starts.push(row_starts.last().copied().unwrap_or(0).saturating_add(rows));
     }
-    let row_group_results: Vec<Result<EntityStore, DedupError>> = row_groups
+
+    // Keep enough independent work for load balancing without paying one file
+    // open, reader, EntityStore, and merge path per row group on large files.
+    let target_chunks = rayon::current_num_threads().saturating_mul(2).max(1);
+    let row_groups_per_chunk = input.row_group_count.div_ceil(target_chunks).max(1);
+    let chunks = (0..input.row_group_count)
+        .step_by(row_groups_per_chunk)
+        .map(|start| {
+            let end = (start + row_groups_per_chunk).min(input.row_group_count);
+            (start, end, row_starts[start])
+        })
+        .collect::<Vec<_>>();
+    let row_group_results: Vec<Result<EntityStore, DedupError>> = chunks
         .par_iter()
-        .map(|&(row_group, row_start)| {
-            scan_row_group_to_shard(input, row_group, row_start, options, progress)
+        .map(|&(start, end, row_start)| {
+            scan_row_groups_to_shard(input, start..end, row_start, options, progress)
         })
         .collect();
     merge_shards_ordered(row_group_results, options)
@@ -254,9 +265,9 @@ fn merge_shards_ordered(
     }
 }
 
-fn scan_row_group_to_shard(
+fn scan_row_groups_to_shard(
     input: &ValidatedInput,
-    row_group: usize,
+    row_groups: std::ops::Range<usize>,
     row_start: u64,
     options: &LoadOptions,
     progress: &dyn ProgressObserver,
@@ -272,7 +283,7 @@ fn scan_row_group_to_shard(
     );
     let reader = ParquetRecordBatchReaderBuilder::new_with_metadata(file, input.metadata.clone())
         .with_projection(mask)
-        .with_row_groups(vec![row_group])
+        .with_row_groups(row_groups.collect())
         .with_batch_size(64 * 1024)
         .build()
         .map_err(|error| DedupError::ParquetRead {
@@ -289,17 +300,16 @@ fn scan_row_group_to_shard(
         })?;
         let columns = ProjectedColumns::new(&batch, &input.path, options)?;
         for row_index in 0..batch.num_rows() {
-            let row = columns.decode(
-                row_index,
-                SourceOrder {
-                    file_ordinal: input.file_ordinal,
-                    file_row_number: row_start + row_offset,
-                },
-            );
+            let source_order = SourceOrder {
+                file_ordinal: input.file_ordinal,
+                file_row_number: row_start + row_offset,
+            };
             row_offset += 1;
-            if !options.allowed_chains.is_empty() && !options.allowed_chains.contains(&row.chain) {
+            let chain = columns.decode_chain(row_index);
+            if !options.allowed_chains.is_empty() && !options.allowed_chains.contains(&chain) {
                 continue;
             }
+            let row = columns.decode_with_chain(row_index, source_order, chain);
             shard.try_ingest_row(row)?;
         }
         progress.add_completed(batch.num_rows() as u64);
@@ -308,7 +318,7 @@ fn scan_row_group_to_shard(
 }
 
 struct ProjectedColumns {
-    columns: [Option<ArrayRef>; REQUIRED_COLUMNS.len()],
+    columns: [Option<StringArray>; REQUIRED_COLUMNS.len()],
 }
 
 impl ProjectedColumns {
@@ -338,6 +348,11 @@ impl ProjectedColumns {
                     ),
                 })?
             };
+            let converted = converted
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("arrow cast to Utf8 must return StringArray")
+                .clone();
             columns[column] = Some(converted);
         }
         Ok(Self { columns })
@@ -347,20 +362,25 @@ impl ProjectedColumns {
         let Some(column) = &self.columns[column] else {
             return "";
         };
-        let array = column
-            .as_any()
-            .downcast_ref::<StringArray>()
-            .expect("arrow cast to Utf8 must return StringArray");
-        if array.is_null(row) {
+        if column.is_null(row) {
             ""
         } else {
-            array.value(row)
+            column.value(row)
         }
     }
 
-    fn decode(&self, row_index: usize, source_order: SourceOrder) -> InputRow {
+    fn decode_chain(&self, row_index: usize) -> String {
+        normalize_chain(self.value(0, row_index))
+    }
+
+    fn decode_with_chain(
+        &self,
+        row_index: usize,
+        source_order: SourceOrder,
+        chain: String,
+    ) -> InputRow {
         InputRow {
-            chain: normalize_chain(self.value(0, row_index)),
+            chain,
             contract_address: self.value(1, row_index).trim().to_owned(),
             token_id: self.value(2, row_index).trim().to_owned(),
             name_norm: coalesce(self.value(3, row_index)),
@@ -391,6 +411,7 @@ mod tests {
     use arrow_array::{ArrayRef, Int64Array};
     use arrow_schema::{Field, Schema};
     use parquet::arrow::ArrowWriter;
+    use parquet::file::properties::WriterProperties;
     use std::sync::Arc;
 
     fn write_mixed_schema(path: &Path) {
@@ -414,6 +435,34 @@ mod tests {
         ];
         let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
         let mut writer = ArrowWriter::try_new(File::create(path).unwrap(), schema, None).unwrap();
+        writer.write(&batch).unwrap();
+        writer.close().unwrap();
+    }
+
+    fn write_multi_row_group_snapshot(path: &Path) {
+        let schema = Arc::new(Schema::new(
+            REQUIRED_COLUMNS
+                .into_iter()
+                .map(|name| Field::new(name, DataType::Utf8, false))
+                .collect::<Vec<_>>(),
+        ));
+        let columns: Vec<ArrayRef> = vec![
+            Arc::new(StringArray::from(vec![
+                "ethereum", "base", "ethereum", "base",
+            ])),
+            Arc::new(StringArray::from(vec!["a", "b", "c", "d"])),
+            Arc::new(StringArray::from(vec!["1", "2", "3", "4"])),
+            Arc::new(StringArray::from(vec!["n1", "n2", "n3", "n4"])),
+            Arc::new(StringArray::from(vec!["u1", "u2", "u3", "u4"])),
+            Arc::new(StringArray::from(vec!["i1", "i2", "i3", "i4"])),
+            Arc::new(StringArray::from(vec!["{}", "{}", "{}", "{}"])),
+        ];
+        let batch = RecordBatch::try_new(schema.clone(), columns).unwrap();
+        let properties = WriterProperties::builder()
+            .set_max_row_group_size(1)
+            .build();
+        let mut writer =
+            ArrowWriter::try_new(File::create(path).unwrap(), schema, Some(properties)).unwrap();
         writer.write(&batch).unwrap();
         writer.close().unwrap();
     }
@@ -451,6 +500,31 @@ mod tests {
         assert!(store.contracts[0].metadata_by_token.is_empty());
         assert!(store.token_uri_postings.is_empty());
         assert!(store.image_uri_postings.is_empty());
+    }
+
+    #[test]
+    fn chunked_row_groups_preserve_source_rows_after_early_chain_filter() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("row-groups.parquet");
+        write_multi_row_group_snapshot(&path);
+        let options = LoadOptions::new(["ethereum".to_owned()], ["ethereum".to_owned()], None);
+
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(1)
+            .build()
+            .unwrap();
+        let store = pool
+            .install(|| load_entities_with_options(&[path], &options, &NoopProgress))
+            .unwrap();
+
+        assert_eq!(
+            store
+                .nfts
+                .iter()
+                .map(|nft| (nft.token_id.as_str(), nft.source_order.file_row_number))
+                .collect::<Vec<_>>(),
+            [("1", 0), ("3", 2)]
+        );
     }
 
     #[test]

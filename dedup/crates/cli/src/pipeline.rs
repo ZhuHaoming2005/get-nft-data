@@ -4,8 +4,8 @@ use crate::report::{
     write_reports,
 };
 use dedup_core::{
-    DedupError, LoadOptions, ProgressObserver, SummaryAccumulator, load_entities_with_options,
-    run_metadata, run_name, run_uri,
+    DedupError, Dimension, LoadOptions, ProgressObserver, SummaryAccumulator,
+    load_entities_with_options, run_metadata, run_name, run_uri,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -77,6 +77,7 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             "name",
             progress,
         )?;
+        acc.seal_dimension(Dimension::Name);
     }
     if config.run_uri {
         let stage_started = Instant::now();
@@ -93,6 +94,8 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             "uri",
             progress,
         )?;
+        acc.seal_dimension(Dimension::TokenUri);
+        acc.seal_dimension(Dimension::ImageUri);
     }
     store.release_completed_dimension_data();
     let mut metadata_stats = None;

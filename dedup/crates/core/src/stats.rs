@@ -9,9 +9,36 @@ pub struct SummaryAccumulator {
     /// URI units use interned integer IDs, avoiding one owned URI string per scope hit.
     counted_uri_units: AHashMap<ScopeKey, AHashSet<(ContractId, StringId)>>,
     counts: AHashMap<ScopeKey, ScopeCounts>,
+    completed_bulk_dimensions: AHashSet<Dimension>,
 }
 
 impl SummaryAccumulator {
+    /// Keep finalized counts while releasing the per-entity deduplication state
+    /// for a dimension that no later stage can update.
+    pub fn seal_dimension(&mut self, dimension: Dimension) {
+        self.counted_contracts
+            .retain(|key, _| key.dimension != dimension);
+        self.counted_nfts
+            .retain(|key, _| key.dimension != dimension);
+        self.counted_uri_units
+            .retain(|key, _| key.dimension != dimension);
+        if self.counted_contracts.is_empty() {
+            self.counted_contracts = AHashMap::new();
+        } else {
+            self.counted_contracts.shrink_to_fit();
+        }
+        if self.counted_nfts.is_empty() {
+            self.counted_nfts = AHashMap::new();
+        } else {
+            self.counted_nfts.shrink_to_fit();
+        }
+        if self.counted_uri_units.is_empty() {
+            self.counted_uri_units = AHashMap::new();
+        } else {
+            self.counted_uri_units.shrink_to_fit();
+        }
+    }
+
     pub(crate) fn merge_unique_contract_counts(&mut self, totals: AHashMap<ScopeKey, ScopeCounts>) {
         for (key, value) in totals {
             let target = self.counts.entry(key).or_default();
@@ -21,6 +48,17 @@ impl SummaryAccumulator {
             target.duplicate_nft_count = target
                 .duplicate_nft_count
                 .saturating_add(value.duplicate_nft_count);
+        }
+    }
+
+    pub(crate) fn merge_completed_dimension_counts(
+        &mut self,
+        dimension: Dimension,
+        totals: AHashMap<ScopeKey, ScopeCounts>,
+    ) {
+        debug_assert!(totals.keys().all(|key| key.dimension == dimension));
+        if self.completed_bulk_dimensions.insert(dimension) {
+            self.merge_unique_contract_counts(totals);
         }
     }
 
@@ -182,5 +220,51 @@ impl SummaryAccumulator {
 
     pub fn counts(&self) -> &AHashMap<ScopeKey, ScopeCounts> {
         &self.counts
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::entity::{InputRow, SourceOrder};
+
+    fn row() -> InputRow {
+        InputRow {
+            chain: "ethereum".to_owned(),
+            contract_address: "0x1".to_owned(),
+            token_id: "1".to_owned(),
+            name_norm: String::new(),
+            token_uri_norm: "uri://one".to_owned(),
+            image_uri_norm: String::new(),
+            metadata_json: String::new(),
+            source_order: SourceOrder {
+                file_ordinal: 0,
+                file_row_number: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn sealing_dimension_preserves_counts_and_forgets_seen_entities() {
+        let mut store = EntityStore::default();
+        store.ingest_row(row());
+        let chain = store.contracts[0].chain_id;
+        let mut acc = SummaryAccumulator::default();
+        acc.mark_uri_hit(
+            &store,
+            0,
+            store.nfts[0].token_uri_id.unwrap(),
+            1,
+            Dimension::TokenUri,
+            chain,
+        );
+        let before = acc.counts.clone();
+
+        acc.seal_dimension(Dimension::TokenUri);
+
+        assert_eq!(acc.counts, before);
+        assert!(acc.counted_contracts.is_empty());
+        assert!(acc.counted_nfts.is_empty());
+        assert!(acc.counted_uri_units.is_empty());
     }
 }
