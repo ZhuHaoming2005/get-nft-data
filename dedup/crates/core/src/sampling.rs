@@ -4,6 +4,8 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::hash::{BuildHasher, Hasher};
 
+const IMPLICIT_EXHAUSTIVE_SAMPLE_MULTIPLIER: usize = 8;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DuplicatePairSample {
     pub contract_a_chain: String,
@@ -208,7 +210,9 @@ impl PairSampler {
         let right_groups = self.group_members(right_len, &right_at);
         let remaining = self.cross_group_remaining(&left_groups, &right_groups);
         let pair_count = left_len.saturating_mul(right_len);
-        if remaining != 0 && pair_count <= remaining {
+        if remaining != 0
+            && pair_count <= remaining.saturating_mul(IMPLICIT_EXHAUSTIVE_SAMPLE_MULTIPLIER)
+        {
             for left in 0..left_len {
                 for right in 0..right_len {
                     self.observe(left_at(left), right_at(right));
@@ -242,7 +246,9 @@ impl PairSampler {
         let groups = self.group_members(len, &at);
         let remaining = self.clique_group_remaining(len, &groups);
         let pair_count = len.saturating_mul(len.saturating_sub(1)) / 2;
-        if remaining != 0 && pair_count <= remaining {
+        if remaining != 0
+            && pair_count <= remaining.saturating_mul(IMPLICIT_EXHAUSTIVE_SAMPLE_MULTIPLIER)
+        {
             for left in 0..len - 1 {
                 for right in left + 1..len {
                     self.observe(at(left), at(right));
@@ -667,6 +673,14 @@ mod tests {
         let mut sampler = plan(25).sampler();
         sampler.observe_cross_by(10_000, 10_000, |id| id as u32, |id| id as u32 + 20_000, 9);
         assert_eq!(sampler.all_chains.heap.len(), 25);
+    }
+
+    #[test]
+    fn near_capacity_implicit_group_is_exhausted_and_fills_the_sample() {
+        let mut sampler = plan(1_000).sampler();
+        sampler.observe_cross_by(1, 1_001, |_| 0, |id| id as u32 + 1, 29);
+        assert_eq!(sampler.all_chains.heap.len(), 1_000);
+        assert_eq!(sampler.intra_chain[&0].heap.len(), 1_000);
     }
 
     #[test]

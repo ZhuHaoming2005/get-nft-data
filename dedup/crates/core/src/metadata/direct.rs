@@ -1,9 +1,12 @@
 use crate::entity::{ChainId, ContractId, Dimension, EntityStore, NftId, ScopeKind};
 use crate::error::DedupError;
 use crate::metadata::bm25::{
-    PreparedDocument, lossless_prefix_len, may_share_term, similarity_at_least,
-    similarity_at_least_after_overlap_filter,
+    PreparedDocument, SimilarityKernel, ThresholdDecision, UpperBoundPrune,
+    initial_upper_bound_pruned_decision, lossless_prefix_len, similarity_at_least,
+    similarity_at_least_after_overlap_filter_with_kernel,
 };
+#[cfg(test)]
+use crate::metadata::bm25::{may_share_term, similarity_at_least_after_overlap_filter};
 use crate::progress::ProgressObserver;
 use crate::radix::{sort_u32_pairs_while, sort_u32_triples_while};
 use crate::sampling::{DuplicatePairSamples, PairSampler, PairSamplingPlan, materialize_samples};
@@ -39,6 +42,7 @@ const DIRECT_ACTIVITY_BATCH: u64 = 512;
 const FULL_DIRECT_PROGRESS_BATCH: u64 = 65_536;
 const DENSE_POSTING_MIN_PROFILES: usize = 1_024;
 const NO_DENSE_POSTING: u32 = u32::MAX;
+const SIMILARITY_KERNEL_CACHE_SLOTS: usize = 128;
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct MetadataStats {
@@ -79,12 +83,19 @@ pub struct MetadataStats {
     pub bm25_cache_hit_ratio: f64,
     pub bm25_cache_bypassed_pairs: u64,
     pub bm25_cache_bypass_ratio: f64,
+    pub bm25_kernel_cache_probes: u64,
+    pub bm25_kernel_cache_hits: u64,
+    pub bm25_kernel_cache_hit_ratio: f64,
     pub bm25_scores: u64,
     pub bm25_score_ratio: f64,
     pub bm25_zero_overlap_prunes: u64,
     pub bm25_zero_overlap_prune_ratio: f64,
     pub bm25_upper_bound_prunes: u64,
     pub bm25_upper_bound_prune_ratio: f64,
+    pub bm25_initial_upper_bound_prunes: u64,
+    pub bm25_initial_upper_bound_prune_ratio: f64,
+    pub bm25_iterative_upper_bound_prunes: u64,
+    pub bm25_iterative_upper_bound_prune_ratio: f64,
     pub matched_profile_pairs: u64,
     pub matched_profile_pair_ratio: f64,
 }
@@ -850,9 +861,12 @@ struct AtomicStats {
     bm25_cache_hits: AtomicU64,
     bm25_cache_probes: AtomicU64,
     bm25_cache_bypassed_pairs: AtomicU64,
+    bm25_kernel_cache_hits: AtomicU64,
     bm25_scores: AtomicU64,
     bm25_zero_overlap_prunes: AtomicU64,
     bm25_upper_bound_prunes: AtomicU64,
+    bm25_initial_upper_bound_prunes: AtomicU64,
+    bm25_iterative_upper_bound_prunes: AtomicU64,
     matched_profile_pairs: AtomicU64,
 }
 
@@ -863,9 +877,12 @@ struct LocalStats {
     bm25_cache_hits: u64,
     bm25_cache_probes: u64,
     bm25_cache_bypassed_pairs: u64,
+    bm25_kernel_cache_hits: u64,
     bm25_scores: u64,
     bm25_zero_overlap_prunes: u64,
     bm25_upper_bound_prunes: u64,
+    bm25_initial_upper_bound_prunes: u64,
+    bm25_iterative_upper_bound_prunes: u64,
     matched_profile_pairs: u64,
 }
 
@@ -887,6 +904,9 @@ impl LocalStats {
             .bm25_cache_bypassed_pairs
             .fetch_add(self.bm25_cache_bypassed_pairs, Ordering::Relaxed);
         target
+            .bm25_kernel_cache_hits
+            .fetch_add(self.bm25_kernel_cache_hits, Ordering::Relaxed);
+        target
             .bm25_scores
             .fetch_add(self.bm25_scores, Ordering::Relaxed);
         target
@@ -895,6 +915,12 @@ impl LocalStats {
         target
             .bm25_upper_bound_prunes
             .fetch_add(self.bm25_upper_bound_prunes, Ordering::Relaxed);
+        target
+            .bm25_initial_upper_bound_prunes
+            .fetch_add(self.bm25_initial_upper_bound_prunes, Ordering::Relaxed);
+        target
+            .bm25_iterative_upper_bound_prunes
+            .fetch_add(self.bm25_iterative_upper_bound_prunes, Ordering::Relaxed);
         target
             .matched_profile_pairs
             .fetch_add(self.matched_profile_pairs, Ordering::Relaxed);
@@ -1009,9 +1035,24 @@ fn run_prepared_direct(
         cross_profile_plan.needs_block_tracking(),
     );
     let stats = AtomicStats::default();
+    let full_universe_samples = if threshold <= 0.0 {
+        let samples = sampling.sampler();
+        samples
+            .enabled()
+            .then(|| sample_all_eligible_contract_pairs(store, &index, samples, progress))
+    } else {
+        None
+    }
+    .transpose()?;
+    let scoring_sampling = if full_universe_samples.is_some() {
+        PairSamplingPlan::disabled()
+    } else {
+        sampling.clone()
+    };
     let equivalent_work = equivalent_scoring_work(&index);
     progress.begin_phase("direct_bm25_equivalent", Some(equivalent_work));
-    let mut samples = score_equivalent_profiles(&index, &hits, &stats, progress, sampling.clone())?;
+    let mut samples =
+        score_equivalent_profiles(&index, &hits, &stats, progress, scoring_sampling.clone())?;
     let (cross_summary, cross_samples) = score_cross_profiles(
         &index,
         &hits,
@@ -1019,9 +1060,13 @@ fn run_prepared_direct(
         &stats,
         progress,
         &cross_profile_plan,
-        sampling,
+        scoring_sampling,
     )?;
-    samples.merge(cross_samples);
+    if let Some(full_universe_samples) = full_universe_samples {
+        samples = full_universe_samples;
+    } else {
+        samples.merge(cross_samples);
+    }
     candidate_stats.prefix_terms = cross_summary.prefix_terms;
     candidate_stats.pair_emissions = cross_summary.pair_emissions;
     candidate_stats.candidate_pairs = cross_summary.pair_count;
@@ -1199,9 +1244,27 @@ fn run_prepared_direct(
     result.bm25_cache_hits = stats.bm25_cache_hits.load(Ordering::Relaxed);
     result.bm25_cache_probes = stats.bm25_cache_probes.load(Ordering::Relaxed);
     result.bm25_cache_bypassed_pairs = stats.bm25_cache_bypassed_pairs.load(Ordering::Relaxed);
+    result.bm25_kernel_cache_hits = stats.bm25_kernel_cache_hits.load(Ordering::Relaxed);
     result.bm25_scores = stats.bm25_scores.load(Ordering::Relaxed);
+    result.bm25_kernel_cache_probes = if cross_profile_plan.is_indexed() {
+        result.bm25_scores
+    } else {
+        0
+    };
     result.bm25_zero_overlap_prunes = stats.bm25_zero_overlap_prunes.load(Ordering::Relaxed);
     result.bm25_upper_bound_prunes = stats.bm25_upper_bound_prunes.load(Ordering::Relaxed);
+    result.bm25_initial_upper_bound_prunes = stats
+        .bm25_initial_upper_bound_prunes
+        .load(Ordering::Relaxed);
+    result.bm25_iterative_upper_bound_prunes = stats
+        .bm25_iterative_upper_bound_prunes
+        .load(Ordering::Relaxed);
+    debug_assert_eq!(
+        result.bm25_upper_bound_prunes,
+        result
+            .bm25_initial_upper_bound_prunes
+            .saturating_add(result.bm25_iterative_upper_bound_prunes)
+    );
     result.matched_profile_pairs = stats.matched_profile_pairs.load(Ordering::Relaxed);
     result.saturated_profile_pair_ratio = ratio(result.saturated_profile_pairs, profile_pair_tasks);
     result.block_saturated_profile_pair_ratio =
@@ -1209,12 +1272,69 @@ fn run_prepared_direct(
     result.exact_document_pair_ratio = ratio(result.exact_document_pairs, profile_pair_tasks);
     result.bm25_cache_hit_ratio = ratio(result.bm25_cache_hits, result.bm25_cache_probes);
     result.bm25_cache_bypass_ratio = ratio(result.bm25_cache_bypassed_pairs, profile_pair_tasks);
+    result.bm25_kernel_cache_hit_ratio = ratio(
+        result.bm25_kernel_cache_hits,
+        result.bm25_kernel_cache_probes,
+    );
     result.bm25_score_ratio = ratio(result.bm25_scores, profile_pair_tasks);
     result.bm25_zero_overlap_prune_ratio =
         ratio(result.bm25_zero_overlap_prunes, result.bm25_scores);
     result.bm25_upper_bound_prune_ratio = ratio(result.bm25_upper_bound_prunes, result.bm25_scores);
+    result.bm25_initial_upper_bound_prune_ratio =
+        ratio(result.bm25_initial_upper_bound_prunes, result.bm25_scores);
+    result.bm25_iterative_upper_bound_prune_ratio =
+        ratio(result.bm25_iterative_upper_bound_prunes, result.bm25_scores);
     result.matched_profile_pair_ratio = ratio(result.matched_profile_pairs, profile_pair_tasks);
     Ok((result, samples))
+}
+
+fn sample_all_eligible_contract_pairs(
+    store: &EntityStore,
+    index: &DirectIndex,
+    mut samples: PairSampler,
+    progress: &dyn ProgressObserver,
+) -> Result<PairSampler, DedupError> {
+    let member_work = index.members.len() as u64;
+    let contract_work = store.contracts.len() as u64;
+    progress.begin_phase(
+        "direct_bm25_sample_all",
+        Some(
+            member_work
+                .saturating_add(contract_work)
+                .saturating_add(contract_work),
+        ),
+    );
+    let mut eligible = vec![0_u64; store.contracts.len().div_ceil(u64::BITS as usize)];
+    let mut completed = 0_u64;
+    for member in &index.members {
+        let contract = member.contract_id as usize;
+        eligible[contract / u64::BITS as usize] |= 1_u64 << (contract % u64::BITS as usize);
+        completed += 1;
+        if completed == PREPARE_BATCH as u64 {
+            progress.add_completed(completed);
+            progress.check_cancelled()?;
+            completed = 0;
+        }
+    }
+    progress.add_completed(completed);
+
+    let mut contracts = Vec::with_capacity(index.eligible_contracts as usize);
+    for (word_index, mut word) in eligible.into_iter().enumerate() {
+        while word != 0 {
+            let bit = word.trailing_zeros() as usize;
+            word &= word - 1;
+            contracts.push((word_index * u64::BITS as usize + bit) as ContractId);
+        }
+    }
+    progress.add_completed(contract_work);
+    progress.check_cancelled()?;
+    samples.observe_clique_by(
+        contracts.len(),
+        |contract| contracts[contract],
+        0x4d45_5441_414c_4c00,
+    );
+    progress.add_completed(contract_work);
+    Ok(samples)
 }
 
 fn build_index(
@@ -3650,6 +3770,100 @@ struct PreparedIndexedDocuments<'a> {
     left: Option<(&'a PreparedDocument, &'a [(u32, u32)])>,
 }
 
+#[derive(Clone, Copy)]
+struct SimilarityKernelCacheEntry {
+    left_document: DocumentId,
+    right_document: DocumentId,
+    shape_key: u64,
+    exact_unit_shape: bool,
+    initial_upper_bound_pruned: bool,
+    kernel: SimilarityKernel,
+}
+
+struct SimilarityKernelCache {
+    entries: Box<[Option<SimilarityKernelCacheEntry>]>,
+    threshold: f64,
+    #[cfg(test)]
+    hits: u64,
+}
+
+impl SimilarityKernelCache {
+    fn new(threshold: f64) -> Self {
+        Self {
+            entries: vec![None; SIMILARITY_KERNEL_CACHE_SLOTS].into_boxed_slice(),
+            threshold,
+            #[cfg(test)]
+            hits: 0,
+        }
+    }
+
+    #[inline]
+    fn decide(
+        &mut self,
+        index: &DirectIndex,
+        left_document: DocumentId,
+        right_document: DocumentId,
+        prepared_left: Option<(&PreparedDocument, &[(u32, u32)])>,
+    ) -> (ThresholdDecision, bool) {
+        let (left, left_terms) = prepared_left.unwrap_or_else(|| {
+            let left = &index.documents[left_document as usize];
+            (left, left.terms(&index.terms))
+        });
+        let right = &index.documents[right_document as usize];
+        let right_terms = index.document_terms(right_document);
+        let exact_unit_shape = left.all_unit_frequencies() && right.all_unit_frequencies();
+        let shape_key = if exact_unit_shape {
+            (left_terms.len() as u64) << 32 | right_terms.len() as u64
+        } else {
+            u64::from(left.weight_shape_signature()) << 32
+                | u64::from(right.weight_shape_signature())
+        };
+        let mixed = (shape_key >> 32).wrapping_mul(0x9e37_79b1) ^ shape_key;
+        let slot = mixed as usize & (SIMILARITY_KERNEL_CACHE_SLOTS - 1);
+        let hit = self.entries[slot].is_some_and(|entry| {
+            if entry.shape_key != shape_key || entry.exact_unit_shape != exact_unit_shape {
+                return false;
+            }
+            if exact_unit_shape {
+                return true;
+            }
+            let cached_left = &index.documents[entry.left_document as usize];
+            let cached_right = &index.documents[entry.right_document as usize];
+            left.has_same_weight_shape(cached_left) && right.has_same_weight_shape(cached_right)
+        });
+        #[cfg(test)]
+        if hit {
+            self.hits += 1;
+        }
+        if !hit {
+            let kernel = SimilarityKernel::prepare(left, right, self.threshold);
+            self.entries[slot] = Some(SimilarityKernelCacheEntry {
+                left_document,
+                right_document,
+                shape_key,
+                exact_unit_shape,
+                initial_upper_bound_pruned: kernel.initial_upper_bound_pruned(),
+                kernel,
+            });
+        }
+        let entry = self.entries[slot]
+            .as_ref()
+            .expect("a similarity kernel cache slot is populated");
+        if entry.initial_upper_bound_pruned {
+            return (initial_upper_bound_pruned_decision(), hit);
+        }
+        (
+            similarity_at_least_after_overlap_filter_with_kernel(
+                &entry.kernel,
+                left_terms,
+                right_terms,
+                self.threshold,
+            ),
+            hit,
+        )
+    }
+}
+
 struct WorkerScorer<'a> {
     index: &'a DirectIndex,
     hits: &'a ProfileHits,
@@ -3657,6 +3871,7 @@ struct WorkerScorer<'a> {
     single_chain_word: bool,
     local_stats: LocalStats,
     samples: PairSampler,
+    similarity_kernels: SimilarityKernelCache,
 }
 
 impl<'a> WorkerScorer<'a> {
@@ -3678,6 +3893,7 @@ impl<'a> WorkerScorer<'a> {
             single_chain_word: hits.is_single_word(),
             local_stats: LocalStats::default(),
             samples: sampling.sampler(),
+            similarity_kernels: SimilarityKernelCache::new(threshold),
         }
     }
 
@@ -3694,59 +3910,28 @@ impl<'a> WorkerScorer<'a> {
         &mut self,
         left: &mut IndexedLeftContext<'a>,
         right_id: u32,
-        include_bm25: bool,
+        _include_bm25: bool,
     ) -> bool {
         let index = self.index;
         let right = &index.profiles[right_id as usize];
         let both_evm = left.profile.is_evm && right.is_evm;
         let (left_document, right_document) = if both_evm {
-            selected_documents(left.profile, left.anchors, right, index.anchors(right))
+            selected_evm_documents(left.profile, left.anchors, right, index.anchors(right))
         } else {
             (left.max_document, right.max_document())
         };
-        let overlap_filter_passed = if both_evm {
-            left_document == right_document
-                || (include_bm25
-                    && may_share_term(
-                        &index.documents[left_document as usize],
-                        index.document_terms(left_document),
-                        &index.documents[right_document as usize],
-                        index.document_terms(right_document),
-                    ))
-        } else {
-            // Non-EVM profiles only emit candidates from global postings, so a
-            // BM25 posting is already an exact shared-term witness for the max
-            // documents selected by this branch. Exact-only postings still
-            // require the max documents themselves to be identical.
-            left_document == right_document || include_bm25
-        };
-        if !overlap_filter_passed {
-            return false;
-        }
-        // Keep candidate/zero-overlap accounting identical to the unsaturated
-        // path. Saturation only avoids document scoring after the posting
-        // witness has passed the same exact overlap test as before.
-        if self.pair_is_saturated(
-            left.profile_id as usize,
-            left.profile,
-            right_id as usize,
-            right,
-            left.known_hit_mask,
-        ) {
-            self.local_stats.saturated_profile_pairs += 1;
-            return true;
-        }
         let prepared_left = (left_document == left.max_document)
             .then_some((left.max_prepared_document, left.max_terms));
+        let prepared_documents = PreparedIndexedDocuments {
+            documents: (left_document, right_document),
+            left: prepared_left,
+        };
         self.score_pair_inner(
             left.profile_id as usize,
             left.profile,
             right_id as usize,
             right,
-            Some(PreparedIndexedDocuments {
-                documents: (left_document, right_document),
-                left: prepared_left,
-            }),
+            Some(prepared_documents),
             left.known_hit_mask.as_mut(),
         );
         true
@@ -3794,6 +3979,8 @@ impl<'a> WorkerScorer<'a> {
             )
         {
             self.local_stats.saturated_profile_pairs += 1;
+            debug_assert!(self.threshold <= 0.0);
+            self.observe_profile_pair(left_id, left, right_id, right);
             return;
         }
         let overlap_filter_passed = prepared_documents.is_some();
@@ -3814,26 +4001,12 @@ impl<'a> WorkerScorer<'a> {
             true
         } else {
             self.local_stats.bm25_cache_bypassed_pairs += 1;
-            if let Some((left_prepared_document, left_terms)) = prepared_left {
-                score_document_pair_with_prepared_left(
-                    self.index,
-                    left_prepared_document,
-                    left_terms,
-                    right_document,
-                    self.threshold,
-                    overlap_filter_passed,
-                    &mut self.local_stats,
-                )
-            } else {
-                score_document_pair(
-                    self.index,
-                    left_document,
-                    right_document,
-                    self.threshold,
-                    overlap_filter_passed,
-                    &mut self.local_stats,
-                )
-            }
+            self.score_document_pair(
+                left_document,
+                right_document,
+                prepared_left,
+                overlap_filter_passed,
+            )
         };
         if matched {
             self.local_stats.matched_profile_pairs += 1;
@@ -3856,18 +4029,72 @@ impl<'a> WorkerScorer<'a> {
             }
             // Publish hit masks before sampling so other workers can use the
             // saturation fast path without waiting for random pair selection.
-            if self.samples.enabled() {
-                let left_members = self.index.members(left);
-                let right_members = self.index.members(right);
-                self.samples.observe_cross_by(
-                    left_members.len(),
-                    right_members.len(),
-                    |member| left_members[member].contract_id,
-                    |member| right_members[member].contract_id,
-                    0x4d45_5441_4352_0000 ^ ((left_id as u64) << 32) ^ right_id as u64,
-                );
+            self.observe_profile_pair(left_id, left, right_id, right);
+        }
+    }
+
+    fn observe_profile_pair(
+        &mut self,
+        left_id: usize,
+        left: &ContractProfile,
+        right_id: usize,
+        right: &ContractProfile,
+    ) {
+        if !self.samples.enabled() {
+            return;
+        }
+        let left_members = self.index.members(left);
+        let right_members = self.index.members(right);
+        self.samples.observe_cross_by(
+            left_members.len(),
+            right_members.len(),
+            |member| left_members[member].contract_id,
+            |member| right_members[member].contract_id,
+            0x4d45_5441_4352_0000 ^ ((left_id as u64) << 32) ^ right_id as u64,
+        );
+    }
+
+    #[inline]
+    fn score_document_pair(
+        &mut self,
+        left: DocumentId,
+        right: DocumentId,
+        prepared_left: Option<(&PreparedDocument, &[(u32, u32)])>,
+        overlap_filter_passed: bool,
+    ) -> bool {
+        self.local_stats.bm25_scores += 1;
+        let decision = if overlap_filter_passed {
+            let (decision, cache_hit) =
+                self.similarity_kernels
+                    .decide(self.index, left, right, prepared_left);
+            self.local_stats.bm25_kernel_cache_hits += u64::from(cache_hit);
+            decision
+        } else {
+            let left_document = &self.index.documents[left as usize];
+            let right_document = &self.index.documents[right as usize];
+            similarity_at_least(
+                left_document,
+                self.index.document_terms(left),
+                right_document,
+                self.index.document_terms(right),
+                self.threshold,
+            )
+        };
+        if decision.zero_overlap_pruned {
+            self.local_stats.bm25_zero_overlap_prunes += 1;
+        }
+        match decision.upper_bound_prune {
+            UpperBoundPrune::None => {}
+            UpperBoundPrune::Initial => {
+                self.local_stats.bm25_upper_bound_prunes += 1;
+                self.local_stats.bm25_initial_upper_bound_prunes += 1;
+            }
+            UpperBoundPrune::Iterative => {
+                self.local_stats.bm25_upper_bound_prunes += 1;
+                self.local_stats.bm25_iterative_upper_bound_prunes += 1;
             }
         }
+        decision.matched
     }
 
     fn finish(self, stats: &AtomicStats) -> PairSampler {
@@ -4831,6 +5058,7 @@ fn score_unique_indexed_candidate<'a>(
     }
 }
 
+#[cfg(test)]
 fn score_document_pair(
     index: &DirectIndex,
     left: DocumentId,
@@ -4852,6 +5080,7 @@ fn score_document_pair(
     )
 }
 
+#[cfg(test)]
 fn score_document_pair_with_prepared_left(
     index: &DirectIndex,
     left_document: &PreparedDocument,
@@ -4884,8 +5113,16 @@ fn score_document_pair_with_prepared_left(
     if decision.zero_overlap_pruned {
         stats.bm25_zero_overlap_prunes += 1;
     }
-    if decision.upper_bound_pruned {
-        stats.bm25_upper_bound_prunes += 1;
+    match decision.upper_bound_prune {
+        UpperBoundPrune::None => {}
+        UpperBoundPrune::Initial => {
+            stats.bm25_upper_bound_prunes += 1;
+            stats.bm25_initial_upper_bound_prunes += 1;
+        }
+        UpperBoundPrune::Iterative => {
+            stats.bm25_upper_bound_prunes += 1;
+            stats.bm25_iterative_upper_bound_prunes += 1;
+        }
     }
     decision.matched
 }
@@ -4948,9 +5185,21 @@ fn selected_documents(
     right: &ContractProfile,
     right_anchors: &[(TokenKeyId, DocumentId)],
 ) -> (DocumentId, DocumentId) {
-    if left.is_evm
-        && right.is_evm
-        && anchor_token_ranges_overlap(left_anchors, right_anchors)
+    if left.is_evm && right.is_evm {
+        return selected_evm_documents(left, left_anchors, right, right_anchors);
+    }
+    (left.max_document(), right.max_document())
+}
+
+#[inline]
+fn selected_evm_documents(
+    left: &ContractProfile,
+    left_anchors: &[(TokenKeyId, DocumentId)],
+    right: &ContractProfile,
+    right_anchors: &[(TokenKeyId, DocumentId)],
+) -> (DocumentId, DocumentId) {
+    debug_assert!(left.is_evm && right.is_evm);
+    if anchor_token_ranges_overlap(left_anchors, right_anchors)
         && token_masks_overlap(&left.token_mask, &right.token_mask)
         && let Some(documents) = highest_shared_anchor(left_anchors, right_anchors)
     {
@@ -5023,10 +5272,11 @@ fn highest_shared_anchor_imbalanced(
     shorter: &[(TokenKeyId, DocumentId)],
     longer: &[(TokenKeyId, DocumentId)],
 ) -> Option<(DocumentId, DocumentId)> {
+    let mut longer_end = longer.len();
     for &(token, short_document) in shorter.iter().rev() {
-        let end = longer.partition_point(|anchor| anchor.0 <= token);
-        if end != 0 && longer[end - 1].0 == token {
-            return Some((short_document, longer[end - 1].1));
+        longer_end = longer[..longer_end].partition_point(|anchor| anchor.0 <= token);
+        if longer_end != 0 && longer[longer_end - 1].0 == token {
+            return Some((short_document, longer[longer_end - 1].1));
         }
     }
     None
@@ -5964,6 +6214,45 @@ mod tests {
     }
 
     #[test]
+    fn imbalanced_anchor_search_matches_linear_reverse_merge() {
+        let reference = |left: &[(u32, u32)], right: &[(u32, u32)]| {
+            let mut left_end = left.len();
+            let mut right_end = right.len();
+            while left_end != 0 && right_end != 0 {
+                let left_anchor = left[left_end - 1];
+                let right_anchor = right[right_end - 1];
+                match left_anchor.0.cmp(&right_anchor.0) {
+                    std::cmp::Ordering::Equal => {
+                        return Some((left_anchor.1, right_anchor.1));
+                    }
+                    std::cmp::Ordering::Greater => left_end -= 1,
+                    std::cmp::Ordering::Less => right_end -= 1,
+                }
+            }
+            None
+        };
+
+        for short_len in 0..16 {
+            for offset in 0..17_u32 {
+                let short = (0..short_len)
+                    .map(|index| {
+                        let token = index as u32 * 19 + offset;
+                        (token, token ^ 0x55aa)
+                    })
+                    .collect::<Vec<_>>();
+                let long = (0..257_u32)
+                    .filter(|token| token % 3 != 1)
+                    .map(|token| (token, token ^ 0xaa55))
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    highest_shared_anchor_imbalanced(&short, &long),
+                    reference(&short, &long)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn no_shared_token_uses_both_max_documents() {
         let left = profile(true, &[(1, 10), (2, 20)]);
         let right = profile(true, &[(3, 30), (4, 40)]);
@@ -6187,7 +6476,7 @@ mod tests {
     }
 
     #[test]
-    fn indexed_scorer_recomputes_repeated_document_pairs_without_cache() {
+    fn indexed_scorer_reuses_weight_kernels_without_caching_pair_results() {
         let index = indexed_scoring_index(&["shared alpha", "shared beta"], &[0, 0, 1], &[0, 0, 1]);
         let hits = ProfileHits::new(index.profiles.len(), index.chain_count, false);
         let mut scorer = WorkerScorer::new(&index, &hits, 0.99);
@@ -6199,7 +6488,120 @@ mod tests {
         assert_eq!(scorer.local_stats.bm25_cache_probes, 0);
         assert_eq!(scorer.local_stats.bm25_cache_hits, 0);
         assert_eq!(scorer.local_stats.bm25_cache_bypassed_pairs, 2);
+        assert_eq!(scorer.local_stats.bm25_kernel_cache_hits, 1);
         assert_eq!(scorer.local_stats.bm25_scores, 2);
+        assert_eq!(scorer.similarity_kernels.hits, 1);
+    }
+
+    #[test]
+    fn similarity_kernel_cache_validates_shapes_after_signature_collisions() {
+        let mut index = indexed_scoring_index(
+            &[
+                "shared alpha",
+                "shared beta gamma gamma",
+                "shared shared shared beta",
+            ],
+            &[0, 1, 2],
+            &[0, 0, 0],
+        );
+        let collision = index.documents[1].weight_shape_signature();
+        index.documents[2].set_weight_shape_signature(collision);
+        let mut cache = SimilarityKernelCache::new(0.6);
+
+        let (_first, first_hit) = cache.decide(&index, 0, 1, None);
+        let (second, second_hit) = cache.decide(&index, 0, 2, None);
+        let expected_second = similarity_at_least_after_overlap_filter(
+            &index.documents[0],
+            index.document_terms(0),
+            &index.documents[2],
+            index.document_terms(2),
+            0.6,
+        );
+
+        assert!(!first_hit);
+        assert!(!second_hit);
+        assert_eq!(second, expected_second);
+        assert_eq!(cache.hits, 0);
+    }
+
+    #[test]
+    fn similarity_kernel_cache_binds_threshold_for_its_lifetime() {
+        let index = indexed_scoring_index(&["shared alpha", "shared beta"], &[0, 1], &[0, 0]);
+        let mut low_cache = SimilarityKernelCache::new(0.6);
+        let mut high_cache = SimilarityKernelCache::new(0.7);
+
+        let (low, first_hit) = low_cache.decide(&index, 0, 1, None);
+        let (_, second_hit) = low_cache.decide(&index, 0, 1, None);
+        let (high, high_hit) = high_cache.decide(&index, 0, 1, None);
+        let expected_low = similarity_at_least_after_overlap_filter(
+            &index.documents[0],
+            index.document_terms(0),
+            &index.documents[1],
+            index.document_terms(1),
+            0.6,
+        );
+        let expected = similarity_at_least_after_overlap_filter(
+            &index.documents[0],
+            index.document_terms(0),
+            &index.documents[1],
+            index.document_terms(1),
+            0.7,
+        );
+
+        assert!(!first_hit);
+        assert!(second_hit);
+        assert!(!high_hit);
+        assert_eq!(low, expected_low);
+        assert_eq!(high, expected);
+    }
+
+    #[test]
+    fn similarity_kernel_cache_matches_uncached_decisions_across_shapes() {
+        let documents = [
+            "alpha beta gamma delta",
+            "alpha beta other value",
+            "one two three four",
+            "repeat repeat alpha value",
+            "repeat repeat other value",
+            "short alpha",
+            "long alpha beta gamma delta epsilon zeta eta theta iota",
+        ];
+        let profile_documents = (0..documents.len()).collect::<Vec<_>>();
+        let profile_chains = vec![0; documents.len()];
+        let index = indexed_scoring_index(&documents, &profile_documents, &profile_chains);
+
+        for threshold in [0.01, 0.6, 0.99] {
+            let mut cache = SimilarityKernelCache::new(threshold);
+            for _ in 0..3 {
+                for left in 0..documents.len() as u32 {
+                    for right in 0..documents.len() as u32 {
+                        if left == right {
+                            continue;
+                        }
+                        let actual = cache.decide(&index, left, right, None).0;
+                        let expected = similarity_at_least_after_overlap_filter(
+                            &index.documents[left as usize],
+                            index.document_terms(left),
+                            &index.documents[right as usize],
+                            index.document_terms(right),
+                            threshold,
+                        );
+                        assert_eq!(actual, expected, "left={left} right={right} t={threshold}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn similarity_kernel_cache_stays_within_the_worker_l1_budget() {
+        assert!(std::mem::size_of::<PreparedDocument>() <= 72);
+        assert!(std::mem::size_of::<SimilarityKernelCacheEntry>() <= 144);
+        assert!(
+            std::mem::size_of::<Option<SimilarityKernelCacheEntry>>()
+                * SIMILARITY_KERNEL_CACHE_SLOTS
+                <= 18 * 1024
+        );
     }
 
     #[test]
@@ -6505,11 +6907,6 @@ mod tests {
             let hits = ProfileHits::new(index.profiles.len(), index.chain_count, false);
             let mut left = IndexedLeftContext::new(&index, &hits, 0);
             assert_eq!(left.max_document, 0);
-            assert!(std::ptr::eq(
-                left.max_prepared_document,
-                &index.documents[0]
-            ));
-            assert_eq!(left.max_terms, index.document_terms(0));
             if !left_evm {
                 assert!(left.anchors.is_empty());
             }
@@ -6529,7 +6926,7 @@ mod tests {
     }
 
     #[test]
-    fn evm_indexed_candidate_validates_selected_documents_before_saturation() {
+    fn evm_indexed_candidate_scores_selected_documents_without_a_pre_overlap_scan() {
         let mut index = indexed_scoring_index(
             &[
                 "lefttokenonly",
@@ -6573,13 +6970,14 @@ mod tests {
         hits.insert_mask(1, index.profiles[0].chain_mask);
         let mut scorer = WorkerScorer::new(&index, &hits, 0.1);
         let mut left = IndexedLeftContext::new(&index, &hits, 0);
-        assert!(!scorer.score_indexed_candidate(&mut left, 1, true));
+        assert!(scorer.score_indexed_candidate(&mut left, 1, true));
         assert_eq!(scorer.local_stats.saturated_profile_pairs, 0);
-        assert_eq!(scorer.local_stats.bm25_scores, 0);
+        assert_eq!(scorer.local_stats.bm25_scores, 1);
+        assert_eq!(scorer.local_stats.matched_profile_pairs, 0);
     }
 
     #[test]
-    fn indexed_left_mask_is_a_safe_monotonic_saturation_lower_bound() {
+    fn indexed_path_does_not_pay_a_per_pair_saturation_check() {
         let index = indexed_scoring_index(&["shared alpha", "shared beta"], &[0, 1], &[0, 1]);
         let hits = ProfileHits::new(index.profiles.len(), index.chain_count, false);
         let mut left = IndexedLeftContext::new(&index, &hits, 0);
@@ -6596,8 +6994,8 @@ mod tests {
         let mut current_left = IndexedLeftContext::new(&index, &hits, 0);
         let mut current_scorer = WorkerScorer::new(&index, &hits, 2.0);
         assert!(current_scorer.score_indexed_candidate(&mut current_left, 1, true));
-        assert_eq!(current_scorer.local_stats.saturated_profile_pairs, 1);
-        assert_eq!(current_scorer.local_stats.bm25_scores, 0);
+        assert_eq!(current_scorer.local_stats.saturated_profile_pairs, 0);
+        assert_eq!(current_scorer.local_stats.bm25_scores, 1);
     }
 
     #[test]
@@ -7041,6 +7439,51 @@ mod tests {
     }
 
     #[test]
+    fn metadata_samples_include_every_pair_hidden_by_chain_saturation() {
+        let evm = ["ethereum".to_owned()].into_iter().collect::<HashSet<_>>();
+        let mut store = EntityStore::with_options(8, &evm.iter().cloned().collect());
+        for (address, suffix) in [("0xa", "alpha"), ("0xb", "beta"), ("0xc", "gamma")] {
+            let metadata = format!(r#"{{"shared":"common value {suffix}"}}"#);
+            store
+                .try_ingest_row(input("ethereum", address, "1", &metadata))
+                .unwrap();
+        }
+
+        let mut acc = SummaryAccumulator::default();
+        let (_, samples) = run_direct_releasing_with_samples(
+            &mut store,
+            &evm,
+            8,
+            0.01,
+            &mut acc,
+            &NoopProgress,
+            10,
+        )
+        .unwrap();
+        let pairs = samples
+            .all_chains
+            .iter()
+            .map(|pair| {
+                let mut addresses = [
+                    pair.contract_a_address.as_str(),
+                    pair.contract_b_address.as_str(),
+                ];
+                addresses.sort_unstable();
+                (addresses[0].to_owned(), addresses[1].to_owned())
+            })
+            .collect::<HashSet<_>>();
+
+        assert_eq!(
+            pairs,
+            HashSet::from([
+                ("0xa".to_owned(), "0xb".to_owned()),
+                ("0xa".to_owned(), "0xc".to_owned()),
+                ("0xb".to_owned(), "0xc".to_owned()),
+            ])
+        );
+    }
+
+    #[test]
     fn full_fallback_skips_saturated_profile_blocks() {
         let evm = ["ethereum".to_owned(), "base".to_owned()]
             .into_iter()
@@ -7068,6 +7511,55 @@ mod tests {
                 + stats.bm25_cache_hits
                 + stats.bm25_scores,
             stats.profile_pair_tasks + stats.equivalent_profile_tasks
+        );
+    }
+
+    #[test]
+    fn full_fallback_samples_the_complete_eligible_contract_universe() {
+        let evm = ["ethereum".to_owned(), "base".to_owned()]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut store = EntityStore::with_options(1, &evm.iter().cloned().collect());
+        for contract in 0..300 {
+            let chain = if contract % 2 == 0 {
+                "ethereum"
+            } else {
+                "base"
+            };
+            let metadata = format!(r#"{{"unique{contract}":"value{contract}"}}"#);
+            store
+                .try_ingest_row(input(chain, &format!("0x{contract:x}"), "1", &metadata))
+                .unwrap();
+        }
+        let mut acc = SummaryAccumulator::default();
+        let (stats, samples) = run_direct_releasing_with_samples(
+            &mut store,
+            &evm,
+            1,
+            0.0,
+            &mut acc,
+            &NoopProgress,
+            1_000,
+        )
+        .unwrap();
+
+        assert!(stats.block_saturated_profile_pairs > 0);
+        assert_eq!(samples.all_chains.len(), 1_000);
+        assert_eq!(samples.intra_chain.len(), 2);
+        assert!(
+            samples
+                .intra_chain
+                .iter()
+                .all(|scope| scope.pairs.len() == 1_000)
+        );
+        assert_eq!(samples.chain_pairs.len(), 1);
+        assert_eq!(samples.chain_pairs[0].pairs.len(), 1_000);
+        assert_eq!(samples.cross_chain_summary.len(), 2);
+        assert!(
+            samples
+                .cross_chain_summary
+                .iter()
+                .all(|scope| scope.pairs.len() == 1_000)
         );
     }
 

@@ -281,7 +281,14 @@ fn all_writes_summary_files() {
     assert!(manifest["metadata_direct"]["bm25_cache_probes"].is_u64());
     assert!(manifest["metadata_direct"]["bm25_cache_hit_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["bm25_cache_bypass_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["bm25_kernel_cache_probes"].is_u64());
+    assert!(manifest["metadata_direct"]["bm25_kernel_cache_hits"].is_u64());
+    assert!(manifest["metadata_direct"]["bm25_kernel_cache_hit_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["bm25_upper_bound_prune_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["bm25_initial_upper_bound_prunes"].is_u64());
+    assert!(manifest["metadata_direct"]["bm25_initial_upper_bound_prune_ratio"].is_f64());
+    assert!(manifest["metadata_direct"]["bm25_iterative_upper_bound_prunes"].is_u64());
+    assert!(manifest["metadata_direct"]["bm25_iterative_upper_bound_prune_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["matched_profile_pair_ratio"].is_f64());
     assert_eq!(manifest["sample_pairs"], 1);
     assert_eq!(manifest["threads"], 2);
