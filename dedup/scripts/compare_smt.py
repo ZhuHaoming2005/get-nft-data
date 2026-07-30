@@ -146,7 +146,6 @@ def main() -> int:
                 raise RuntimeError(
                     f"manifest reported {reported_threads} threads; expected {len(cpus)}"
                 )
-            metadata = manifest.get("metadata_direct") or {}
             runs.append(
                 {
                     "mode": mode,
@@ -156,9 +155,6 @@ def main() -> int:
                     "wall_elapsed_secs": wall_elapsed,
                     "manifest_elapsed_secs": float(manifest["elapsed_secs"]),
                     "direct_bm25_elapsed_secs": direct_bm25_seconds(manifest),
-                    "bm25_kernel_cache_hit_ratio": metadata.get(
-                        "bm25_kernel_cache_hit_ratio"
-                    ),
                     "output_dir": str(output_dir),
                 }
             )
@@ -176,9 +172,6 @@ def main() -> int:
             ),
             "median_direct_bm25_elapsed_secs": median(
                 [run["direct_bm25_elapsed_secs"] for run in selected]
-            ),
-            "median_bm25_kernel_cache_hit_ratio": median(
-                [run["bm25_kernel_cache_hit_ratio"] for run in selected]
             ),
         }
 

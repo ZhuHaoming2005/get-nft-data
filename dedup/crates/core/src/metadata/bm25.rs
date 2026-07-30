@@ -29,7 +29,6 @@ pub struct PreparedDocument {
     frequency_histogram: FrequencyHistogram,
     term_mask: [u64; 2],
     length: u32,
-    weight_shape_signature: u32,
 }
 
 #[cfg(test)]
@@ -100,7 +99,10 @@ impl FrequencyHistogram {
 
 impl PreparedDocument {
     pub(crate) fn all_unit_frequencies(&self) -> bool {
-        self.weight_shape_signature & (1 << 31) != 0
+        matches!(
+            self.frequency_histogram.as_slice(),
+            [(1, count)] if *count == self.term_len
+        )
     }
 
     #[cfg(test)]
@@ -163,14 +165,12 @@ impl PreparedDocument {
         }
         let compact_terms = &terms[term_start..];
         let frequency_histogram = FrequencyHistogram::from_terms(compact_terms);
-        let weight_shape_signature = weight_shape_signature(length, &frequency_histogram);
         Ok(Self {
             term_start: 0,
             term_len: compact_terms.len() as u32,
             frequency_histogram,
             term_mask,
             length,
-            weight_shape_signature,
         })
     }
 
@@ -183,42 +183,11 @@ impl PreparedDocument {
         &terms[start..start + self.term_len as usize]
     }
 
-    pub(crate) fn weight_shape_signature(&self) -> u32 {
-        self.weight_shape_signature
-    }
-
-    #[cfg(test)]
-    pub(crate) fn set_weight_shape_signature(&mut self, signature: u32) {
-        let all_unit = matches!(
-            self.frequency_histogram.as_slice(),
-            [(1, count)] if *count == self.term_len
-        );
-        self.weight_shape_signature = (signature & 0x7fff_ffff) | (u32::from(all_unit) << 31);
-    }
-
-    pub(crate) fn has_same_weight_shape(&self, other: &Self) -> bool {
-        self.term_len == other.term_len
-            && self.length == other.length
-            && self.frequency_histogram.as_slice() == other.frequency_histogram.as_slice()
-    }
-
     #[cfg(test)]
     pub(crate) fn term_range(&self) -> std::ops::Range<usize> {
         let start = self.term_start as usize;
         start..start + self.term_len as usize
     }
-}
-
-fn weight_shape_signature(length: u32, histogram: &FrequencyHistogram) -> u32 {
-    let mut signature = length.wrapping_mul(0x9e37_79b9) ^ 0x85eb_ca6b;
-    for &(frequency, count) in histogram.as_slice() {
-        signature ^= frequency.wrapping_mul(0xc2b2_ae35).rotate_left(13);
-        signature = signature.wrapping_mul(0x27d4_eb2d);
-        signature ^= count.wrapping_mul(0x1656_67b1).rotate_left(17);
-        signature = signature.rotate_left(11);
-    }
-    let all_unit = matches!(histogram.as_slice(), [(1, count)] if *count == length);
-    (signature & 0x7fff_ffff) | (u32::from(all_unit) << 31)
 }
 
 pub(crate) fn lossless_prefix_len(frequencies_in_rarity_order: &[u32], threshold: f64) -> usize {
@@ -281,7 +250,6 @@ pub fn similarity_at_least(
     similarity_at_least_impl(left, left_terms, right, right_terms, threshold, false)
 }
 
-#[cfg(test)]
 pub(crate) fn similarity_at_least_after_overlap_filter(
     left: &PreparedDocument,
     left_terms: &[(u32, u32)],
@@ -290,89 +258,6 @@ pub(crate) fn similarity_at_least_after_overlap_filter(
     threshold: f64,
 ) -> ThresholdDecision {
     similarity_at_least_impl(left, left_terms, right, right_terms, threshold, true)
-}
-
-#[derive(Clone, Copy)]
-pub(crate) struct SimilarityKernel {
-    weights: PairWeights,
-    initial_upper_bound_pruned: bool,
-    all_unit_frequencies: bool,
-    use_iterative_bound: bool,
-    iterative_bound: Option<IterativeBound>,
-}
-
-impl SimilarityKernel {
-    pub(crate) fn prepare(
-        left: &PreparedDocument,
-        right: &PreparedDocument,
-        threshold: f64,
-    ) -> Self {
-        let short_pair = left.term_len.saturating_add(right.term_len) <= 24;
-        let all_unit_frequencies = left.all_unit_frequencies() && right.all_unit_frequencies();
-        let weights = PairWeights::new_with_bounds(left, right, !short_pair, all_unit_frequencies);
-        let initial_upper_bound_pruned =
-            !short_pair && weights.initial_upper_bound_below_threshold(threshold);
-        let imbalanced = left.term_len.saturating_mul(4) < right.term_len
-            || right.term_len.saturating_mul(4) < left.term_len;
-        let use_iterative_bound = !initial_upper_bound_pruned
-            && all_unit_frequencies
-            && !imbalanced
-            && left.term_len.min(right.term_len) >= 16;
-        let iterative_bound = use_iterative_bound
-            .then(|| weights.iterative_bound(threshold))
-            .flatten();
-        Self {
-            weights,
-            initial_upper_bound_pruned,
-            all_unit_frequencies,
-            use_iterative_bound,
-            iterative_bound,
-        }
-    }
-
-    pub(crate) fn initial_upper_bound_pruned(&self) -> bool {
-        self.initial_upper_bound_pruned
-    }
-}
-
-#[inline]
-pub(crate) fn similarity_at_least_after_overlap_filter_with_kernel(
-    kernel: &SimilarityKernel,
-    left_terms: &[(u32, u32)],
-    right_terms: &[(u32, u32)],
-    threshold: f64,
-) -> ThresholdDecision {
-    if threshold <= 0.0 {
-        return matched_decision();
-    }
-    if kernel.initial_upper_bound_pruned {
-        return initial_upper_bound_pruned_decision();
-    }
-    if !kernel.use_iterative_bound {
-        let mut shared = SharedWeights::default();
-        if kernel.all_unit_frequencies {
-            let unit = kernel.weights.unit_weights();
-            for_each_shared_term(left_terms, right_terms, |_, _| {
-                shared.add_unit(unit);
-            });
-        } else {
-            for_each_shared_term(left_terms, right_terms, |left_tf, right_tf| {
-                shared.add(
-                    kernel.weights.left_once(left_tf),
-                    kernel.weights.right_once(right_tf),
-                );
-            });
-        }
-        return decision_at_least(&kernel.weights, shared, threshold, false);
-    }
-
-    similarity_at_least_unit_iterative(
-        &kernel.weights,
-        left_terms,
-        right_terms,
-        threshold,
-        kernel.iterative_bound,
-    )
 }
 
 fn similarity_at_least_impl(
@@ -389,13 +274,31 @@ fn similarity_at_least_impl(
     if !overlap_filter_passed && !may_share_term(left, left_terms, right, right_terms) {
         return zero_overlap_pruned_decision();
     }
-    let kernel = SimilarityKernel::prepare(left, right, threshold);
-    similarity_at_least_after_overlap_filter_with_kernel(
-        &kernel,
-        left_terms,
-        right_terms,
-        threshold,
-    )
+    let short_pair = left.term_len.saturating_add(right.term_len) <= 24;
+    let all_unit_frequencies = left.all_unit_frequencies() && right.all_unit_frequencies();
+    let weights = PairWeights::new_with_bounds(left, right, !short_pair, all_unit_frequencies);
+    if !short_pair && weights.initial_upper_bound_below_threshold(threshold) {
+        return initial_upper_bound_pruned_decision();
+    }
+    let imbalanced = left.term_len.saturating_mul(4) < right.term_len
+        || right.term_len.saturating_mul(4) < left.term_len;
+    let check_iterative_bound = left.term_len.min(right.term_len) >= 16;
+    if !all_unit_frequencies || imbalanced || !check_iterative_bound {
+        let mut shared = SharedWeights::default();
+        if all_unit_frequencies {
+            let unit = weights.unit_weights();
+            for_each_shared_term(left_terms, right_terms, |_, _| {
+                shared.add_unit(unit);
+            });
+        } else {
+            for_each_shared_term(left_terms, right_terms, |left_tf, right_tf| {
+                shared.add(weights.left_once(left_tf), weights.right_once(right_tf));
+            });
+        }
+        return decision_at_least(&weights, shared, threshold, false);
+    }
+
+    similarity_at_least_unit_iterative(&weights, left_terms, right_terms, threshold)
 }
 
 fn similarity_at_least_unit_iterative(
@@ -403,7 +306,6 @@ fn similarity_at_least_unit_iterative(
     left_terms: &[(u32, u32)],
     right_terms: &[(u32, u32)],
     threshold: f64,
-    iterative_bound: Option<IterativeBound>,
 ) -> ThresholdDecision {
     let unit = weights.unit_weights();
     let mut left_pos = 0;
@@ -412,6 +314,7 @@ fn similarity_at_least_unit_iterative(
     let mut processed_right_norm = 0.0;
     let mut shared = SharedWeights::default();
     let mut comparisons = 0_u32;
+    let mut iterative_bound = None::<Option<IterativeBound>>;
     let mut next_bound_check = 8_u32;
     while left_pos < left_terms.len() && right_pos < right_terms.len() {
         let left_term = left_terms[left_pos].0;
@@ -435,7 +338,8 @@ fn similarity_at_least_unit_iterative(
         }
         comparisons += 1;
         if comparisons == next_bound_check {
-            if iterative_bound.is_some_and(|bound| {
+            let bound = *iterative_bound.get_or_insert_with(|| weights.iterative_bound(threshold));
+            if bound.is_some_and(|bound| {
                 weights.upper_bound_below_threshold(
                     bound,
                     shared,
@@ -1230,7 +1134,6 @@ mod tests {
         PreparedDocument {
             term_start: 0,
             term_len: terms.len() as u32,
-            weight_shape_signature: weight_shape_signature(length, &frequency_histogram),
             frequency_histogram,
             term_mask,
             length,
@@ -1986,7 +1889,6 @@ mod tests {
             },
             term_mask: [u64::MAX; 2],
             length: 1_500_000,
-            weight_shape_signature: 0,
         };
         let other_long_document = PreparedDocument {
             term_start: 0,
@@ -1997,7 +1899,6 @@ mod tests {
             },
             term_mask: [u64::MAX; 2],
             length: 2_333_334,
-            weight_shape_signature: 0,
         };
         let weights = PairWeights::new(&long_document, &other_long_document);
         let mut shared = SharedWeights::default();
