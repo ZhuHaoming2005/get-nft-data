@@ -27,6 +27,25 @@ cargo build --release --manifest-path dedup/Cargo.toml
 
 使用 `--threads <正整数>` 指定全链路 Rayon 工作线程数；省略时使用系统默认并行度。进度默认 `auto`（TTY 用人类可读格式，否则 JSON Lines），含 EWMA ETA。
 
+## Linux SMT 对比测试
+
+`scripts/compare_smt.py` 可在 SMT 开启的 Linux 目标机上对比“每个物理核一个 worker”和“使用全部 SMT siblings”。脚本读取当前 cpuset 与 sysfs CPU 拓扑，通过 `taskset` 固定 CPU，交替运行两种模式，并从 `run_manifest.json` 比较 `direct_bm25` 中位耗时。两种模式的输出互相隔离；至少相差 2% 才给出明确推荐。
+
+```bash
+python3 scripts/compare_smt.py \
+  --binary ./target/release/dedup \
+  --output-root ./smt-benchmark \
+  --repetitions 1 \
+  -- run-metadata \
+  --input ./data/base.parquet \
+  --input ./data/ethereum.parquet \
+  --chains base,ethereum \
+  --evm-chains base,ethereum \
+  --sample-pairs 0
+```
+
+脚本自动注入 `--threads` 和 `--output-dir`，不要在 `--` 后重复传入。建议先使用保持真实 Metadata/anchor 分布的代表性子集；需要降低运行波动时使用 `--repetitions 2` 或 `3`。结果写入 `smt-benchmark/smt_comparison.json`。如果阿里云已经关闭或隐藏 SMT，脚本会明确退出，因为此时没有两组可比较的逻辑 CPU。
+
 ## 输出
 
 - `summary.csv`
