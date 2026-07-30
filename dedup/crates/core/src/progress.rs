@@ -9,6 +9,8 @@ pub trait ProgressObserver: Send + Sync {
     fn begin_phase(&self, phase: &str, total: Option<u64>);
     fn set_total(&self, total: Option<u64>);
     fn add_completed(&self, delta: u64);
+    /// Record fine-grained work within a coarse completion unit.
+    fn add_activity(&self, _delta: u64) {}
     fn check_cancelled(&self) -> Result<(), crate::DedupError> {
         Ok(())
     }

@@ -31,13 +31,35 @@ pub struct ProgressReporter {
 
 struct Shared {
     meta: Mutex<Meta>,
-    completed: AtomicU64,
+    completed: ProgressCounter,
+    activity: ProgressCounter,
     stopping: AtomicBool,
     cancelled: AtomicBool,
     wake_lock: Mutex<()>,
     wake: Condvar,
     mode: EffectiveMode,
     interval: Duration,
+}
+
+#[repr(align(64))]
+struct ProgressCounter(AtomicU64);
+
+impl ProgressCounter {
+    fn new() -> Self {
+        Self(AtomicU64::new(0))
+    }
+
+    fn load(&self, order: Ordering) -> u64 {
+        self.0.load(order)
+    }
+
+    fn store(&self, value: u64, order: Ordering) {
+        self.0.store(value, order);
+    }
+
+    fn add(&self, delta: u64) {
+        self.0.fetch_add(delta, Ordering::Relaxed);
+    }
 }
 
 struct Meta {
@@ -47,8 +69,10 @@ struct Meta {
     stage_started: Instant,
     phase_started: Instant,
     last_completed: u64,
+    last_activity: u64,
     last_tick: Instant,
     eta: EwmaEta,
+    activity_rate: EwmaEta,
     phase_history: Vec<PhaseTimingSnapshot>,
 }
 
@@ -67,8 +91,12 @@ struct ProgressLine {
     total: Option<u64>,
     percent: Option<f64>,
     rate: Option<f64>,
+    activity: u64,
+    activity_rate: Option<f64>,
+    active: bool,
     eta_secs: Option<f64>,
     eta_confident: bool,
+    eta_status: &'static str,
     phase_elapsed_secs: f64,
     stage_elapsed_secs: f64,
 }
@@ -96,11 +124,14 @@ impl ProgressReporter {
                 stage_started: now,
                 phase_started: now,
                 last_completed: 0,
+                last_activity: 0,
                 last_tick: now,
                 eta: EwmaEta::new(EWMA_ALPHA),
+                activity_rate: EwmaEta::new(EWMA_ALPHA),
                 phase_history: Vec::new(),
             }),
-            completed: AtomicU64::new(0),
+            completed: ProgressCounter::new(),
+            activity: ProgressCounter::new(),
             stopping: AtomicBool::new(false),
             cancelled: AtomicBool::new(false),
             wake_lock: Mutex::new(()),
@@ -175,9 +206,12 @@ impl ProgressObserver for ProgressReporter {
         meta.stage_started = now;
         meta.phase_started = now;
         meta.last_completed = 0;
+        meta.last_activity = 0;
         meta.last_tick = now;
         meta.eta = EwmaEta::new(EWMA_ALPHA);
+        meta.activity_rate = EwmaEta::new(EWMA_ALPHA);
         self.shared.completed.store(0, Ordering::Relaxed);
+        self.shared.activity.store(0, Ordering::Relaxed);
     }
 
     fn begin_phase(&self, phase: &str, total: Option<u64>) {
@@ -188,9 +222,12 @@ impl ProgressObserver for ProgressReporter {
         meta.total = total;
         meta.phase_started = now;
         meta.last_completed = 0;
+        meta.last_activity = 0;
         meta.last_tick = now;
         meta.eta = EwmaEta::new(EWMA_ALPHA);
+        meta.activity_rate = EwmaEta::new(EWMA_ALPHA);
         self.shared.completed.store(0, Ordering::Relaxed);
+        self.shared.activity.store(0, Ordering::Relaxed);
     }
 
     fn set_total(&self, total: Option<u64>) {
@@ -198,7 +235,15 @@ impl ProgressObserver for ProgressReporter {
     }
 
     fn add_completed(&self, delta: u64) {
-        self.shared.completed.fetch_add(delta, Ordering::Relaxed);
+        if self.shared.mode != EffectiveMode::Off {
+            self.shared.completed.add(delta);
+        }
+    }
+
+    fn add_activity(&self, delta: u64) {
+        if self.shared.mode != EffectiveMode::Off {
+            self.shared.activity.add(delta);
+        }
     }
 
     fn check_cancelled(&self) -> Result<(), DedupError> {
@@ -257,28 +302,52 @@ fn emit_snapshot(shared: &Shared) {
     // Workers still update the counter lock-free, while phase changes cannot pair a
     // new phase label with the previous phase's completed value.
     let completed = shared.completed.load(Ordering::Acquire);
+    let activity = shared.activity.load(Ordering::Acquire);
     let now = Instant::now();
     let dt = now.duration_since(meta.last_tick).as_secs_f64().max(1e-6);
     let delta = completed.saturating_sub(meta.last_completed);
     let instant_rate = delta as f64 / dt;
     meta.eta.observe(instant_rate);
+    let activity_delta = activity.saturating_sub(meta.last_activity);
+    meta.activity_rate.observe(activity_delta as f64 / dt);
     meta.last_completed = completed;
+    meta.last_activity = activity;
     meta.last_tick = now;
 
+    let phase_elapsed_secs = meta.phase_started.elapsed().as_secs_f64().max(1e-6);
     let remaining = meta.total.map(|total| total.saturating_sub(completed));
     let percent = meta
         .total
         .and_then(|t| (t > 0).then_some(100.0 * completed as f64 / t as f64));
+    // A positive-only EWMA is responsive while profiles complete, but would
+    // otherwise leave a stale optimistic ETA during one unusually heavy profile.
+    // Fall back to whole-phase throughput on zero-completion ticks so elapsed
+    // time continues to influence both the displayed rate and ETA.
+    let rate = effective_progress_rate(completed, delta, phase_elapsed_secs, meta.eta.rate());
+    let eta_secs = remaining.and_then(|remaining| {
+        rate.filter(|rate| *rate > 0.0)
+            .map(|rate| remaining as f64 / rate)
+    });
+    let active = delta != 0 || activity_delta != 0;
+    let unfinished = meta.total.is_none_or(|total| completed < total);
+    let eta_status =
+        progress_eta_status(eta_secs, meta.eta.confident(), active, unfinished, activity);
     let line = ProgressLine {
         stage: meta.stage.clone(),
         phase: meta.phase.clone(),
         completed,
         total: meta.total,
         percent,
-        rate: meta.eta.rate(),
-        eta_secs: remaining.and_then(|r| meta.eta.eta_secs(r)),
+        rate,
+        activity,
+        activity_rate: (activity_delta != 0)
+            .then(|| meta.activity_rate.rate())
+            .flatten(),
+        active,
+        eta_secs,
         eta_confident: meta.eta.confident(),
-        phase_elapsed_secs: meta.phase_started.elapsed().as_secs_f64(),
+        eta_status,
+        phase_elapsed_secs,
         stage_elapsed_secs: meta.stage_started.elapsed().as_secs_f64(),
     };
     drop(meta);
@@ -307,22 +376,63 @@ fn emit_snapshot(shared: &Shared) {
                 .rate
                 .map(|r| format!("{r:.0}/s"))
                 .unwrap_or_else(|| "-/s".to_owned());
+            let activity = if line.activity == 0 {
+                String::new()
+            } else {
+                let activity_rate = line
+                    .activity_rate
+                    .map(|rate| format!(" {rate:.0}/s"))
+                    .unwrap_or_default();
+                format!(" candidates={}{}", line.activity, activity_rate)
+            };
             let elapsed = format_duration(line.phase_elapsed_secs);
             let eta = match line.total {
                 None => "n/a".to_owned(),
                 Some(_) => match (line.eta_secs, line.eta_confident) {
                     (Some(secs), true) => format_duration(secs),
                     (Some(secs), false) => format!("~{}", format_duration(secs)),
+                    (None, _) if line.eta_status == "working" => "warming".to_owned(),
                     (None, _) => "...".to_owned(),
                 },
             };
             let _ = write!(
                 io::stderr(),
-                "\r[{label}] {progress} {pct} {rate} elapsed={elapsed} eta={eta}\x1b[K"
+                "\r[{label}] {progress} {pct} {rate}{activity} elapsed={elapsed} eta={eta}\x1b[K"
             );
             let _ = io::stderr().flush();
         }
         EffectiveMode::Off => {}
+    }
+}
+
+fn effective_progress_rate(
+    completed: u64,
+    delta: u64,
+    phase_elapsed_secs: f64,
+    ewma_rate: Option<f64>,
+) -> Option<f64> {
+    let cumulative_rate = (completed != 0 && phase_elapsed_secs > 0.0)
+        .then_some(completed as f64 / phase_elapsed_secs);
+    if delta == 0 {
+        cumulative_rate.or(ewma_rate)
+    } else {
+        ewma_rate.or(cumulative_rate)
+    }
+}
+
+fn progress_eta_status(
+    eta_secs: Option<f64>,
+    confident: bool,
+    active: bool,
+    unfinished: bool,
+    activity: u64,
+) -> &'static str {
+    if eta_secs.is_some() {
+        if confident { "ready" } else { "estimating" }
+    } else if active || (unfinished && activity != 0) {
+        "working"
+    } else {
+        "waiting"
     }
 }
 
@@ -345,7 +455,9 @@ fn format_duration(secs: f64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ProgressMode, ProgressReporter};
+    use super::{ProgressMode, ProgressReporter, effective_progress_rate, progress_eta_status};
+    use dedup_core::ProgressObserver;
+    use std::sync::atomic::Ordering;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -358,6 +470,57 @@ mod tests {
         assert!(
             started.elapsed() < Duration::from_secs(1),
             "finish waited for the reporting interval"
+        );
+    }
+
+    #[test]
+    fn phase_changes_reset_fine_grained_activity() {
+        let mut reporter = ProgressReporter::start(ProgressMode::Json, 60_000);
+        reporter.begin_phase("direct_bm25", Some(10));
+        reporter.add_activity(7);
+        assert_eq!(reporter.shared.activity.load(Ordering::Relaxed), 7);
+
+        reporter.begin_phase("next", Some(1));
+        assert_eq!(reporter.shared.activity.load(Ordering::Relaxed), 0);
+        reporter.finish();
+    }
+
+    #[test]
+    fn off_mode_skips_hot_path_progress_atomics() {
+        let mut reporter = ProgressReporter::start(ProgressMode::Off, 1_000);
+        reporter.begin_phase("direct_bm25", Some(10));
+        reporter.add_completed(3);
+        reporter.add_activity(7);
+
+        assert_eq!(reporter.shared.completed.load(Ordering::Relaxed), 0);
+        assert_eq!(reporter.shared.activity.load(Ordering::Relaxed), 0);
+        reporter.finish();
+    }
+
+    #[test]
+    fn eta_rate_accounts_for_elapsed_time_during_a_heavy_profile() {
+        assert_eq!(
+            effective_progress_rate(100, 5, 10.0, Some(50.0)),
+            Some(50.0)
+        );
+        assert_eq!(effective_progress_rate(100, 0, 20.0, Some(50.0)), Some(5.0));
+        assert_eq!(effective_progress_rate(0, 0, 20.0, None), None);
+    }
+
+    #[test]
+    fn candidate_activity_keeps_zero_profile_progress_visibly_working() {
+        assert_eq!(
+            progress_eta_status(None, false, false, true, 512),
+            "working"
+        );
+        assert_eq!(progress_eta_status(None, false, false, true, 0), "waiting");
+        assert_eq!(
+            progress_eta_status(Some(10.0), false, true, true, 512),
+            "estimating"
+        );
+        assert_eq!(
+            progress_eta_status(Some(10.0), true, false, true, 512),
+            "ready"
         );
     }
 }

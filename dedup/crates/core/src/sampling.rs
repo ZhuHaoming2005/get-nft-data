@@ -200,6 +200,10 @@ impl PairSampler {
         if !self.enabled() || left_len == 0 || right_len == 0 {
             return;
         }
+        if left_len == 1 && right_len == 1 {
+            self.observe(left_at(0), right_at(0));
+            return;
+        }
         let left_groups = self.group_members(left_len, &left_at);
         let right_groups = self.group_members(right_len, &right_at);
         let remaining = self.cross_group_remaining(&left_groups, &right_groups);
@@ -639,6 +643,23 @@ mod tests {
         }
         even.merge(odd);
         assert_eq!(all.all_chains.into_pairs(), even.all_chains.into_pairs());
+    }
+
+    #[test]
+    fn singleton_cross_group_matches_direct_observation() {
+        let plan = plan(5);
+        let mut grouped = plan.sampler();
+        let mut direct = plan.sampler();
+
+        grouped.observe_cross_by(1, 1, |_| 7, |_| 11, 123);
+        direct.observe(7, 11);
+
+        assert_eq!(
+            grouped.all_chains.into_pairs(),
+            direct.all_chains.into_pairs()
+        );
+        assert_eq!(grouped.intra_chain[&0].heap.len(), 1);
+        assert_eq!(direct.intra_chain[&0].heap.len(), 1);
     }
 
     #[test]
