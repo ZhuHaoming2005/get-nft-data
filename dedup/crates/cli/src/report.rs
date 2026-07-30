@@ -1,4 +1,7 @@
-use dedup_core::{Dimension, EntityStore, MetadataStats, ScopeKind, SummaryAccumulator};
+use dedup_core::{
+    Dimension, DuplicatePairSample, DuplicatePairSamples, EntityStore, MetadataStats, ScopeKind,
+    SummaryAccumulator,
+};
 use serde::Serialize;
 use std::fs::{self, File};
 use std::io::Write;
@@ -52,6 +55,8 @@ struct RunManifest {
     name_threshold: Option<f64>,
     metadata_threshold: f64,
     metadata_anchors: Option<usize>,
+    sample_pairs: usize,
+    threads: usize,
     metadata_direct: Option<MetadataStats>,
 }
 
@@ -84,6 +89,8 @@ pub struct ReportRequest<'a> {
     pub name_threshold: Option<f64>,
     pub metadata_threshold: f64,
     pub metadata_anchors: Option<usize>,
+    pub sample_pairs: usize,
+    pub threads: usize,
     pub interned_strings: usize,
     pub token_uri_postings: usize,
     pub image_uri_postings: usize,
@@ -130,6 +137,8 @@ pub fn write_reports(output_dir: &Path, request: ReportRequest<'_>) -> Result<()
         name_threshold: request.name_threshold,
         metadata_threshold: request.metadata_threshold,
         metadata_anchors: request.metadata_anchors,
+        sample_pairs: request.sample_pairs,
+        threads: request.threads,
         metadata_direct: request.metadata_direct,
     };
     thread::scope(|scope| -> Result<(), ReportError> {
@@ -164,6 +173,95 @@ pub fn write_reports(output_dir: &Path, request: ReportRequest<'_>) -> Result<()
         Ok(())
     })?;
     commit_reports(output_dir, staging.path(), &REPORT_FILES)
+}
+
+pub fn write_duplicate_pair_samples(
+    output_dir: &Path,
+    file_name: &'static str,
+    samples: &DuplicatePairSamples,
+) -> Result<(), ReportError> {
+    fs::create_dir_all(output_dir)?;
+    let staging = Builder::new()
+        .prefix(".dedup-sample-staging-")
+        .tempdir_in(output_dir)?;
+    let stem = file_name.strip_suffix(".csv").unwrap_or(file_name);
+    let intra_name = format!("{stem}_intra_chain.csv");
+    let matrix_name = format!("{stem}_chain_matrix.csv");
+    let cross_summary_name = format!("{stem}_cross_chain_summary.csv");
+
+    let mut writer = csv::Writer::from_path(staging.path().join(file_name))?;
+    write_pair_header(&mut writer, &[])?;
+    write_pairs(&mut writer, &[], &samples.all_chains)?;
+    writer.flush()?;
+    drop(writer);
+
+    let mut writer = csv::Writer::from_path(staging.path().join(&intra_name))?;
+    write_pair_header(&mut writer, &["chain"])?;
+    for group in &samples.intra_chain {
+        write_pairs(&mut writer, &[&group.chain], &group.pairs)?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let mut writer = csv::Writer::from_path(staging.path().join(&matrix_name))?;
+    write_pair_header(&mut writer, &["primary_chain", "secondary_chain"])?;
+    for group in &samples.chain_pairs {
+        write_pairs(&mut writer, &[&group.chain_a, &group.chain_b], &group.pairs)?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let mut writer = csv::Writer::from_path(staging.path().join(&cross_summary_name))?;
+    write_pair_header(&mut writer, &["chain"])?;
+    for group in &samples.cross_chain_summary {
+        write_pairs(&mut writer, &[&group.chain], &group.pairs)?;
+    }
+    writer.flush()?;
+    drop(writer);
+
+    let files = [
+        file_name,
+        intra_name.as_str(),
+        matrix_name.as_str(),
+        cross_summary_name.as_str(),
+    ];
+    commit_reports(output_dir, staging.path(), &files)
+}
+
+fn write_pair_header(
+    writer: &mut csv::Writer<File>,
+    group_columns: &[&str],
+) -> Result<(), ReportError> {
+    let mut header = Vec::with_capacity(group_columns.len() + 4);
+    header.extend_from_slice(group_columns);
+    header.extend_from_slice(&[
+        "contract_a_chain",
+        "contract_a_address",
+        "contract_b_chain",
+        "contract_b_address",
+    ]);
+    writer.write_record(header)?;
+    Ok(())
+}
+
+fn write_pairs(
+    writer: &mut csv::Writer<File>,
+    group_values: &[&str],
+    samples: &[DuplicatePairSample],
+) -> Result<(), ReportError> {
+    let mut row = Vec::with_capacity(group_values.len() + 4);
+    for sample in samples {
+        row.clear();
+        row.extend_from_slice(group_values);
+        row.extend_from_slice(&[
+            &sample.contract_a_chain,
+            &sample.contract_a_address,
+            &sample.contract_b_chain,
+            &sample.contract_b_address,
+        ]);
+        writer.write_record(&row)?;
+    }
+    Ok(())
 }
 
 pub fn write_partition_reports(

@@ -1,11 +1,11 @@
 use crate::progress::ProgressReporter;
 use crate::report::{
-    PhaseTiming, ReportPartition, ReportRequest, StageTiming, write_partition_reports,
-    write_reports,
+    PhaseTiming, ReportPartition, ReportRequest, StageTiming, write_duplicate_pair_samples,
+    write_partition_reports, write_reports,
 };
 use dedup_core::{
     DedupError, Dimension, LoadOptions, ProgressObserver, SummaryAccumulator,
-    load_entities_with_options, run_metadata, run_name, run_uri,
+    load_entities_with_options, run_metadata_with_samples, run_name_with_samples, run_uri,
 };
 use std::path::PathBuf;
 use std::time::Instant;
@@ -19,6 +19,8 @@ pub struct RunConfig {
     pub name_threshold: Option<f64>,
     pub metadata_threshold: f64,
     pub metadata_anchors: Option<usize>,
+    pub sample_pairs: usize,
+    pub threads: usize,
     pub run_name: bool,
     pub run_uri: bool,
     pub run_metadata: bool,
@@ -64,7 +66,13 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
     let mut acc = SummaryAccumulator::default();
     if let (true, Some(name_threshold)) = (config.run_name, config.name_threshold) {
         let stage_started = Instant::now();
-        run_name(&store, name_threshold / 100.0, &mut acc, progress)?;
+        let samples = run_name_with_samples(
+            &store,
+            name_threshold / 100.0,
+            &mut acc,
+            progress,
+            config.sample_pairs,
+        )?;
         stage_timings.push(StageTiming {
             stage: "name",
             elapsed_secs: stage_started.elapsed().as_secs_f64(),
@@ -77,6 +85,8 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             "name",
             progress,
         )?;
+        write_duplicate_pair_samples(&config.output_dir, "name_duplicate_pairs.csv", &samples)
+            .map_err(|error| DedupError::Message(error.to_string()))?;
         acc.seal_dimension(Dimension::Name);
     }
     if config.run_uri {
@@ -106,15 +116,22 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             .iter()
             .map(|c| c.trim().to_ascii_lowercase())
             .collect();
-        let result = run_metadata(
+        let result = run_metadata_with_samples(
             &mut store,
             &evm,
             config.metadata_anchors,
             config.metadata_threshold,
             &mut acc,
             progress,
+            config.sample_pairs,
         )?;
         metadata_stats = Some(result.stats);
+        write_duplicate_pair_samples(
+            &config.output_dir,
+            "metadata_duplicate_pairs.csv",
+            &result.samples,
+        )
+        .map_err(|error| DedupError::Message(error.to_string()))?;
         stage_timings.push(StageTiming {
             stage: "metadata",
             elapsed_secs: stage_started.elapsed().as_secs_f64(),
@@ -143,6 +160,8 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             name_threshold: config.name_threshold,
             metadata_threshold: config.metadata_threshold,
             metadata_anchors: config.metadata_anchors,
+            sample_pairs: config.sample_pairs,
+            threads: config.threads,
             interned_strings,
             token_uri_postings,
             image_uri_postings,

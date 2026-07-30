@@ -6,6 +6,7 @@ use crate::metadata::bm25::{
 };
 use crate::progress::ProgressObserver;
 use crate::radix::{sort_u32_pairs_while, sort_u32_triples_while};
+use crate::sampling::{DuplicatePairSamples, PairSampler, PairSamplingPlan, materialize_samples};
 use crate::scope::{ScopeCounts, ScopeKey};
 use crate::stats::SummaryAccumulator;
 use ahash::{AHashMap, AHasher};
@@ -33,7 +34,6 @@ const CANDIDATE_CANCEL_BATCH: u64 = 1 << 20;
 const CANDIDATE_PAIR_CHUNK: usize = 4096;
 const CANDIDATE_SCHEDULING_CHUNK: usize = 8;
 const CANDIDATE_FINE_TAIL_PER_LANE: usize = 64;
-const CANDIDATE_COMPACT_BATCH: usize = 8;
 const DIRECT_PROGRESS_BATCH: u64 = 1_024;
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -905,7 +905,15 @@ pub fn run_direct(
     progress: &dyn ProgressObserver,
 ) -> Result<MetadataStats, DedupError> {
     let index = build_index(store, evm_chains, anchors_k.into(), progress)?;
-    run_prepared_direct(store, index, threshold, acc, progress)
+    run_prepared_direct(
+        store,
+        index,
+        threshold,
+        acc,
+        progress,
+        PairSamplingPlan::disabled(),
+    )
+    .map(|(stats, _)| stats)
 }
 
 pub fn run_direct_releasing(
@@ -918,7 +926,53 @@ pub fn run_direct_releasing(
 ) -> Result<MetadataStats, DedupError> {
     let index = build_index(store, evm_chains, anchors_k.into(), progress)?;
     store.release_metadata();
-    run_prepared_direct(store, index, threshold, acc, progress)
+    run_prepared_direct(
+        store,
+        index,
+        threshold,
+        acc,
+        progress,
+        PairSamplingPlan::disabled(),
+    )
+    .map(|(stats, _)| stats)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn run_direct_releasing_with_samples(
+    store: &mut EntityStore,
+    evm_chains: &HashSet<String>,
+    anchors_k: impl Into<Option<usize>>,
+    threshold: f64,
+    acc: &mut SummaryAccumulator,
+    progress: &dyn ProgressObserver,
+    sample_size: usize,
+) -> Result<(MetadataStats, DuplicatePairSamples), DedupError> {
+    let index = build_index(store, evm_chains, anchors_k.into(), progress)?;
+    if sample_size == 0 {
+        store.release_metadata();
+        return run_prepared_direct(
+            store,
+            index,
+            threshold,
+            acc,
+            progress,
+            PairSamplingPlan::disabled(),
+        )
+        .map(|(stats, _)| (stats, DuplicatePairSamples::default()));
+    }
+
+    store.release_metadata_payloads();
+    let result = run_prepared_direct(
+        store,
+        index,
+        threshold,
+        acc,
+        progress,
+        PairSamplingPlan::new(store, sample_size),
+    );
+    let result = result.map(|(stats, samples)| (stats, materialize_samples(store, samples)));
+    store.release_contract_addresses();
+    result
 }
 
 fn run_prepared_direct(
@@ -927,10 +981,11 @@ fn run_prepared_direct(
     threshold: f64,
     acc: &mut SummaryAccumulator,
     progress: &dyn ProgressObserver,
-) -> Result<MetadataStats, DedupError> {
+    sampling: PairSamplingPlan,
+) -> Result<(MetadataStats, PairSampler), DedupError> {
     let eligible_members = index.eligible_members;
     if eligible_members < 2 {
-        return Ok(base_stats(store, &index, 0, 0, 0));
+        return Ok((base_stats(store, &index, 0, 0, 0), sampling.sampler()));
     }
 
     let logical_contract_pairs = index.logical_member_pairs();
@@ -950,15 +1005,17 @@ fn run_prepared_direct(
     let stats = AtomicStats::default();
     let equivalent_work = equivalent_scoring_work(&index);
     progress.begin_phase("direct_bm25_equivalent", Some(equivalent_work));
-    score_equivalent_profiles(&index, &hits, &stats, progress)?;
-    let cross_summary = score_cross_profiles(
+    let mut samples = score_equivalent_profiles(&index, &hits, &stats, progress, sampling.clone())?;
+    let (cross_summary, cross_samples) = score_cross_profiles(
         &index,
         &hits,
         threshold,
         &stats,
         progress,
         &cross_profile_plan,
+        sampling,
     )?;
+    samples.merge(cross_samples);
     candidate_stats.prefix_terms = cross_summary.prefix_terms;
     candidate_stats.pair_emissions = cross_summary.pair_emissions;
     candidate_stats.candidate_pairs = cross_summary.pair_count;
@@ -1151,7 +1208,7 @@ fn run_prepared_direct(
         ratio(result.bm25_zero_overlap_prunes, result.bm25_scores);
     result.bm25_upper_bound_prune_ratio = ratio(result.bm25_upper_bound_prunes, result.bm25_scores);
     result.matched_profile_pair_ratio = ratio(result.matched_profile_pairs, profile_pair_tasks);
-    Ok(result)
+    Ok((result, samples))
 }
 
 fn build_index(
@@ -1595,6 +1652,13 @@ impl CandidateEntries {
         ]
         .into_iter()
         .fold(0_u64, |total, len| total.saturating_add(len as u64))
+    }
+
+    fn sort_work(&self) -> u64 {
+        (self.global_exact.len() as u64)
+            .saturating_mul(6)
+            .saturating_add((self.token_full.len() as u64).saturating_mul(9))
+            .saturating_add((self.token_exact.len() as u64).saturating_mul(9))
     }
 
     fn into_compact(self) -> CompactCandidateEntries {
@@ -2164,7 +2228,7 @@ fn build_candidate_plan(
                 Ok::<(), DedupError>(())
             },
         )?;
-    let mut shards = sharded_entries
+    let shards = sharded_entries
         .into_vec()
         .into_iter()
         .map(|entries| {
@@ -2195,45 +2259,67 @@ fn build_candidate_plan(
             .saturating_add(triple_sorts.saturating_mul(9))
     });
     progress.begin_phase("candidate_sort", Some(sort_passes));
-    for entries in &mut shards {
-        let sorted = sort_u32_pairs_while(&mut entries.global_exact, || {
-            progress.add_completed(1);
-            progress.check_cancelled().is_ok()
-        }) && sort_u32_triples_while(&mut entries.token_full, || {
-            progress.add_completed(1);
-            progress.check_cancelled().is_ok()
-        }) && sort_u32_triples_while(&mut entries.token_exact, || {
-            progress.add_completed(1);
-            progress.check_cancelled().is_ok()
-        });
-        if !sorted {
-            return Err(DedupError::Interrupted);
-        }
-    }
+    let mut weighted_shards = shards
+        .into_iter()
+        .enumerate()
+        .map(|(shard_id, entries)| (shard_id, entries.sort_work(), entries))
+        .collect::<Vec<_>>();
+    weighted_shards.sort_unstable_by_key(|&(_, work, _)| std::cmp::Reverse(work));
+    let mut sorted_shards = weighted_shards
+        .into_iter()
+        .par_bridge()
+        .map(|(shard_id, _, mut entries)| {
+            progress.check_cancelled()?;
+            let sorted = sort_u32_pairs_while(&mut entries.global_exact, || {
+                progress.add_completed(1);
+                progress.check_cancelled().is_ok()
+            }) && sort_u32_triples_while(&mut entries.token_full, || {
+                progress.add_completed(1);
+                progress.check_cancelled().is_ok()
+            }) && sort_u32_triples_while(&mut entries.token_exact, || {
+                progress.add_completed(1);
+                progress.check_cancelled().is_ok()
+            });
+            if !sorted {
+                return Err(DedupError::Interrupted);
+            }
+            Ok((shard_id, entries))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<Result<Vec<_>, DedupError>>()?;
+    sorted_shards.sort_unstable_by_key(|(shard_id, _)| *shard_id);
+    let shards = sorted_shards
+        .into_iter()
+        .map(|(_, entries)| entries)
+        .collect::<Vec<_>>();
     let sharded_posting_entries = stats
         .posting_entries
         .saturating_sub(global_full.len() as u64);
     progress.begin_phase("candidate_ranges", Some(sharded_posting_entries));
-    let mut compact_shards = Vec::with_capacity(shards.len());
-    for raw_batch in shards.chunks_mut(CANDIDATE_COMPACT_BATCH) {
-        progress.check_cancelled()?;
-        let compact_batch = raw_batch
-            .par_iter_mut()
-            .map(|entries| {
-                progress.check_cancelled()?;
-                let entries = std::mem::take(entries);
-                let posting_entries = entries.posting_entries();
-                let compact = entries.into_compact();
-                progress.add_completed(posting_entries);
-                Ok::<_, DedupError>(compact)
-            })
-            .collect::<Vec<_>>()
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
-        compact_shards.extend(compact_batch);
-    }
-    drop(shards);
-    let shards = compact_shards;
+    let mut weighted_shards = shards
+        .into_iter()
+        .enumerate()
+        .map(|(shard_id, entries)| (shard_id, entries.posting_entries(), entries))
+        .collect::<Vec<_>>();
+    weighted_shards.sort_unstable_by_key(|&(_, work, _)| std::cmp::Reverse(work));
+    let mut compact_shards = weighted_shards
+        .into_iter()
+        .par_bridge()
+        .map(|(shard_id, posting_entries, entries)| {
+            progress.check_cancelled()?;
+            let compact = entries.into_compact();
+            progress.add_completed(posting_entries);
+            Ok::<_, DedupError>((shard_id, compact))
+        })
+        .collect::<Vec<_>>()
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    compact_shards.sort_unstable_by_key(|(shard_id, _)| *shard_id);
+    let shards = compact_shards
+        .into_iter()
+        .map(|(_, entries)| entries)
+        .collect::<Vec<_>>();
     let token_count = index
         .anchors
         .iter()
@@ -3089,44 +3175,64 @@ fn score_equivalent_profiles(
     hits: &ProfileHits,
     stats: &AtomicStats,
     progress: &dyn ProgressObserver,
-) -> Result<(), DedupError> {
+    sampling: PairSamplingPlan,
+) -> Result<PairSampler, DedupError> {
     let cancelled = AtomicBool::new(false);
-    index
+    let samples = index
         .profiles
         .par_chunks(PREPARE_BATCH)
         .enumerate()
-        .for_each(|(chunk_id, profiles)| {
-            if progress.check_cancelled().is_err() {
-                cancelled.store(true, Ordering::Relaxed);
-                return;
-            }
-            let mut completed = 0_u64;
-            let mut equivalent = 0_u64;
-            for (offset, profile) in profiles.iter().enumerate() {
-                if profile.member_len < 2 {
-                    continue;
+        .fold(
+            || sampling.sampler(),
+            |mut samples, (chunk_id, profiles)| {
+                if progress.check_cancelled().is_err() {
+                    cancelled.store(true, Ordering::Relaxed);
+                    return samples;
                 }
-                let profile_id = chunk_id * PREPARE_BATCH + offset;
-                for &(chain, count) in index.chains(profile) {
-                    if count > 1 {
-                        hits.insert(profile_id, chain);
+                let mut completed = 0_u64;
+                let mut equivalent = 0_u64;
+                for (offset, profile) in profiles.iter().enumerate() {
+                    if profile.member_len < 2 {
+                        continue;
                     }
+                    let profile_id = chunk_id * PREPARE_BATCH + offset;
+                    for &(chain, count) in index.chains(profile) {
+                        if count > 1 {
+                            hits.insert(profile_id, chain);
+                        }
+                    }
+                    if samples.enabled() {
+                        let members = index.members(profile);
+                        samples.observe_clique_by(
+                            members.len(),
+                            |member| members[member].contract_id,
+                            0x4d45_5441_4551_0000 ^ profile_id as u64,
+                        );
+                    }
+                    equivalent += 1;
+                    completed = completed.saturating_add(choose_two(u64::from(profile.member_len)));
                 }
-                equivalent += 1;
-                completed = completed.saturating_add(choose_two(u64::from(profile.member_len)));
-            }
-            stats
-                .exact_document_pairs
-                .fetch_add(equivalent, Ordering::Relaxed);
-            stats
-                .matched_profile_pairs
-                .fetch_add(equivalent, Ordering::Relaxed);
-            progress.add_completed(completed);
-        });
+                stats
+                    .exact_document_pairs
+                    .fetch_add(equivalent, Ordering::Relaxed);
+                stats
+                    .matched_profile_pairs
+                    .fetch_add(equivalent, Ordering::Relaxed);
+                progress.add_completed(completed);
+                samples
+            },
+        )
+        .reduce(
+            || sampling.sampler(),
+            |mut left, right| {
+                left.merge(right);
+                left
+            },
+        );
     if cancelled.load(Ordering::Relaxed) {
         Err(DedupError::Interrupted)
     } else {
-        Ok(())
+        Ok(samples)
     }
 }
 
@@ -3173,16 +3279,28 @@ struct WorkerScorer<'a> {
     threshold: f64,
     single_chain_word: bool,
     local_stats: LocalStats,
+    samples: PairSampler,
 }
 
 impl<'a> WorkerScorer<'a> {
+    #[cfg(test)]
     fn new(index: &'a DirectIndex, hits: &'a ProfileHits, threshold: f64) -> Self {
+        Self::new_with_sampling(index, hits, threshold, PairSamplingPlan::disabled())
+    }
+
+    fn new_with_sampling(
+        index: &'a DirectIndex,
+        hits: &'a ProfileHits,
+        threshold: f64,
+        sampling: PairSamplingPlan,
+    ) -> Self {
         Self {
             index,
             hits,
             threshold,
             single_chain_word: hits.is_single_word(),
             local_stats: LocalStats::default(),
+            samples: sampling.sampler(),
         }
     }
 
@@ -3359,11 +3477,25 @@ impl<'a> WorkerScorer<'a> {
                 self.hits
                     .insert_profile_chains(right_id, left, self.index.chains(left));
             }
+            // Publish hit masks before sampling so other workers can use the
+            // saturation fast path without waiting for random pair selection.
+            if self.samples.enabled() {
+                let left_members = self.index.members(left);
+                let right_members = self.index.members(right);
+                self.samples.observe_cross_by(
+                    left_members.len(),
+                    right_members.len(),
+                    |member| left_members[member].contract_id,
+                    |member| right_members[member].contract_id,
+                    0x4d45_5441_4352_0000 ^ ((left_id as u64) << 32) ^ right_id as u64,
+                );
+            }
         }
     }
 
-    fn flush(self, stats: &AtomicStats) {
+    fn finish(self, stats: &AtomicStats) -> PairSampler {
         self.local_stats.flush(stats);
+        self.samples
     }
 }
 
@@ -3537,9 +3669,12 @@ fn score_cross_profiles(
     stats: &AtomicStats,
     progress: &dyn ProgressObserver,
     plan: &CrossProfilePlan,
-) -> Result<CandidateScoreSummary, DedupError> {
+    sampling: PairSamplingPlan,
+) -> Result<(CandidateScoreSummary, PairSampler), DedupError> {
     if let CrossProfilePlan::Indexed(candidates) = plan {
-        return score_streamed_candidates(index, hits, threshold, stats, progress, candidates);
+        return score_streamed_candidates(
+            index, hits, threshold, stats, progress, candidates, sampling,
+        );
     }
 
     progress.begin_phase(
@@ -3558,95 +3693,110 @@ fn score_cross_profiles(
     let tile_count = upper_rect_tile_count(left_tile_count, right_tile_count);
     let next_tile = AtomicU64::new(0);
     let workers = rayon::current_num_threads().max(1);
-    (0..workers).into_par_iter().for_each(|_| {
-        let mut scorer = WorkerScorer::new(index, hits, threshold);
-        'work: loop {
-            let scheduled = next_tile.load(Ordering::Relaxed);
-            let remaining = tile_count.saturating_sub(scheduled);
-            let tile_batch = if remaining > (workers as u64).saturating_mul(MAX_SCORE_TILE_BATCH) {
-                MAX_SCORE_TILE_BATCH
-            } else {
-                1
-            };
-            let tile_start = next_tile.fetch_add(tile_batch, Ordering::Relaxed);
-            if tile_start >= tile_count || cancelled.load(Ordering::Relaxed) {
-                break;
-            }
-            let tile_end = tile_start.saturating_add(tile_batch).min(tile_count);
-            let mut coordinates =
-                UpperRectTileCoordinateCursor::new(tile_start, left_tile_count, right_tile_count);
-            for _ in tile_start..tile_end {
-                if cancelled.load(Ordering::Relaxed) {
-                    break 'work;
-                }
-                if progress.check_cancelled().is_err() {
-                    cancelled.store(true, Ordering::Relaxed);
-                    break 'work;
-                }
-                let (left_tile_index, right_tile_index) = coordinates.next();
-                let left_tile = &tiles[left_tile_index as usize];
-                let right_tile = &tiles[right_tile_index as usize];
-                let mut completed = 0_u64;
-                for left_block_index in left_tile.block_start..left_tile.block_end {
-                    let first_right_block = if left_tile_index == right_tile_index {
-                        left_block_index
+    let worker_samples = (0..workers)
+        .into_par_iter()
+        .map(|_| {
+            let mut scorer =
+                WorkerScorer::new_with_sampling(index, hits, threshold, sampling.clone());
+            'work: loop {
+                let scheduled = next_tile.load(Ordering::Relaxed);
+                let remaining = tile_count.saturating_sub(scheduled);
+                let tile_batch =
+                    if remaining > (workers as u64).saturating_mul(MAX_SCORE_TILE_BATCH) {
+                        MAX_SCORE_TILE_BATCH
                     } else {
-                        right_tile.block_start
+                        1
                     };
-                    for right_block_index in first_right_block..right_tile.block_end {
-                        let left_block = &blocks[left_block_index];
-                        let right_block = &blocks[right_block_index];
-                        if hits.is_single_word()
-                            && hits.block_contains_mask(left_block_index, right_block.chain_mask)
-                            && hits.block_contains_mask(right_block_index, left_block.chain_mask)
-                        {
-                            let (skipped_profiles, skipped_work) = if left_block_index
-                                == right_block_index
+                let tile_start = next_tile.fetch_add(tile_batch, Ordering::Relaxed);
+                if tile_start >= tile_count || cancelled.load(Ordering::Relaxed) {
+                    break;
+                }
+                let tile_end = tile_start.saturating_add(tile_batch).min(tile_count);
+                let mut coordinates = UpperRectTileCoordinateCursor::new(
+                    tile_start,
+                    left_tile_count,
+                    right_tile_count,
+                );
+                for _ in tile_start..tile_end {
+                    if cancelled.load(Ordering::Relaxed) {
+                        break 'work;
+                    }
+                    if progress.check_cancelled().is_err() {
+                        cancelled.store(true, Ordering::Relaxed);
+                        break 'work;
+                    }
+                    let (left_tile_index, right_tile_index) = coordinates.next();
+                    let left_tile = &tiles[left_tile_index as usize];
+                    let right_tile = &tiles[right_tile_index as usize];
+                    let mut completed = 0_u64;
+                    for left_block_index in left_tile.block_start..left_tile.block_end {
+                        let first_right_block = if left_tile_index == right_tile_index {
+                            left_block_index
+                        } else {
+                            right_tile.block_start
+                        };
+                        for right_block_index in first_right_block..right_tile.block_end {
+                            let left_block = &blocks[left_block_index];
+                            let right_block = &blocks[right_block_index];
+                            if hits.is_single_word()
+                                && hits
+                                    .block_contains_mask(left_block_index, right_block.chain_mask)
+                                && hits
+                                    .block_contains_mask(right_block_index, left_block.chain_mask)
                             {
-                                (
-                                    choose_two(left_block.profile_count()),
-                                    choose_two(left_block.member_sum)
-                                        .saturating_sub(left_block.equivalent_member_pairs),
-                                )
-                            } else {
-                                (
-                                    left_block
-                                        .profile_count()
-                                        .saturating_mul(right_block.profile_count()),
-                                    left_block.member_sum.saturating_mul(right_block.member_sum),
-                                )
-                            };
-                            stats
-                                .saturated_profile_pairs
-                                .fetch_add(skipped_profiles, Ordering::Relaxed);
-                            stats
-                                .block_saturated_profile_pairs
-                                .fetch_add(skipped_profiles, Ordering::Relaxed);
-                            completed = completed.saturating_add(skipped_work);
-                            continue;
-                        }
-                        for left_id in left_block.start..left_block.end {
-                            let first_right = if left_block_index == right_block_index {
-                                left_id + 1
-                            } else {
-                                right_block.start
-                            };
-                            for right_id in first_right..right_block.end {
-                                completed =
-                                    completed.saturating_add(scorer.score_pair(left_id, right_id));
+                                let (skipped_profiles, skipped_work) =
+                                    if left_block_index == right_block_index {
+                                        (
+                                            choose_two(left_block.profile_count()),
+                                            choose_two(left_block.member_sum)
+                                                .saturating_sub(left_block.equivalent_member_pairs),
+                                        )
+                                    } else {
+                                        (
+                                            left_block
+                                                .profile_count()
+                                                .saturating_mul(right_block.profile_count()),
+                                            left_block
+                                                .member_sum
+                                                .saturating_mul(right_block.member_sum),
+                                        )
+                                    };
+                                stats
+                                    .saturated_profile_pairs
+                                    .fetch_add(skipped_profiles, Ordering::Relaxed);
+                                stats
+                                    .block_saturated_profile_pairs
+                                    .fetch_add(skipped_profiles, Ordering::Relaxed);
+                                completed = completed.saturating_add(skipped_work);
+                                continue;
+                            }
+                            for left_id in left_block.start..left_block.end {
+                                let first_right = if left_block_index == right_block_index {
+                                    left_id + 1
+                                } else {
+                                    right_block.start
+                                };
+                                for right_id in first_right..right_block.end {
+                                    completed = completed
+                                        .saturating_add(scorer.score_pair(left_id, right_id));
+                                }
                             }
                         }
                     }
+                    progress.add_completed(completed);
                 }
-                progress.add_completed(completed);
             }
-        }
-        scorer.flush(stats);
-    });
+            scorer.finish(stats)
+        })
+        .collect::<Vec<_>>();
     if cancelled.load(Ordering::Relaxed) {
         Err(DedupError::Interrupted)
     } else {
-        Ok(CandidateScoreSummary::default())
+        let mut samples = sampling.sampler();
+        for worker in worker_samples {
+            samples.merge(worker);
+        }
+        Ok((CandidateScoreSummary::default(), samples))
     }
 }
 
@@ -3657,8 +3807,11 @@ fn score_streamed_candidates(
     stats: &AtomicStats,
     progress: &dyn ProgressObserver,
     candidates: &ResidentCandidateIndex,
-) -> Result<CandidateScoreSummary, DedupError> {
-    score_candidate_sources(index, hits, threshold, stats, progress, candidates)
+    sampling: PairSamplingPlan,
+) -> Result<(CandidateScoreSummary, PairSampler), DedupError> {
+    score_candidate_sources(
+        index, hits, threshold, stats, progress, candidates, sampling,
+    )
 }
 
 fn score_candidate_sources(
@@ -3668,11 +3821,12 @@ fn score_candidate_sources(
     stats: &AtomicStats,
     progress: &dyn ProgressObserver,
     candidates: &ResidentCandidateIndex,
-) -> Result<CandidateScoreSummary, DedupError> {
+    sampling: PairSamplingPlan,
+) -> Result<(CandidateScoreSummary, PairSampler), DedupError> {
     let profile_count = index.profiles.len();
     let query_profile_count = index.query_profile_count;
     if query_profile_count == 0 || profile_count < 2 {
-        return Ok(CandidateScoreSummary::default());
+        return Ok((CandidateScoreSummary::default(), sampling.sampler()));
     }
     let lane_count = candidate_seen_lanes(query_profile_count);
     let fine_tail = lane_count
@@ -3687,7 +3841,8 @@ fn score_candidate_sources(
         .map(|_| {
             let mut seen = None;
             let mut postings = CandidatePostingSlices::default();
-            let mut scorer = WorkerScorer::new(index, hits, threshold);
+            let mut scorer =
+                WorkerScorer::new_with_sampling(index, hits, threshold, sampling.clone());
             let mut summary = CandidateScoreSummary::default();
             let mut unchecked_emissions = 0_u64;
             let mut completed = 0_u64;
@@ -3775,15 +3930,17 @@ fn score_candidate_sources(
                 }
             }
             progress.add_completed(completed);
-            scorer.flush(stats);
-            Ok::<_, DedupError>(summary)
+            let samples = scorer.finish(stats);
+            Ok::<_, DedupError>((summary, samples))
         })
         .collect::<Vec<_>>()
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-    Ok(lanes
-        .into_iter()
-        .fold(CandidateScoreSummary::default(), |mut total, lane| {
+    let mut samples = sampling.sampler();
+    let summary = lanes.into_iter().fold(
+        CandidateScoreSummary::default(),
+        |mut total, (lane, worker_samples)| {
+            samples.merge(worker_samples);
             total.pair_count = total.pair_count.saturating_add(lane.pair_count);
             total.pair_emissions = total.pair_emissions.saturating_add(lane.pair_emissions);
             total.prefix_terms = total.prefix_terms.saturating_add(lane.prefix_terms);
@@ -3791,7 +3948,9 @@ fn score_candidate_sources(
                 .zero_overlap_prunes
                 .saturating_add(lane.zero_overlap_prunes);
             total
-        }))
+        },
+    );
+    Ok((summary, samples))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5977,6 +6136,7 @@ mod tests {
             &full_stats,
             &NoopProgress,
             &CrossProfilePlan::Full,
+            PairSamplingPlan::disabled(),
         )
         .unwrap();
         let solana = store.chain_ids["solana"];

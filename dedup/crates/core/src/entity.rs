@@ -380,14 +380,24 @@ impl EntityStore {
     }
 
     pub(crate) fn release_metadata(&mut self) {
+        self.release_metadata_payloads();
+        self.release_contract_addresses();
+    }
+
+    pub(crate) fn release_metadata_payloads(&mut self) {
         self.contracts.par_iter_mut().for_each(|contract| {
             contract.metadata_by_token = Vec::new();
-            contract.address = String::new();
         });
         self.nfts
             .par_iter_mut()
             .for_each(|nft| nft.token_id = String::new());
         self.nft_index = AHashMap::new();
+    }
+
+    pub(crate) fn release_contract_addresses(&mut self) {
+        self.contracts
+            .par_iter_mut()
+            .for_each(|contract| contract.address = String::new());
     }
 
     pub fn release_completed_dimension_data(&mut self) {

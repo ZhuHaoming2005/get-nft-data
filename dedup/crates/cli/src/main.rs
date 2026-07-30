@@ -37,10 +37,22 @@ struct CommonArgs {
         help = "Metadata anchors per contract; omission keeps every valid NFT metadata record"
     )]
     metadata_anchors: Option<usize>,
+    #[arg(
+        long,
+        default_value_t = 1_000,
+        help = "Random duplicate contract pairs written per Name/Metadata report group"
+    )]
+    sample_pairs: usize,
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
     #[arg(long, default_value_t = 1_000)]
     progress_interval_ms: u64,
+    #[arg(
+        long,
+        value_parser = parse_positive_usize,
+        help = "Worker threads; omission uses Rayon's system default"
+    )]
+    threads: Option<usize>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -76,6 +88,16 @@ fn run() -> Result<(), DedupError> {
     };
     let progress_mode = args.progress;
     let progress_interval_ms = args.progress_interval_ms;
+    if let Some(threads) = args.threads {
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .map_err(|error| {
+                DedupError::Message(format!(
+                    "failed to configure {threads} worker threads: {error}"
+                ))
+            })?;
+    }
     let config = RunConfig {
         inputs: args.inputs,
         output_dir: args.output_dir,
@@ -84,6 +106,8 @@ fn run() -> Result<(), DedupError> {
         name_threshold: args.name_threshold,
         metadata_threshold: args.metadata_threshold,
         metadata_anchors: args.metadata_anchors,
+        sample_pairs: args.sample_pairs,
+        threads: rayon::current_num_threads(),
         run_name,
         run_uri,
         run_metadata,
@@ -98,4 +122,27 @@ fn run() -> Result<(), DedupError> {
     let result = pipeline::run(config, &reporter);
     reporter.finish();
     result
+}
+
+fn parse_positive_usize(value: &str) -> Result<usize, String> {
+    let parsed = value
+        .parse::<usize>()
+        .map_err(|_| "must be a positive integer".to_owned())?;
+    if parsed == 0 {
+        Err("must be greater than zero".to_owned())
+    } else {
+        Ok(parsed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_positive_usize;
+
+    #[test]
+    fn thread_count_must_be_positive() {
+        assert_eq!(parse_positive_usize("64").unwrap(), 64);
+        assert!(parse_positive_usize("0").is_err());
+        assert!(parse_positive_usize("invalid").is_err());
+    }
 }

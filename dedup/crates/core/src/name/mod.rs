@@ -8,6 +8,7 @@ use crate::entity::{ChainId, ContractId, Dimension, EntityStore, NftId, ScopeKin
 use crate::error::DedupError;
 use crate::progress::ProgressObserver;
 use crate::radix::{sort_u32_pairs_while, sort_u32_triples_while, sort_u64_while};
+use crate::sampling::{DuplicatePairSamples, PairSampler, PairSamplingPlan, materialize_samples};
 use crate::scope::{ScopeCounts, ScopeKey};
 use crate::stats::SummaryAccumulator;
 use ahash::{AHashMap, AHashSet};
@@ -289,6 +290,40 @@ pub fn run_name(
     acc: &mut SummaryAccumulator,
     progress: &dyn ProgressObserver,
 ) -> Result<(), DedupError> {
+    run_name_internal(
+        store,
+        threshold,
+        acc,
+        progress,
+        PairSamplingPlan::disabled(),
+    )
+    .map(drop)
+}
+
+pub fn run_name_with_samples(
+    store: &EntityStore,
+    threshold: f64,
+    acc: &mut SummaryAccumulator,
+    progress: &dyn ProgressObserver,
+    sample_size: usize,
+) -> Result<DuplicatePairSamples, DedupError> {
+    let sampler = run_name_internal(
+        store,
+        threshold,
+        acc,
+        progress,
+        PairSamplingPlan::new(store, sample_size),
+    )?;
+    Ok(materialize_samples(store, sampler))
+}
+
+fn run_name_internal(
+    store: &EntityStore,
+    threshold: f64,
+    acc: &mut SummaryAccumulator,
+    progress: &dyn ProgressObserver,
+    sampling: PairSamplingPlan,
+) -> Result<PairSampler, DedupError> {
     if !(0.0..=1.0).contains(&threshold) {
         return Err(DedupError::invalid(
             "name",
@@ -302,15 +337,24 @@ pub fn run_name(
     let names = atomize(store, progress)?;
     let mut intra_nft_hits = IntraNftHits::default();
     progress.begin_phase("identical", Some(names.len() as u64));
-    emit_identical(&names, store, acc, &mut intra_nft_hits, progress)?;
+    let mut samples = emit_identical(
+        &names,
+        store,
+        acc,
+        &mut intra_nft_hits,
+        progress,
+        sampling.clone(),
+    )?;
 
     if names.len() < 2 {
         intra_nft_hits.merge_into(acc);
-        return Ok(());
+        return Ok(samples);
     }
 
     let index = ResidentNameIndex::build(&names, progress)?;
-    let hits = score_resident_index(&index, &names, threshold_pct, progress)?;
+    let (hits, fuzzy_samples) =
+        score_resident_index_with_samples(&index, &names, threshold_pct, progress, sampling)?;
+    samples.merge(fuzzy_samples);
 
     progress.begin_phase("emit", Some(hits.len() as u64));
     let mut completed = 0_u64;
@@ -322,7 +366,21 @@ pub fn run_name(
     }
     flush_remaining(&mut completed, progress);
     intra_nft_hits.merge_into(acc);
-    Ok(())
+    Ok(samples)
+}
+
+fn name_member_len(name: &CanonicalName) -> usize {
+    name.atoms.iter().map(|atom| atom.members.len()).sum()
+}
+
+fn name_member_contract(name: &CanonicalName, mut member: usize) -> ContractId {
+    for atom in &name.atoms {
+        if member < atom.members.len() {
+            return atom.members[member].contract_id;
+        }
+        member -= atom.members.len();
+    }
+    unreachable!("Name member index is within the flattened atom length")
 }
 
 fn atomize(
@@ -558,38 +616,67 @@ fn emit_identical(
     acc: &mut SummaryAccumulator,
     intra_nft_hits: &mut IntraNftHits,
     progress: &dyn ProgressObserver,
-) -> Result<(), DedupError> {
+    sampling: PairSamplingPlan,
+) -> Result<PairSampler, DedupError> {
     const CHUNK: usize = 4096;
-    let partials: Vec<Result<NameHits, DedupError>> = names
-        .par_chunks(CHUNK)
-        .map(|chunk| {
-            progress.check_cancelled()?;
-            let mut hits = AHashSet::new();
-            for name in chunk {
-                for atom in &name.atoms {
-                    if atom.members.len() >= 2 {
-                        record_atom_hits(atom, atom.chain_id, &mut hits);
-                    }
-                }
-                for (position, left) in name.atoms.iter().enumerate() {
-                    for right in &name.atoms[position + 1..] {
-                        record_atom_hits(left, right.chain_id, &mut hits);
-                        record_atom_hits(right, left.chain_id, &mut hits);
-                    }
-                }
-            }
-            progress.add_completed(chunk.len() as u64);
-            Ok(hits)
-        })
-        .collect();
-    let mut hits = AHashSet::new();
-    for partial in partials {
-        hits.extend(partial?);
+    struct ExactWorker {
+        hits: NameHits,
+        samples: PairSampler,
     }
-    for hit in hits {
+
+    let worker = names
+        .par_chunks(CHUNK)
+        .enumerate()
+        .try_fold(
+            || ExactWorker {
+                hits: AHashSet::new(),
+                samples: sampling.sampler(),
+            },
+            |mut worker, (chunk_id, chunk)| {
+                progress.check_cancelled()?;
+                for (offset, name) in chunk.iter().enumerate() {
+                    for atom in &name.atoms {
+                        if atom.members.len() >= 2 {
+                            record_atom_hits(atom, atom.chain_id, &mut worker.hits);
+                        }
+                    }
+                    for (position, left) in name.atoms.iter().enumerate() {
+                        for right in &name.atoms[position + 1..] {
+                            record_atom_hits(left, right.chain_id, &mut worker.hits);
+                            record_atom_hits(right, left.chain_id, &mut worker.hits);
+                        }
+                    }
+                    if worker.samples.enabled() {
+                        let name_id = chunk_id * CHUNK + offset;
+                        worker.samples.observe_clique_by(
+                            name_member_len(name),
+                            |member| name_member_contract(name, member),
+                            0x4e41_4d45_0000_0000 ^ name_id as u64,
+                        );
+                    }
+                }
+                progress.add_completed(chunk.len() as u64);
+                Ok::<ExactWorker, DedupError>(worker)
+            },
+        )
+        .try_reduce(
+            || ExactWorker {
+                hits: AHashSet::new(),
+                samples: sampling.sampler(),
+            },
+            |mut left, mut right| {
+                if left.hits.len() < right.hits.len() {
+                    std::mem::swap(&mut left.hits, &mut right.hits);
+                }
+                left.hits.extend(right.hits);
+                left.samples.merge(right.samples);
+                Ok::<ExactWorker, DedupError>(left)
+            },
+        )?;
+    for hit in worker.hits {
         emit_hit(store, acc, intra_nft_hits, hit);
     }
-    Ok(())
+    Ok(worker.samples)
 }
 
 fn emit_hit(
@@ -615,16 +702,34 @@ fn emit_hit(
     }
 }
 
+#[cfg(test)]
 fn score_resident_index(
     index: &ResidentNameIndex,
     names: &[CanonicalName],
     threshold_pct: f64,
     progress: &dyn ProgressObserver,
 ) -> Result<NameHits, DedupError> {
+    score_resident_index_with_samples(
+        index,
+        names,
+        threshold_pct,
+        progress,
+        PairSamplingPlan::disabled(),
+    )
+    .map(|(hits, _)| hits)
+}
+
+fn score_resident_index_with_samples(
+    index: &ResidentNameIndex,
+    names: &[CanonicalName],
+    threshold_pct: f64,
+    progress: &dyn ProgressObserver,
+    sampling: PairSamplingPlan,
+) -> Result<(NameHits, PairSampler), DedupError> {
     let left_count = names.len().saturating_sub(1);
     progress.begin_phase("score_name", Some(left_count as u64));
     if left_count == 0 {
-        return Ok(AHashSet::new());
+        return Ok((AHashSet::new(), sampling.sampler()));
     }
 
     let right_ends = build_right_name_range_ends(names, threshold_pct);
@@ -668,6 +773,7 @@ fn score_resident_index(
         candidates: Vec<u32>,
         seen: CandidateSeen,
         hits: NameHits,
+        samples: PairSampler,
     }
 
     let lane_count = rayon::current_num_threads().min(left_count).max(1);
@@ -680,6 +786,7 @@ fn score_resident_index(
                 candidates: Vec::new(),
                 seen: CandidateSeen::new(names.len()),
                 hits: AHashSet::new(),
+                samples: sampling.sampler(),
             };
             let mut pending = 0_u64;
             loop {
@@ -752,6 +859,17 @@ fn score_resident_index(
                                 .is_some()
                             {
                                 record_pair_hits(&names[left], &names[right], &mut worker.hits);
+                                if worker.samples.enabled() {
+                                    worker.samples.observe_cross_by(
+                                        name_member_len(&names[left]),
+                                        name_member_len(&names[right]),
+                                        |member| name_member_contract(&names[left], member),
+                                        |member| name_member_contract(&names[right], member),
+                                        0x4655_5a5a_5900_0000
+                                            ^ ((left as u64) << 32)
+                                            ^ right as u64,
+                                    );
+                                }
                             }
                         }
                     }
@@ -776,12 +894,14 @@ fn score_resident_index(
                 candidates: Vec::new(),
                 seen: CandidateSeen::new(0),
                 hits: AHashSet::new(),
+                samples: sampling.sampler(),
             },
             |mut left, mut right| {
                 if left.hits.len() < right.hits.len() {
                     std::mem::swap(&mut left.hits, &mut right.hits);
                 }
                 left.hits.extend(right.hits);
+                left.samples.merge(right.samples);
                 left
             },
         );
@@ -789,7 +909,7 @@ fn score_resident_index(
     if cancelled.load(Ordering::Relaxed) != 0 {
         return Err(DedupError::Interrupted);
     }
-    Ok(worker.hits)
+    Ok((worker.hits, worker.samples))
 }
 
 fn record_pair_hits(left: &CanonicalName, right: &CanonicalName, hits: &mut NameHits) {

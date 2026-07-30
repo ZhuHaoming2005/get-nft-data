@@ -21,11 +21,11 @@ cargo build --release --manifest-path dedup/Cargo.toml
   --evm-chains base,ethereum,polygon
 ```
 
-默认不执行 Name 查重；只有显式传入 `--name-threshold <百分比>` 时才执行。默认不限制 Metadata anchor 数量，所有具有有效 Metadata 的 NFT 都参与查重；如需主动限制，显式传入 `--metadata-anchors <数量>`。
+默认不执行 Name 查重；只有显式传入 `--name-threshold <百分比>` 时才执行。默认不限制 Metadata anchor 数量，所有具有有效 Metadata 的 NFT 都参与查重；如需主动限制，显式传入 `--metadata-anchors <数量>`。Name 与 Metadata 各自按“各链单链、链对跨链、各链跨链汇总、全链汇总”分别随机导出最多 1000 个已确认的重复合约对；使用 `--sample-pairs <数量>` 修改每个分组的上限，设为 `0` 可关闭抽样。
 
 程序不设置内存预算或内存上限，不会因内存估算切换算法、降低并行度、跳过数据或输出内存警告。索引仍使用紧凑整数、字符串驻留、分块临时缓冲和流式候选评分来减少实际内存占用；若物理内存不足，由系统分配失败直接终止。
 
-进度默认 `auto`（TTY 用人类可读格式，否则 JSON Lines），含 EWMA ETA。
+使用 `--threads <正整数>` 指定全链路 Rayon 工作线程数；省略时使用系统默认并行度。进度默认 `auto`（TTY 用人类可读格式，否则 JSON Lines），含 EWMA ETA。
 
 ## 输出
 
@@ -33,6 +33,10 @@ cargo build --release --manifest-path dedup/Cargo.toml
 - `chain_matrix.csv`
 - `run_manifest.json`
 - `name_summary.csv` / `name_chain_matrix.csv`（显式指定 `--name-threshold` 且 Name 阶段完成后提交）
+- `name_duplicate_pairs.csv`（Name 全链汇总随机样本）
+- `name_duplicate_pairs_intra_chain.csv` / `name_duplicate_pairs_chain_matrix.csv` / `name_duplicate_pairs_cross_chain_summary.csv`
 - `uri_summary.csv` / `uri_chain_matrix.csv`（URI 阶段完成后立即提交）
+- `metadata_duplicate_pairs.csv`（Metadata 全链汇总随机样本）
+- `metadata_duplicate_pairs_intra_chain.csv` / `metadata_duplicate_pairs_chain_matrix.csv` / `metadata_duplicate_pairs_cross_chain_summary.csv`
 
 设计说明：`docs/superpowers/specs/2026-07-18-dedup2-experimental-design.md`

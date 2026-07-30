@@ -5,15 +5,20 @@ pub mod name;
 pub mod parquet;
 pub mod progress;
 mod radix;
+mod sampling;
 pub mod scope;
 pub mod stats;
 pub mod uri;
 
 pub use entity::{Dimension, EntityStore, NftId, ScopeKind, StringId};
 pub use error::DedupError;
-pub use metadata::{MetadataRunResult, MetadataStats, run_metadata};
-pub use name::run_name;
+pub use metadata::{MetadataRunResult, MetadataStats, run_metadata, run_metadata_with_samples};
+pub use name::{run_name, run_name_with_samples};
 pub use parquet::{LoadOptions, load_entities, load_entities_with_options};
 pub use progress::{EwmaEta, NoopProgress, ProgressObserver};
+pub use sampling::{
+    ChainDuplicatePairSamples, ChainPairDuplicatePairSamples, DuplicatePairSample,
+    DuplicatePairSamples,
+};
 pub use stats::SummaryAccumulator;
 pub use uri::run_uri;

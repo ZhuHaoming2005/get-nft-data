@@ -496,6 +496,7 @@ dependencies = [
  "ctrlc",
  "dedup_core",
  "parquet",
+ "rayon",
  "serde",
  "serde_json",
  "tempfile",

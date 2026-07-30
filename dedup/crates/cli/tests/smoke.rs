@@ -92,6 +92,10 @@ fn all_writes_summary_files() {
             "98",
             "--metadata-anchors",
             "2",
+            "--sample-pairs",
+            "1",
+            "--threads",
+            "2",
         ])
         .status()
         .unwrap();
@@ -141,6 +145,82 @@ fn all_writes_summary_files() {
             row_count += 1;
         }
         assert!(row_count > 0);
+    }
+    for name in ["name_duplicate_pairs.csv", "metadata_duplicate_pairs.csv"] {
+        let path = out.join(name);
+        assert!(path.is_file(), "missing duplicate-pair sample {name}");
+        let mut reader = csv::Reader::from_path(path).unwrap();
+        assert_eq!(
+            reader.headers().unwrap(),
+            [
+                "contract_a_chain",
+                "contract_a_address",
+                "contract_b_chain",
+                "contract_b_address",
+            ]
+            .as_slice()
+        );
+        let rows = reader.records().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(rows.len(), 1, "sample limit was not applied to {name}");
+        assert!(rows[0].iter().all(|value| !value.is_empty()));
+    }
+    for dimension in ["name", "metadata"] {
+        for (suffix, group_columns) in [
+            ("intra_chain", &["chain"][..]),
+            ("chain_matrix", &["primary_chain", "secondary_chain"][..]),
+            ("cross_chain_summary", &["chain"][..]),
+        ] {
+            let name = format!("{dimension}_duplicate_pairs_{suffix}.csv");
+            let path = out.join(&name);
+            assert!(
+                path.is_file(),
+                "missing scoped duplicate-pair sample {name}"
+            );
+            let mut reader = csv::Reader::from_path(path).unwrap();
+            let headers = reader.headers().unwrap();
+            assert_eq!(
+                &headers.iter().collect::<Vec<_>>()[..group_columns.len()],
+                group_columns
+            );
+            assert_eq!(
+                &headers.iter().collect::<Vec<_>>()[group_columns.len()..],
+                [
+                    "contract_a_chain",
+                    "contract_a_address",
+                    "contract_b_chain",
+                    "contract_b_address",
+                ]
+            );
+            let mut group_counts = std::collections::HashMap::<Vec<String>, usize>::new();
+            for row in reader.records() {
+                let row = row.unwrap();
+                let group = row
+                    .iter()
+                    .take(group_columns.len())
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                *group_counts.entry(group.clone()).or_default() += 1;
+                let a_chain = &row[group_columns.len()];
+                let b_chain = &row[group_columns.len() + 2];
+                match suffix {
+                    "intra_chain" => {
+                        assert_eq!(a_chain, b_chain);
+                        assert_eq!(a_chain, &group[0]);
+                    }
+                    "chain_matrix" => {
+                        assert_ne!(a_chain, b_chain);
+                        assert!(group.contains(&a_chain.to_owned()));
+                        assert!(group.contains(&b_chain.to_owned()));
+                    }
+                    "cross_chain_summary" => {
+                        assert_ne!(a_chain, b_chain);
+                        assert!(a_chain == group[0] || b_chain == group[0]);
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert!(group_counts.values().all(|&count| count <= 1));
+        }
     }
     for (name, allowed_dimensions) in [
         ("name_summary.csv", &["name"][..]),
@@ -203,6 +283,8 @@ fn all_writes_summary_files() {
     assert!(manifest["metadata_direct"]["bm25_cache_bypass_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["bm25_upper_bound_prune_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["matched_profile_pair_ratio"].is_f64());
+    assert_eq!(manifest["sample_pairs"], 1);
+    assert_eq!(manifest["threads"], 2);
     assert!(
         manifest["interned_strings"]
             .as_u64()
