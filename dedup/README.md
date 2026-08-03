@@ -23,7 +23,9 @@ cargo build --release --manifest-path dedup/Cargo.toml
 
 默认不执行 Name 查重；只有显式传入 `--name-threshold <百分比>` 时才执行。默认不限制 Metadata anchor 数量，所有具有有效 Metadata 的 NFT 都参与查重；如需主动限制，显式传入 `--metadata-anchors <数量>`。
 
-抽样默认关闭，不加载抽样所需的图片 URI，也不发起图片网络请求。显式传入 `--sample-pairs <正整数>` 后，Name 与 Metadata 的合约对抽样才作为一个整体启用。Name 导出有界的已确认重复合约对；Metadata 则从实际命中比较所选择的两个 token 中抽样，并且只有双方 `image_uri_norm` 均非空且两张媒体均成功下载的合约对，才会同时写入 `metadata_duplicate_pairs*.csv`、`metadata_image_samples.csv` 和 `metadata_sample_images/`。任意一侧下载失败会舍弃整对并扩大候选集继续补位，成功运行时最终恰好得到 `--sample-pairs N` 对完整媒体；如果穷尽合格重复对仍不足 N，命令会在正常写出查重统计后明确报错，且不会发布本轮不完整的媒体样本。HTTP、IPFS、Arweave 和 base64 `data:image/...` URI 均支持，图片不转码。
+抽样默认关闭，不加载抽样所需的图片 URI，也不发起图片网络请求。显式传入 `--sample-pairs <正整数>` 后，Name 与 Metadata 的合约对抽样才作为一个整体启用。Name 导出有界的已确认重复合约对；Metadata 通过一次查重扫描保留有界候选池，并且只有实际比较 token 的两张媒体均成功下载的合约对，才会同时写入 `metadata_duplicate_pairs*.csv`、`metadata_image_samples.csv` 和 `metadata_sample_images/`。任意一侧下载失败会永久舍弃整对，已成功下载的对会在同一临时集合中保留并继续用后续候选补足；成功运行时最终恰好得到 `--sample-pairs N` 对完整媒体。候选池默认是 `max(N*16, N+256)`，可用 `--sample-candidate-limit` 显式调整；候选耗尽仍不足 N 时，命令会在正常写出查重统计后明确报错，且不会发布本轮不完整的媒体样本，不会反复执行 Metadata 查重或扩张到全部合约对。
+
+Parquet 中由 `top_contract_analysis_rs` 导出的规范化 URI 会在请求前恢复：`ipfs:<cid/path>` 映射到 IPFS 网关，`ar:<tx/path>` 映射到 Arweave 网关，普通 HTTP(S) URI 直接使用。下载器同时兼容未规范化的 `ipfs://`、`ar://` 和 base64 `data:image/...`，图片不转码。HTTP(S) 请求禁用代理和自动重定向，只允许解析到公网地址的目标；每次重定向都会重新执行相同检查，拒绝 loopback、私网、link-local 和其他非公网地址。
 
 ```bash
 ./dedup run-metadata \

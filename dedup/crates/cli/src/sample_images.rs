@@ -2,16 +2,36 @@ use base64::Engine;
 use dedup_core::MetadataImagePairSample;
 use rayon::prelude::*;
 use reqwest::blocking::Client;
-use reqwest::header::{CONTENT_TYPE, RETRY_AFTER};
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
+use reqwest::header::{CONTENT_TYPE, LOCATION, RETRY_AFTER};
+use reqwest::redirect::Policy;
+use reqwest::{StatusCode, Url};
 use std::fs;
 use std::io::{Read, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 
 const DOWNLOAD_WORKERS: usize = 8;
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
 const MAX_ATTEMPTS: usize = 5;
+const MAX_REDIRECTS: usize = 10;
+
+#[derive(Debug)]
+struct PublicDnsResolver;
+
+impl Resolve for PublicDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let host = name.as_str().to_owned();
+        Box::pin(async move {
+            let addresses = resolve_public_host(&host)
+                .map_err(|error| -> Box<dyn std::error::Error + Send + Sync> { Box::new(error) })?;
+            Ok(Box::new(addresses.into_iter()) as Addrs)
+        })
+    }
+}
 
 struct DownloadedImage {
     bytes: Vec<u8>,
@@ -64,10 +84,7 @@ pub fn download_metadata_image_samples(
     let staging = tempfile::Builder::new()
         .prefix(".metadata-sample-images-")
         .tempdir_in(output_dir)?;
-    let client = Client::builder()
-        .timeout(Duration::from_secs(30))
-        .user_agent("dedup-metadata-image-sampler/1.0")
-        .build()?;
+    let client = build_http_client()?;
     let pool = rayon::ThreadPoolBuilder::new()
         .num_threads(DOWNLOAD_WORKERS.min(samples.len()).max(1))
         .build()?;
@@ -127,6 +144,16 @@ pub fn download_metadata_image_samples(
     Ok(DownloadOutcome::Complete(selected))
 }
 
+fn build_http_client() -> Result<Client, reqwest::Error> {
+    Client::builder()
+        .timeout(Duration::from_secs(30))
+        .user_agent("dedup-metadata-image-sampler/1.0")
+        .redirect(Policy::none())
+        .no_proxy()
+        .dns_resolver(Arc::new(PublicDnsResolver))
+        .build()
+}
+
 fn stage_pair(
     client: &Client,
     sample: &MetadataImagePairSample,
@@ -165,8 +192,8 @@ fn download_image(client: &Client, image_uri: &str) -> Result<DownloadedImage, s
     let url = normalize_image_uri(image_uri)?;
     let mut last_error = None;
     for attempt in 0..MAX_ATTEMPTS {
-        match client.get(&url).send() {
-            Ok(response) if response.status().is_success() => {
+        match send_public_get(client, &url) {
+            Ok((response, final_url)) if response.status().is_success() => {
                 if response
                     .content_length()
                     .is_some_and(|size| size > MAX_IMAGE_BYTES)
@@ -184,10 +211,10 @@ fn download_image(client: &Client, image_uri: &str) -> Result<DownloadedImage, s
                 if bytes.len() as u64 > MAX_IMAGE_BYTES {
                     return Err(std::io::Error::other("image exceeds 50 MiB limit"));
                 }
-                let suffix = infer_image_suffix(&content_type, &url, &bytes)?;
+                let suffix = infer_image_suffix(&content_type, &final_url, &bytes)?;
                 return Ok(DownloadedImage { bytes, suffix });
             }
-            Ok(response) => {
+            Ok((response, _)) => {
                 let status = response.status();
                 let retryable = status.as_u16() == 429 || status.is_server_error();
                 let retry_after = response
@@ -204,6 +231,11 @@ fn download_image(client: &Client, image_uri: &str) -> Result<DownloadedImage, s
                 ));
             }
             Err(error) => {
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    || error.kind() == std::io::ErrorKind::InvalidInput
+                {
+                    return Err(error);
+                }
                 last_error = Some(error.to_string());
                 if attempt + 1 == MAX_ATTEMPTS {
                     break;
@@ -215,6 +247,130 @@ fn download_image(client: &Client, image_uri: &str) -> Result<DownloadedImage, s
     Err(std::io::Error::other(
         last_error.unwrap_or_else(|| "download failed".to_owned()),
     ))
+}
+
+fn send_public_get(
+    client: &Client,
+    initial_url: &str,
+) -> Result<(reqwest::blocking::Response, String), std::io::Error> {
+    let mut current = Url::parse(initial_url)
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+    for redirect in 0..=MAX_REDIRECTS {
+        validate_request_url(&current)?;
+        let response = client
+            .get(current.clone())
+            .send()
+            .map_err(std::io::Error::other)?;
+        if !is_followed_redirect(response.status()) {
+            return Ok((response, current.to_string()));
+        }
+        if redirect == MAX_REDIRECTS {
+            return Err(std::io::Error::other("too many image redirects"));
+        }
+        let location = response
+            .headers()
+            .get(LOCATION)
+            .ok_or_else(|| std::io::Error::other("image redirect has no Location header"))?
+            .to_str()
+            .map_err(|error| {
+                std::io::Error::other(format!("invalid redirect Location: {error}"))
+            })?;
+        current = current.join(location).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("invalid image redirect: {error}"),
+            )
+        })?;
+    }
+    unreachable!("redirect loop returns or errors at its bound")
+}
+
+fn is_followed_redirect(status: StatusCode) -> bool {
+    matches!(status.as_u16(), 301 | 302 | 303 | 307 | 308)
+}
+
+fn validate_request_url(url: &Url) -> Result<(), std::io::Error> {
+    if !matches!(url.scheme(), "http" | "https") {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "image URL must use HTTP or HTTPS",
+        ));
+    }
+    let host = url.host().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::InvalidInput, "image URL has no host")
+    })?;
+    let allowed = match host {
+        url::Host::Domain(_) => true,
+        url::Host::Ipv4(address) => is_public_ipv4(address),
+        url::Host::Ipv6(address) => is_public_ipv6(address),
+    };
+    if allowed {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "image URL resolves to a non-public network address",
+        ))
+    }
+}
+
+fn resolve_public_host(host: &str) -> Result<Vec<SocketAddr>, std::io::Error> {
+    let addresses = (host, 0).to_socket_addrs()?.collect::<Vec<_>>();
+    let public = addresses
+        .into_iter()
+        .filter(|address| is_public_ip(address.ip()))
+        .collect::<Vec<_>>();
+    if public.is_empty() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!("image host {host:?} has no public network address"),
+        ))
+    } else {
+        Ok(public)
+    }
+}
+
+fn is_public_ip(address: IpAddr) -> bool {
+    match address {
+        IpAddr::V4(address) => is_public_ipv4(address),
+        IpAddr::V6(address) => is_public_ipv6(address),
+    }
+}
+
+fn is_public_ipv4(address: Ipv4Addr) -> bool {
+    let [a, b, c, _] = address.octets();
+    !(a == 0
+        || a == 10
+        || a == 127
+        || (a == 100 && (64..=127).contains(&b))
+        || (a == 169 && b == 254)
+        || (a == 172 && (16..=31).contains(&b))
+        || (a == 192 && b == 0 && c == 0)
+        || (a == 192 && b == 0 && c == 2)
+        || (a == 192 && b == 88 && c == 99)
+        || (a == 192 && b == 168)
+        || (a == 198 && (b == 18 || b == 19))
+        || (a == 198 && b == 51 && c == 100)
+        || (a == 203 && b == 0 && c == 113)
+        || a >= 224)
+}
+
+fn is_public_ipv6(address: Ipv6Addr) -> bool {
+    if let Some(mapped) = address.to_ipv4_mapped() {
+        return is_public_ipv4(mapped);
+    }
+    let segments = address.segments();
+    !(address.is_unspecified()
+        || address.is_loopback()
+        || address.is_multicast()
+        || segments[0] & 0xe000 != 0x2000
+        || segments[0] & 0xfe00 == 0xfc00
+        || segments[0] & 0xffc0 == 0xfe80
+        || segments[0] & 0xffc0 == 0xfec0
+        || (segments[0] == 0x2001 && segments[1] == 0x0db8)
+        || (segments[0] == 0x2001 && segments[1] == 0)
+        || segments[0] == 0x2002
+        || (segments[0] == 0x0064 && segments[1] == 0xff9b))
 }
 
 fn decode_data_image(data: &str) -> Result<DownloadedImage, std::io::Error> {
@@ -239,20 +395,36 @@ fn decode_data_image(data: &str) -> Result<DownloadedImage, std::io::Error> {
 
 fn normalize_image_uri(uri: &str) -> Result<String, std::io::Error> {
     let uri = uri.trim();
-    if let Some(path) = uri.strip_prefix("ipfs://") {
-        let path = path.strip_prefix("ipfs/").unwrap_or(path);
+    let lowered = uri.to_ascii_lowercase();
+    if lowered.starts_with("ipfs:") {
+        let path = uri["ipfs:".len()..].trim_start_matches('/');
+        let path = if path
+            .get(.."ipfs/".len())
+            .is_some_and(|prefix| prefix.eq_ignore_ascii_case("ipfs/"))
+        {
+            &path["ipfs/".len()..]
+        } else {
+            path
+        };
+        if path.is_empty() {
+            return Err(std::io::Error::other("empty IPFS image URI"));
+        }
         return Ok(format!(
             "https://ipfs.io/ipfs/{}",
             path.trim_start_matches('/')
         ));
     }
-    if let Some(path) = uri.strip_prefix("ar://") {
+    if lowered.starts_with("ar:") {
+        let path = uri["ar:".len()..].trim_start_matches('/');
+        if path.is_empty() {
+            return Err(std::io::Error::other("empty Arweave image URI"));
+        }
         return Ok(format!(
             "https://arweave.net/{}",
             path.trim_start_matches('/')
         ));
     }
-    if uri.starts_with("http://") || uri.starts_with("https://") {
+    if lowered.starts_with("http://") || lowered.starts_with("https://") {
         return Ok(uri.to_owned());
     }
     Err(std::io::Error::other("unsupported image URI scheme"))
@@ -381,7 +553,6 @@ fn write_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::net::TcpListener;
 
     fn sample(address: &str, image_uri: &str) -> MetadataImagePairSample {
         MetadataImagePairSample {
@@ -406,6 +577,14 @@ mod tests {
             normalize_image_uri("ar://transaction").unwrap(),
             "https://arweave.net/transaction"
         );
+        assert_eq!(
+            normalize_image_uri("ipfs:QmNormalized/image.png").unwrap(),
+            "https://ipfs.io/ipfs/QmNormalized/image.png"
+        );
+        assert_eq!(
+            normalize_image_uri("ar:normalized-transaction/image.png").unwrap(),
+            "https://arweave.net/normalized-transaction/image.png"
+        );
     }
 
     #[test]
@@ -421,31 +600,54 @@ mod tests {
     }
 
     #[test]
-    fn downloads_original_image_bytes() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let address = listener.local_addr().unwrap();
-        let expected = b"\x89PNG\r\n\x1a\noriginal-bytes".to_vec();
-        let response_bytes = expected.clone();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0_u8; 1024];
-            let _ = stream.read(&mut request).unwrap();
-            write!(
-                stream,
-                "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                response_bytes.len()
-            )
-            .unwrap();
-            stream.write_all(&response_bytes).unwrap();
-        });
-        let client = Client::builder()
-            .timeout(Duration::from_secs(2))
-            .build()
-            .unwrap();
-        let image = download_image(&client, &format!("http://{address}/image")).unwrap();
-        server.join().unwrap();
+    fn decodes_original_data_image_bytes() {
+        let expected = b"\x89PNG\r\n\x1a\n".to_vec();
+        let client = build_http_client().unwrap();
+        let image = download_image(&client, "data:image/png;base64,iVBORw0KGgo=").unwrap();
         assert_eq!(image.suffix, ".png");
         assert_eq!(image.bytes, expected);
+    }
+
+    #[test]
+    fn rejects_non_public_literal_and_resolved_hosts() {
+        for url in [
+            "http://127.0.0.1/image.png",
+            "http://10.0.0.1/image.png",
+            "http://169.254.169.254/latest/meta-data",
+            "http://[::1]/image.png",
+            "http://[::127.0.0.1]/image.png",
+            "http://[::ffff:127.0.0.1]/image.png",
+            "http://[fe80::1]/image.png",
+            "http://[fc00::1]/image.png",
+        ] {
+            let parsed = Url::parse(url).unwrap();
+            assert_eq!(
+                validate_request_url(&parsed).unwrap_err().kind(),
+                std::io::ErrorKind::PermissionDenied,
+                "unsafe URL was accepted: {url}"
+            );
+        }
+        assert_eq!(
+            resolve_public_host("localhost").unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        validate_request_url(&Url::parse("https://8.8.8.8/image.png").unwrap()).unwrap();
+
+        let client = build_http_client().unwrap();
+        assert_eq!(
+            send_public_get(&client, "http://127.0.0.1/image.png")
+                .unwrap_err()
+                .kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
+        let redirect = Url::parse("https://example.com/image.png")
+            .unwrap()
+            .join("http://169.254.169.254/latest/meta-data")
+            .unwrap();
+        assert_eq!(
+            validate_request_url(&redirect).unwrap_err().kind(),
+            std::io::ErrorKind::PermissionDenied
+        );
     }
 
     #[test]

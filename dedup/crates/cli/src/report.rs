@@ -56,6 +56,7 @@ struct RunManifest {
     metadata_threshold: f64,
     metadata_anchors: Option<usize>,
     sample_pairs: usize,
+    sample_candidate_limit: Option<usize>,
     threads: usize,
     metadata_direct: Option<MetadataStats>,
 }
@@ -90,6 +91,7 @@ pub struct ReportRequest<'a> {
     pub metadata_threshold: f64,
     pub metadata_anchors: Option<usize>,
     pub sample_pairs: usize,
+    pub sample_candidate_limit: Option<usize>,
     pub threads: usize,
     pub interned_strings: usize,
     pub token_uri_postings: usize,
@@ -138,6 +140,7 @@ pub fn write_reports(output_dir: &Path, request: ReportRequest<'_>) -> Result<()
         metadata_threshold: request.metadata_threshold,
         metadata_anchors: request.metadata_anchors,
         sample_pairs: request.sample_pairs,
+        sample_candidate_limit: request.sample_candidate_limit,
         threads: request.threads,
         metadata_direct: request.metadata_direct,
     };

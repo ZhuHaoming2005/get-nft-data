@@ -25,6 +25,7 @@ pub struct RunConfig {
     pub metadata_threshold: f64,
     pub metadata_anchors: Option<usize>,
     pub sample_pairs: usize,
+    pub sample_candidate_limit: usize,
     pub threads: usize,
     pub run_name: bool,
     pub run_uri: bool,
@@ -64,11 +65,6 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
     let interned_strings = store.strings.len();
     let token_uri_postings = store.token_uri_postings.len();
     let image_uri_postings = store.image_uri_postings.len();
-    let max_metadata_pair_candidates = store
-        .contracts
-        .len()
-        .saturating_mul(store.contracts.len().saturating_sub(1))
-        / 2;
     let mut stage_timings = vec![StageTiming {
         stage: "load",
         elapsed_secs: stage_started.elapsed().as_secs_f64(),
@@ -156,7 +152,7 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
                 config.metadata_threshold,
                 &mut acc,
                 progress,
-                config.sample_pairs,
+                config.sample_candidate_limit,
             )?
         };
         metadata_stats = Some(result.stats);
@@ -167,72 +163,37 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
         if sample_metadata_images {
             let stage_started = Instant::now();
             clear_previous_metadata_samples(&config.output_dir)?;
-            let mut candidate_limit = config.sample_pairs;
-            let mut candidate_samples = result.image_samples;
-            let mut candidate_pairs = result.samples;
-            loop {
-                progress.set_stage("sample_images");
-                progress.begin_phase("download", Some(candidate_samples.len() as u64));
-                let download = download_metadata_image_samples(
-                    &config.output_dir,
-                    &candidate_samples,
-                    config.sample_pairs,
-                );
-                progress.add_completed(candidate_samples.len() as u64);
-                match download {
-                    Ok(DownloadOutcome::Complete(downloaded)) => {
-                        let final_pairs = retain_downloaded_pairs(candidate_pairs, &downloaded);
-                        write_duplicate_pair_samples(
-                            &config.output_dir,
-                            "metadata_duplicate_pairs.csv",
-                            &final_pairs,
-                        )
-                        .map_err(|error| DedupError::Message(error.to_string()))?;
-                        break;
-                    }
-                    Ok(DownloadOutcome::Insufficient {
-                        successful,
-                        candidates,
-                    }) => {
-                        if candidate_limit >= max_metadata_pair_candidates {
-                            sampling_error = Some(DedupError::Message(format!(
-                                "requested {} complete Metadata media pairs, but only {successful} of {candidates} image-qualified pairs downloaded successfully",
-                                config.sample_pairs
-                            )));
-                            break;
-                        }
-                        let next_limit = candidate_limit
-                            .saturating_mul(2)
-                            .max(candidate_limit.saturating_add(1))
-                            .min(max_metadata_pair_candidates);
-                        let mut retry_options = load_options.clone();
-                        retry_options.load_names = false;
-                        retry_options.load_token_uris = false;
-                        retry_options.load_image_uris = true;
-                        retry_options.load_metadata = true;
-                        let mut retry_store =
-                            load_entities_with_options(&config.inputs, &retry_options, progress)?;
-                        retry_store.release_completed_dimension_data_preserving_image_uris();
-                        let mut retry_acc = SummaryAccumulator::default();
-                        let retry_result = run_metadata_with_samples(
-                            &mut retry_store,
-                            &evm,
-                            config.metadata_anchors,
-                            config.metadata_threshold,
-                            &mut retry_acc,
-                            progress,
-                            next_limit,
-                        )?;
-                        candidate_limit = next_limit;
-                        candidate_samples = retry_result.image_samples;
-                        candidate_pairs = retry_result.samples;
-                    }
-                    Err(error) => {
-                        sampling_error = Some(DedupError::Message(format!(
-                            "failed to build a complete Metadata media sample: {error}"
-                        )));
-                        break;
-                    }
+            progress.set_stage("sample_images");
+            progress.begin_phase("download", Some(result.image_samples.len() as u64));
+            let download = download_metadata_image_samples(
+                &config.output_dir,
+                &result.image_samples,
+                config.sample_pairs,
+            );
+            progress.add_completed(result.image_samples.len() as u64);
+            match download {
+                Ok(DownloadOutcome::Complete(downloaded)) => {
+                    let final_pairs = retain_downloaded_pairs(result.samples, &downloaded);
+                    write_duplicate_pair_samples(
+                        &config.output_dir,
+                        "metadata_duplicate_pairs.csv",
+                        &final_pairs,
+                    )
+                    .map_err(|error| DedupError::Message(error.to_string()))?;
+                }
+                Ok(DownloadOutcome::Insufficient {
+                    successful,
+                    candidates,
+                }) => {
+                    sampling_error = Some(DedupError::Message(format!(
+                        "requested {} complete Metadata media pairs, but only {successful} of {candidates} bounded image-qualified candidates downloaded successfully; raise --sample-candidate-limit (currently {}) to inspect more candidates",
+                        config.sample_pairs, config.sample_candidate_limit
+                    )));
+                }
+                Err(error) => {
+                    sampling_error = Some(DedupError::Message(format!(
+                        "failed to build a complete Metadata media sample: {error}"
+                    )));
                 }
             }
             stage_timings.push(StageTiming {
@@ -265,6 +226,8 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             metadata_threshold: config.metadata_threshold,
             metadata_anchors: config.metadata_anchors,
             sample_pairs: config.sample_pairs,
+            sample_candidate_limit: (config.sample_pairs != 0)
+                .then_some(config.sample_candidate_limit),
             threads: config.threads,
             interned_strings,
             token_uri_postings,

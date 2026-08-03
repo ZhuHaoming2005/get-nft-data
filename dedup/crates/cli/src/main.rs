@@ -44,6 +44,12 @@ struct CommonArgs {
         help = "Explicitly enable bounded contract-pair sampling; Metadata samples require both compared tokens to have image URIs and download those images"
     )]
     sample_pairs: usize,
+    #[arg(
+        long,
+        value_parser = parse_positive_usize,
+        help = "Image-qualified Metadata candidates inspected for --sample-pairs; omission uses max(N*16, N+256) and does not enable sampling by itself"
+    )]
+    sample_candidate_limit: Option<usize>,
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
     #[arg(long, default_value_t = 1_000)]
@@ -89,6 +95,8 @@ fn run() -> Result<(), DedupError> {
     };
     let progress_mode = args.progress;
     let progress_interval_ms = args.progress_interval_ms;
+    let sample_candidate_limit =
+        resolve_sample_candidate_limit(args.sample_pairs, args.sample_candidate_limit)?;
     if let Some(threads) = args.threads {
         rayon::ThreadPoolBuilder::new()
             .num_threads(threads)
@@ -108,6 +116,7 @@ fn run() -> Result<(), DedupError> {
         metadata_threshold: args.metadata_threshold,
         metadata_anchors: args.metadata_anchors,
         sample_pairs: args.sample_pairs,
+        sample_candidate_limit,
         threads: rayon::current_num_threads(),
         run_name,
         run_uri,
@@ -125,6 +134,31 @@ fn run() -> Result<(), DedupError> {
     result
 }
 
+fn resolve_sample_candidate_limit(
+    sample_pairs: usize,
+    requested: Option<usize>,
+) -> Result<usize, DedupError> {
+    if sample_pairs == 0 {
+        return if requested.is_some() {
+            Err(DedupError::Message(
+                "--sample-candidate-limit requires --sample-pairs greater than zero".to_owned(),
+            ))
+        } else {
+            Ok(0)
+        };
+    }
+    let automatic = sample_pairs
+        .saturating_mul(16)
+        .max(sample_pairs.saturating_add(256));
+    let limit = requested.unwrap_or(automatic);
+    if limit < sample_pairs {
+        return Err(DedupError::Message(format!(
+            "--sample-candidate-limit ({limit}) must be at least --sample-pairs ({sample_pairs})"
+        )));
+    }
+    Ok(limit)
+}
+
 fn parse_positive_usize(value: &str) -> Result<usize, String> {
     let parsed = value
         .parse::<usize>()
@@ -138,12 +172,21 @@ fn parse_positive_usize(value: &str) -> Result<usize, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_positive_usize;
+    use super::{parse_positive_usize, resolve_sample_candidate_limit};
 
     #[test]
     fn thread_count_must_be_positive() {
         assert_eq!(parse_positive_usize("64").unwrap(), 64);
         assert!(parse_positive_usize("0").is_err());
         assert!(parse_positive_usize("invalid").is_err());
+    }
+
+    #[test]
+    fn metadata_candidate_limit_is_bounded_and_must_cover_the_target() {
+        assert_eq!(resolve_sample_candidate_limit(0, None).unwrap(), 0);
+        assert!(resolve_sample_candidate_limit(0, Some(10)).is_err());
+        assert_eq!(resolve_sample_candidate_limit(10, None).unwrap(), 266);
+        assert_eq!(resolve_sample_candidate_limit(10, Some(20)).unwrap(), 20);
+        assert!(resolve_sample_candidate_limit(10, Some(9)).is_err());
     }
 }

@@ -323,6 +323,7 @@ fn all_writes_summary_files() {
     assert!(manifest["metadata_direct"]["bm25_iterative_upper_bound_prune_ratio"].is_f64());
     assert!(manifest["metadata_direct"]["matched_profile_pair_ratio"].is_f64());
     assert_eq!(manifest["sample_pairs"], 1);
+    assert_eq!(manifest["sample_candidate_limit"], 257);
     assert_eq!(manifest["threads"], 2);
     assert!(
         manifest["interned_strings"]
@@ -385,6 +386,7 @@ fn omitted_name_threshold_disables_name_and_omitted_anchors_are_unbounded() {
         serde_json::from_slice(&std::fs::read(out.join("run_manifest.json")).unwrap()).unwrap();
     assert!(manifest["name_threshold"].is_null());
     assert!(manifest["metadata_anchors"].is_null());
+    assert!(manifest["sample_candidate_limit"].is_null());
     assert_eq!(manifest["interned_strings"], 0);
 }
 
@@ -514,6 +516,8 @@ fn failed_media_pairs_are_replaced_until_the_target_is_complete() {
             "off",
             "--sample-pairs",
             "1",
+            "--sample-candidate-limit",
+            "6",
         ])
         .status()
         .unwrap();
@@ -526,6 +530,9 @@ fn failed_media_pairs_are_replaced_until_the_target_is_complete() {
     assert_eq!(&rows[0][8], "0x2");
     assert!(out.join("metadata_sample_images/1/1a.png").is_file());
     assert!(out.join("metadata_sample_images/1/1b.png").is_file());
+    let run_manifest: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(out.join("run_manifest.json")).unwrap()).unwrap();
+    assert_eq!(run_manifest["sample_candidate_limit"], 6);
 }
 
 #[test]
