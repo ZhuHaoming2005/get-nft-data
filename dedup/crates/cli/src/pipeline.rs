@@ -169,8 +169,8 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
                 &config.output_dir,
                 &result.image_samples,
                 config.sample_pairs,
+                progress,
             );
-            progress.add_completed(result.image_samples.len() as u64);
             match download {
                 Ok(DownloadOutcome::Complete(downloaded)) => {
                     let final_pairs = retain_downloaded_pairs(result.samples, &downloaded);
@@ -191,6 +191,12 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
                     )));
                 }
                 Err(error) => {
+                    if error
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::Interrupted)
+                    {
+                        return Err(DedupError::Interrupted);
+                    }
                     sampling_error = Some(DedupError::Message(format!(
                         "failed to build a complete Metadata media sample: {error}"
                     )));

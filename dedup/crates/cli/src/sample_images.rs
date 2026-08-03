@@ -1,5 +1,5 @@
 use base64::Engine;
-use dedup_core::MetadataImagePairSample;
+use dedup_core::{MetadataImagePairSample, ProgressObserver};
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -11,13 +11,16 @@ use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
-const DOWNLOAD_WORKERS: usize = 8;
+const DOWNLOAD_WORKERS: usize = 32;
 const MAX_IMAGE_BYTES: u64 = 50 * 1024 * 1024;
-const MAX_ATTEMPTS: usize = 5;
+const MAX_ATTEMPTS: usize = 2;
 const MAX_REDIRECTS: usize = 10;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 
 #[derive(Debug)]
 struct PublicDnsResolver;
@@ -78,6 +81,7 @@ pub fn download_metadata_image_samples(
     output_dir: &Path,
     samples: &[MetadataImagePairSample],
     target: usize,
+    progress: &dyn ProgressObserver,
 ) -> Result<DownloadOutcome, Box<dyn std::error::Error + Send + Sync>> {
     debug_assert!(target > 0);
     fs::create_dir_all(output_dir)?;
@@ -90,17 +94,37 @@ pub fn download_metadata_image_samples(
         .build()?;
     let mut successful = Vec::with_capacity(target);
     for (chunk_index, chunk) in samples.chunks(DOWNLOAD_WORKERS).enumerate() {
-        let staged = pool.install(|| {
+        check_cancelled(progress)?;
+        let attempted = pool.install(|| {
             chunk
                 .par_iter()
                 .enumerate()
-                .filter_map(|(offset, sample)| {
+                .map(|(offset, sample)| {
                     let candidate_index = chunk_index * DOWNLOAD_WORKERS + offset + 1;
-                    stage_pair(&client, sample, candidate_index, staging.path()).ok()
+                    let staged = stage_pair(
+                        &client,
+                        sample,
+                        candidate_index,
+                        staging.path(),
+                        progress,
+                    );
+                    if !matches!(staged.as_ref(), Err(error) if error.kind() == std::io::ErrorKind::Interrupted)
+                    {
+                        progress.add_completed(1);
+                    }
+                    staged
                 })
                 .collect::<Vec<_>>()
         });
-        successful.extend(staged);
+        for staged in attempted {
+            match staged {
+                Ok(staged) => successful.push(staged),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    return Err(error.into());
+                }
+                Err(_) => {}
+            }
+        }
         if successful.len() >= target {
             break;
         }
@@ -146,7 +170,8 @@ pub fn download_metadata_image_samples(
 
 fn build_http_client() -> Result<Client, reqwest::Error> {
     Client::builder()
-        .timeout(Duration::from_secs(30))
+        .connect_timeout(CONNECT_TIMEOUT)
+        .timeout(REQUEST_TIMEOUT)
         .user_agent("dedup-metadata-image-sampler/1.0")
         .redirect(Policy::none())
         .no_proxy()
@@ -159,13 +184,16 @@ fn stage_pair(
     sample: &MetadataImagePairSample,
     candidate_index: usize,
     staging_root: &Path,
+    progress: &dyn ProgressObserver,
 ) -> Result<StagedPair, std::io::Error> {
+    check_cancelled(progress)?;
     let row_dir = staging_root.join(format!("candidate-{candidate_index}"));
     fs::create_dir(&row_dir)?;
-    let image_a = download_image(client, &sample.image_uri_a)?;
+    let image_a = download_image(client, &sample.image_uri_a, progress)?;
     let file_a = row_dir.join(format!("a{}", image_a.suffix));
     atomic_write(&file_a, &image_a.bytes)?;
-    let image_b = download_image(client, &sample.image_uri_b)?;
+    check_cancelled(progress)?;
+    let image_b = download_image(client, &sample.image_uri_b, progress)?;
     let file_b = row_dir.join(format!("b{}", image_b.suffix));
     atomic_write(&file_b, &image_b.bytes)?;
     Ok(StagedPair {
@@ -185,14 +213,20 @@ fn relative_image_path(index: usize, path: &Path) -> String {
     format!("metadata_sample_images/{index}/{file_name}")
 }
 
-fn download_image(client: &Client, image_uri: &str) -> Result<DownloadedImage, std::io::Error> {
+fn download_image(
+    client: &Client,
+    image_uri: &str,
+    progress: &dyn ProgressObserver,
+) -> Result<DownloadedImage, std::io::Error> {
+    check_cancelled(progress)?;
     if let Some(data) = image_uri.trim().strip_prefix("data:") {
         return decode_data_image(data);
     }
     let url = normalize_image_uri(image_uri)?;
     let mut last_error = None;
     for attempt in 0..MAX_ATTEMPTS {
-        match send_public_get(client, &url) {
+        check_cancelled(progress)?;
+        match send_public_get(client, &url, progress) {
             Ok((response, final_url)) if response.status().is_success() => {
                 if response
                     .content_length()
@@ -206,8 +240,7 @@ fn download_image(client: &Client, image_uri: &str) -> Result<DownloadedImage, s
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or("")
                     .to_owned();
-                let mut bytes = Vec::new();
-                response.take(MAX_IMAGE_BYTES + 1).read_to_end(&mut bytes)?;
+                let bytes = read_response_body(response, progress)?;
                 if bytes.len() as u64 > MAX_IMAGE_BYTES {
                     return Err(std::io::Error::other("image exceeds 50 MiB limit"));
                 }
@@ -226,9 +259,14 @@ fn download_image(client: &Client, image_uri: &str) -> Result<DownloadedImage, s
                 if !retryable || attempt + 1 == MAX_ATTEMPTS {
                     break;
                 }
-                std::thread::sleep(Duration::from_secs(
-                    retry_after.unwrap_or(1_u64 << attempt.min(5)).min(30),
-                ));
+                cancellable_sleep(
+                    Duration::from_secs(
+                        retry_after
+                            .unwrap_or(1_u64 << attempt.min(2))
+                            .min(MAX_RETRY_DELAY.as_secs()),
+                    ),
+                    progress,
+                )?;
             }
             Err(error) => {
                 if error.kind() == std::io::ErrorKind::PermissionDenied
@@ -240,7 +278,10 @@ fn download_image(client: &Client, image_uri: &str) -> Result<DownloadedImage, s
                 if attempt + 1 == MAX_ATTEMPTS {
                     break;
                 }
-                std::thread::sleep(Duration::from_secs(1_u64 << attempt.min(5)));
+                cancellable_sleep(
+                    Duration::from_secs(1_u64 << attempt.min(2)).min(MAX_RETRY_DELAY),
+                    progress,
+                )?;
             }
         }
     }
@@ -252,10 +293,12 @@ fn download_image(client: &Client, image_uri: &str) -> Result<DownloadedImage, s
 fn send_public_get(
     client: &Client,
     initial_url: &str,
+    progress: &dyn ProgressObserver,
 ) -> Result<(reqwest::blocking::Response, String), std::io::Error> {
     let mut current = Url::parse(initial_url)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     for redirect in 0..=MAX_REDIRECTS {
+        check_cancelled(progress)?;
         validate_request_url(&current)?;
         let response = client
             .get(current.clone())
@@ -283,6 +326,45 @@ fn send_public_get(
         })?;
     }
     unreachable!("redirect loop returns or errors at its bound")
+}
+
+fn read_response_body(
+    response: reqwest::blocking::Response,
+    progress: &dyn ProgressObserver,
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut reader = response.take(MAX_IMAGE_BYTES + 1);
+    let mut bytes = Vec::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        check_cancelled(progress)?;
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        bytes.extend_from_slice(&buffer[..read]);
+    }
+    Ok(bytes)
+}
+
+fn cancellable_sleep(
+    duration: Duration,
+    progress: &dyn ProgressObserver,
+) -> Result<(), std::io::Error> {
+    let deadline = Instant::now() + duration;
+    loop {
+        check_cancelled(progress)?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(());
+        }
+        std::thread::sleep(remaining.min(Duration::from_millis(100)));
+    }
+}
+
+fn check_cancelled(progress: &dyn ProgressObserver) -> Result<(), std::io::Error> {
+    progress
+        .check_cancelled()
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::Interrupted, error.to_string()))
 }
 
 fn is_followed_redirect(status: StatusCode) -> bool {
@@ -553,6 +635,32 @@ fn write_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use dedup_core::{DedupError, NoopProgress};
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Default)]
+    struct CountingProgress(AtomicU64);
+
+    impl ProgressObserver for CountingProgress {
+        fn set_stage(&self, _stage: &str) {}
+        fn begin_phase(&self, _phase: &str, _total: Option<u64>) {}
+        fn set_total(&self, _total: Option<u64>) {}
+        fn add_completed(&self, delta: u64) {
+            self.0.fetch_add(delta, Ordering::Relaxed);
+        }
+    }
+
+    struct CancelledProgress;
+
+    impl ProgressObserver for CancelledProgress {
+        fn set_stage(&self, _stage: &str) {}
+        fn begin_phase(&self, _phase: &str, _total: Option<u64>) {}
+        fn set_total(&self, _total: Option<u64>) {}
+        fn add_completed(&self, _delta: u64) {}
+        fn check_cancelled(&self) -> Result<(), DedupError> {
+            Err(DedupError::Interrupted)
+        }
+    }
 
     fn sample(address: &str, image_uri: &str) -> MetadataImagePairSample {
         MetadataImagePairSample {
@@ -603,7 +711,8 @@ mod tests {
     fn decodes_original_data_image_bytes() {
         let expected = b"\x89PNG\r\n\x1a\n".to_vec();
         let client = build_http_client().unwrap();
-        let image = download_image(&client, "data:image/png;base64,iVBORw0KGgo=").unwrap();
+        let image =
+            download_image(&client, "data:image/png;base64,iVBORw0KGgo=", &NoopProgress).unwrap();
         assert_eq!(image.suffix, ".png");
         assert_eq!(image.bytes, expected);
     }
@@ -635,7 +744,7 @@ mod tests {
 
         let client = build_http_client().unwrap();
         assert_eq!(
-            send_public_get(&client, "http://127.0.0.1/image.png")
+            send_public_get(&client, "http://127.0.0.1/image.png", &NoopProgress,)
                 .unwrap_err()
                 .kind(),
             std::io::ErrorKind::PermissionDenied
@@ -658,12 +767,15 @@ mod tests {
             sample("0xfail", "unsupported://image"),
             sample("0xok", good),
         ];
-        let outcome = download_metadata_image_samples(temp.path(), &candidates, 1).unwrap();
+        let progress = CountingProgress::default();
+        let outcome =
+            download_metadata_image_samples(temp.path(), &candidates, 1, &progress).unwrap();
         let DownloadOutcome::Complete(selected) = outcome else {
             panic!("a complete fallback pair should have been selected");
         };
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].contract_a_address, "0xok");
+        assert_eq!(progress.0.load(Ordering::Relaxed), 2);
         assert!(
             temp.path()
                 .join("metadata_sample_images/1/1a.png")
@@ -683,7 +795,8 @@ mod tests {
     fn insufficient_candidates_do_not_publish_partial_output() {
         let temp = tempfile::tempdir().unwrap();
         let candidates = [sample("0xok", "data:image/png;base64,iVBORw0KGgo=")];
-        let outcome = download_metadata_image_samples(temp.path(), &candidates, 2).unwrap();
+        let outcome =
+            download_metadata_image_samples(temp.path(), &candidates, 2, &NoopProgress).unwrap();
         let DownloadOutcome::Insufficient {
             successful,
             candidates,
@@ -693,6 +806,30 @@ mod tests {
         };
         assert_eq!(successful, 1);
         assert_eq!(candidates, 1);
+        assert!(!temp.path().join("metadata_image_samples.csv").exists());
+        assert!(!temp.path().join("metadata_sample_images").exists());
+    }
+
+    #[test]
+    fn cancellation_stops_before_starting_candidate_downloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let candidates = [sample("0xcancelled", "data:image/png;base64,iVBORw0KGgo=")];
+        let error = match download_metadata_image_samples(
+            temp.path(),
+            &candidates,
+            1,
+            &CancelledProgress,
+        ) {
+            Ok(_) => panic!("cancelled download unexpectedly completed"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .expect("cancellation remains an I/O interruption")
+                .kind(),
+            std::io::ErrorKind::Interrupted
+        );
         assert!(!temp.path().join("metadata_image_samples.csv").exists());
         assert!(!temp.path().join("metadata_sample_images").exists());
     }
