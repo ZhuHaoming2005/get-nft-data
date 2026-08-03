@@ -23,10 +23,12 @@ pub struct MetadataImagePairSample {
     pub contract_a_address: String,
     pub token_id_a: String,
     pub image_uri_a: String,
+    pub metadata_json_a: String,
     pub contract_b_chain: String,
     pub contract_b_address: String,
     pub token_id_b: String,
     pub image_uri_b: String,
+    pub metadata_json_b: String,
 }
 
 pub fn run_metadata(

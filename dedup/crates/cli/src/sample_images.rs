@@ -6,6 +6,7 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{CONTENT_TYPE, LOCATION, RETRY_AFTER};
 use reqwest::redirect::Policy;
 use reqwest::{StatusCode, Url};
+use serde::Serialize;
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -47,6 +48,8 @@ struct DownloadRow {
     error_a: String,
     file_b: String,
     error_b: String,
+    record_a: String,
+    record_b: String,
 }
 
 struct StagedPair {
@@ -55,6 +58,16 @@ struct StagedPair {
     suffix_a: &'static str,
     file_b: PathBuf,
     suffix_b: &'static str,
+}
+
+#[derive(Serialize)]
+struct NftSampleRecord<'a> {
+    chain: &'a str,
+    contract_address: &'a str,
+    token_id: &'a str,
+    image_uri: &'a str,
+    image_file: &'a str,
+    metadata: serde_json::Value,
 }
 
 pub enum DownloadOutcome {
@@ -149,12 +162,44 @@ pub fn download_metadata_image_samples(
         let destination_b = row_dir.join(format!("{index}b{}", staged.suffix_b));
         fs::rename(staged.file_a, &destination_a)?;
         fs::rename(staged.file_b, &destination_b)?;
+        let file_name_a = destination_a
+            .file_name()
+            .expect("published image always has a file name")
+            .to_string_lossy();
+        let file_name_b = destination_b
+            .file_name()
+            .expect("published image always has a file name")
+            .to_string_lossy();
+        write_nft_record(
+            &row_dir.join(format!("{index}a.json")),
+            NftSampleRecord {
+                chain: &staged.sample.contract_a_chain,
+                contract_address: &staged.sample.contract_a_address,
+                token_id: &staged.sample.token_id_a,
+                image_uri: &staged.sample.image_uri_a,
+                image_file: &file_name_a,
+                metadata: serde_json::from_str(&staged.sample.metadata_json_a)?,
+            },
+        )?;
+        write_nft_record(
+            &row_dir.join(format!("{index}b.json")),
+            NftSampleRecord {
+                chain: &staged.sample.contract_b_chain,
+                contract_address: &staged.sample.contract_b_address,
+                token_id: &staged.sample.token_id_b,
+                image_uri: &staged.sample.image_uri_b,
+                image_file: &file_name_b,
+                metadata: serde_json::from_str(&staged.sample.metadata_json_b)?,
+            },
+        )?;
         rows.push(DownloadRow {
             index,
             file_a: relative_image_path(index, &destination_a),
             error_a: String::new(),
             file_b: relative_image_path(index, &destination_b),
             error_b: String::new(),
+            record_a: format!("metadata_sample_images/{index}/{index}a.json"),
+            record_b: format!("metadata_sample_images/{index}/{index}b.json"),
         });
         selected.push(staged.sample);
     }
@@ -585,6 +630,15 @@ fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), std::io::Error> {
     Ok(())
 }
 
+fn write_nft_record(
+    path: &Path,
+    record: NftSampleRecord<'_>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = serde_json::to_vec_pretty(&record)?;
+    atomic_write(path, &bytes)?;
+    Ok(())
+}
+
 fn write_manifest(
     output_dir: &Path,
     samples: &[MetadataImagePairSample],
@@ -608,6 +662,8 @@ fn write_manifest(
             "image_uri_b",
             "file_b",
             "error_b",
+            "record_a",
+            "record_b",
         ])?;
         for (sample, row) in samples.iter().zip(rows) {
             writer.write_record([
@@ -624,6 +680,8 @@ fn write_manifest(
                 sample.image_uri_b.clone(),
                 row.file_b.clone(),
                 row.error_b.clone(),
+                row.record_a.clone(),
+                row.record_b.clone(),
             ])?;
         }
         writer.flush()?;
@@ -668,10 +726,12 @@ mod tests {
             contract_a_address: address.to_owned(),
             token_id_a: "1".to_owned(),
             image_uri_a: image_uri.to_owned(),
+            metadata_json_a: r#"{"name":"left"}"#.to_owned(),
             contract_b_chain: "ethereum".to_owned(),
             contract_b_address: format!("{address}-peer"),
             token_id_b: "2".to_owned(),
             image_uri_b: image_uri.to_owned(),
+            metadata_json_b: r#"{"name":"right"}"#.to_owned(),
         }
     }
 
@@ -786,8 +846,38 @@ mod tests {
                 .join("metadata_sample_images/1/1b.png")
                 .is_file()
         );
+        let nft_a: serde_json::Value = serde_json::from_slice(
+            &fs::read(temp.path().join("metadata_sample_images/1/1a.json")).unwrap(),
+        )
+        .unwrap();
+        let nft_b: serde_json::Value = serde_json::from_slice(
+            &fs::read(temp.path().join("metadata_sample_images/1/1b.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(nft_a["contract_address"], "0xok");
+        assert_eq!(nft_a["token_id"], "1");
+        assert_eq!(nft_a["image_file"], "1a.png");
+        assert_eq!(nft_a["metadata"]["name"], "left");
+        assert_eq!(nft_b["contract_address"], "0xok-peer");
+        assert_eq!(nft_b["token_id"], "2");
+        assert_eq!(nft_b["image_file"], "1b.png");
+        assert_eq!(nft_b["metadata"]["name"], "right");
         let mut manifest =
             csv::Reader::from_path(temp.path().join("metadata_image_samples.csv")).unwrap();
+        assert!(
+            manifest
+                .headers()
+                .unwrap()
+                .iter()
+                .any(|field| field == "record_a")
+        );
+        assert!(
+            manifest
+                .headers()
+                .unwrap()
+                .iter()
+                .any(|field| field == "record_b")
+        );
         assert_eq!(manifest.records().count(), 1);
     }
 

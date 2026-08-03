@@ -422,7 +422,11 @@ impl MetadataImageSampler {
         }
     }
 
-    fn into_samples(self, store: &EntityStore) -> Vec<MetadataImagePairSample> {
+    fn into_samples(
+        self,
+        store: &EntityStore,
+        image_metadata: &AHashMap<NftId, String>,
+    ) -> Vec<MetadataImagePairSample> {
         let mut pairs = self.retained.into_values().collect::<Vec<_>>();
         pairs.sort_unstable();
         pairs
@@ -434,15 +438,19 @@ impl MetadataImageSampler {
                 let nft_b = &store.nfts[pair.nft_b as usize];
                 let image_uri_a = store.string(nft_a.image_uri_id?).to_owned();
                 let image_uri_b = store.string(nft_b.image_uri_id?).to_owned();
+                let metadata_json_a = image_metadata.get(&pair.nft_a)?.clone();
+                let metadata_json_b = image_metadata.get(&pair.nft_b)?.clone();
                 Some(MetadataImagePairSample {
                     contract_a_chain: store.chain_name(contract_a.chain_id).to_owned(),
                     contract_a_address: contract_a.address.clone(),
                     token_id_a: nft_a.token_id.clone(),
                     image_uri_a,
+                    metadata_json_a,
                     contract_b_chain: store.chain_name(contract_b.chain_id).to_owned(),
                     contract_b_address: contract_b.address.clone(),
                     token_id_b: nft_b.token_id.clone(),
                     image_uri_b,
+                    metadata_json_b,
                 })
             })
             .collect()
@@ -1217,6 +1225,7 @@ pub fn run_direct_releasing_with_samples(
         .map(|(stats, _, _)| (stats, DuplicatePairSamples::default(), Vec::new()));
     }
 
+    let image_metadata = build_image_metadata(store, &index)?;
     store.release_metadata_records();
     let result = run_prepared_direct(
         store,
@@ -1228,12 +1237,40 @@ pub fn run_direct_releasing_with_samples(
         sample_size,
     );
     let result = result.map(|(stats, _, image_samples)| {
-        let image_samples = image_samples.into_samples(store);
+        let image_samples = image_samples.into_samples(store, &image_metadata);
         let contract_samples = contract_samples_from_images(&image_samples);
         (stats, contract_samples, image_samples)
     });
     store.release_metadata();
     result
+}
+
+fn build_image_metadata(
+    store: &EntityStore,
+    index: &DirectIndex,
+) -> Result<AHashMap<NftId, String>, DedupError> {
+    let witnesses = index.image_witnesses.as_ref().ok_or_else(|| {
+        DedupError::invalid("metadata", "image sampling has no image witness index")
+    })?;
+    let mut metadata = AHashMap::with_capacity(witnesses.len());
+    for &nft_id in witnesses.values() {
+        if metadata.contains_key(&nft_id) {
+            continue;
+        }
+        let nft = &store.nfts[nft_id as usize];
+        let contract = &store.contracts[nft.contract_id as usize];
+        let canonical_json = contract
+            .metadata_by_token
+            .iter()
+            .find(|record| record.token_id == nft.token_id)
+            .ok_or_else(|| {
+                DedupError::invalid("metadata", "image witness has no matching metadata record")
+            })?
+            .canonical_json
+            .clone();
+        metadata.insert(nft_id, canonical_json);
+    }
+    Ok(metadata)
 }
 
 fn contract_samples_from_images(image_samples: &[MetadataImagePairSample]) -> DuplicatePairSamples {
@@ -7494,6 +7531,8 @@ mod tests {
         assert_eq!(image_samples[0].token_id_b, "2");
         assert!(image_samples[0].image_uri_a.contains("images.example"));
         assert!(image_samples[0].image_uri_b.contains("images.example"));
+        assert_eq!(image_samples[0].metadata_json_a, r#"{"token":"two"}"#);
+        assert_eq!(image_samples[0].metadata_json_b, r#"{"token":"two"}"#);
         assert_ne!(
             image_samples[0].contract_a_address,
             image_samples[0].contract_b_address

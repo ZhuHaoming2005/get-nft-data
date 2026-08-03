@@ -193,12 +193,16 @@ fn all_writes_summary_files() {
             "image_uri_b",
             "file_b",
             "error_b",
+            "record_a",
+            "record_b",
         ]
         .as_slice()
     );
     assert_eq!(image_reader.records().count(), 1);
     assert!(out.join("metadata_sample_images/1/1a.png").is_file());
     assert!(out.join("metadata_sample_images/1/1b.png").is_file());
+    assert!(out.join("metadata_sample_images/1/1a.json").is_file());
+    assert!(out.join("metadata_sample_images/1/1b.json").is_file());
     for dimension in ["name", "metadata"] {
         for (suffix, group_columns) in [
             ("intra_chain", &["chain"][..]),
