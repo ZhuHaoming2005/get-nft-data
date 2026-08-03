@@ -15,6 +15,8 @@ ctrlc = { workspace = true }
 dedup_core.workspace = true
 csv.workspace = true
 rayon.workspace = true
+reqwest.workspace = true
+base64.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

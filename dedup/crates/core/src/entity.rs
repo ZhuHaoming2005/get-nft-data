@@ -385,13 +385,17 @@ impl EntityStore {
     }
 
     pub(crate) fn release_metadata_payloads(&mut self) {
-        self.contracts.par_iter_mut().for_each(|contract| {
-            contract.metadata_by_token = Vec::new();
-        });
+        self.release_metadata_records();
         self.nfts
             .par_iter_mut()
             .for_each(|nft| nft.token_id = String::new());
         self.nft_index = AHashMap::new();
+    }
+
+    pub(crate) fn release_metadata_records(&mut self) {
+        self.contracts.par_iter_mut().for_each(|contract| {
+            contract.metadata_by_token = Vec::new();
+        });
     }
 
     pub(crate) fn release_contract_addresses(&mut self) {
@@ -401,16 +405,47 @@ impl EntityStore {
     }
 
     pub fn release_completed_dimension_data(&mut self) {
+        self.release_completed_dimension_data_with_image_retention(false);
+    }
+
+    pub fn release_completed_dimension_data_preserving_image_uris(&mut self) {
+        self.release_completed_dimension_data_with_image_retention(true);
+    }
+
+    fn release_completed_dimension_data_with_image_retention(&mut self, preserve_images: bool) {
         self.token_uri_postings = Vec::new();
         self.image_uri_postings = Vec::new();
-        self.strings = Vec::new();
+        if preserve_images {
+            let mut remap = AHashMap::<StringId, StringId>::new();
+            let mut image_strings = Vec::new();
+            for nft in &mut self.nfts {
+                let Some(old_id) = nft.image_uri_id else {
+                    continue;
+                };
+                let new_id = if let Some(&id) = remap.get(&old_id) {
+                    id
+                } else {
+                    let id = StringId::try_from(image_strings.len())
+                        .expect("image URI count was already bounded by StringId");
+                    image_strings.push(self.strings[old_id as usize].clone());
+                    remap.insert(old_id, id);
+                    id
+                };
+                nft.image_uri_id = Some(new_id);
+            }
+            self.strings = image_strings;
+        } else {
+            self.strings = Vec::new();
+        }
         self.string_ids = AHashMap::new();
         self.chain_ids = AHashMap::new();
         self.contract_index = AHashMap::new();
         self.nfts.par_iter_mut().for_each(|nft| {
             nft.name_id = None;
             nft.token_uri_id = None;
-            nft.image_uri_id = None;
+            if !preserve_images {
+                nft.image_uri_id = None;
+            }
         });
     }
 

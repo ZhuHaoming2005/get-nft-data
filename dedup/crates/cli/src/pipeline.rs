@@ -3,10 +3,15 @@ use crate::report::{
     PhaseTiming, ReportPartition, ReportRequest, StageTiming, write_duplicate_pair_samples,
     write_partition_reports, write_reports,
 };
-use dedup_core::{
-    DedupError, Dimension, LoadOptions, ProgressObserver, SummaryAccumulator,
-    load_entities_with_options, run_metadata_with_samples, run_name_with_samples, run_uri,
+use crate::sample_images::{
+    DownloadOutcome, clear_published_metadata_image_samples, download_metadata_image_samples,
 };
+use dedup_core::{
+    DedupError, Dimension, DuplicatePairSample, DuplicatePairSamples, LoadOptions,
+    MetadataImagePairSample, ProgressObserver, SummaryAccumulator, load_entities_with_options,
+    run_metadata, run_metadata_with_samples, run_name, run_name_with_samples, run_uri,
+};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Instant;
 
@@ -51,13 +56,19 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
     );
     load_options.load_names = config.run_name && config.name_threshold.is_some();
     load_options.load_token_uris = config.run_uri;
-    load_options.load_image_uris = config.run_uri;
+    let sample_metadata_images = config.run_metadata && config.sample_pairs != 0;
+    load_options.load_image_uris = config.run_uri || sample_metadata_images;
     load_options.load_metadata = config.run_metadata;
     let stage_started = Instant::now();
     let mut store = load_entities_with_options(&config.inputs, &load_options, progress)?;
     let interned_strings = store.strings.len();
     let token_uri_postings = store.token_uri_postings.len();
     let image_uri_postings = store.image_uri_postings.len();
+    let max_metadata_pair_candidates = store
+        .contracts
+        .len()
+        .saturating_mul(store.contracts.len().saturating_sub(1))
+        / 2;
     let mut stage_timings = vec![StageTiming {
         stage: "load",
         elapsed_secs: stage_started.elapsed().as_secs_f64(),
@@ -66,13 +77,18 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
     let mut acc = SummaryAccumulator::default();
     if let (true, Some(name_threshold)) = (config.run_name, config.name_threshold) {
         let stage_started = Instant::now();
-        let samples = run_name_with_samples(
-            &store,
-            name_threshold / 100.0,
-            &mut acc,
-            progress,
-            config.sample_pairs,
-        )?;
+        let samples = if config.sample_pairs == 0 {
+            run_name(&store, name_threshold / 100.0, &mut acc, progress)?;
+            DuplicatePairSamples::default()
+        } else {
+            run_name_with_samples(
+                &store,
+                name_threshold / 100.0,
+                &mut acc,
+                progress,
+                config.sample_pairs,
+            )?
+        };
         stage_timings.push(StageTiming {
             stage: "name",
             elapsed_secs: stage_started.elapsed().as_secs_f64(),
@@ -85,8 +101,10 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             "name",
             progress,
         )?;
-        write_duplicate_pair_samples(&config.output_dir, "name_duplicate_pairs.csv", &samples)
-            .map_err(|error| DedupError::Message(error.to_string()))?;
+        if config.sample_pairs != 0 {
+            write_duplicate_pair_samples(&config.output_dir, "name_duplicate_pairs.csv", &samples)
+                .map_err(|error| DedupError::Message(error.to_string()))?;
+        }
         acc.seal_dimension(Dimension::Name);
     }
     if config.run_uri {
@@ -107,8 +125,13 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
         acc.seal_dimension(Dimension::TokenUri);
         acc.seal_dimension(Dimension::ImageUri);
     }
-    store.release_completed_dimension_data();
+    if sample_metadata_images {
+        store.release_completed_dimension_data_preserving_image_uris();
+    } else {
+        store.release_completed_dimension_data();
+    }
     let mut metadata_stats = None;
+    let mut sampling_error = None;
     if config.run_metadata {
         let stage_started = Instant::now();
         let evm: std::collections::HashSet<String> = config
@@ -116,26 +139,107 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
             .iter()
             .map(|c| c.trim().to_ascii_lowercase())
             .collect();
-        let result = run_metadata_with_samples(
-            &mut store,
-            &evm,
-            config.metadata_anchors,
-            config.metadata_threshold,
-            &mut acc,
-            progress,
-            config.sample_pairs,
-        )?;
+        let result = if config.sample_pairs == 0 {
+            run_metadata(
+                &mut store,
+                &evm,
+                config.metadata_anchors,
+                config.metadata_threshold,
+                &mut acc,
+                progress,
+            )?
+        } else {
+            run_metadata_with_samples(
+                &mut store,
+                &evm,
+                config.metadata_anchors,
+                config.metadata_threshold,
+                &mut acc,
+                progress,
+                config.sample_pairs,
+            )?
+        };
         metadata_stats = Some(result.stats);
-        write_duplicate_pair_samples(
-            &config.output_dir,
-            "metadata_duplicate_pairs.csv",
-            &result.samples,
-        )
-        .map_err(|error| DedupError::Message(error.to_string()))?;
         stage_timings.push(StageTiming {
             stage: "metadata",
             elapsed_secs: stage_started.elapsed().as_secs_f64(),
         });
+        if sample_metadata_images {
+            let stage_started = Instant::now();
+            clear_previous_metadata_samples(&config.output_dir)?;
+            let mut candidate_limit = config.sample_pairs;
+            let mut candidate_samples = result.image_samples;
+            let mut candidate_pairs = result.samples;
+            loop {
+                progress.set_stage("sample_images");
+                progress.begin_phase("download", Some(candidate_samples.len() as u64));
+                let download = download_metadata_image_samples(
+                    &config.output_dir,
+                    &candidate_samples,
+                    config.sample_pairs,
+                );
+                progress.add_completed(candidate_samples.len() as u64);
+                match download {
+                    Ok(DownloadOutcome::Complete(downloaded)) => {
+                        let final_pairs = retain_downloaded_pairs(candidate_pairs, &downloaded);
+                        write_duplicate_pair_samples(
+                            &config.output_dir,
+                            "metadata_duplicate_pairs.csv",
+                            &final_pairs,
+                        )
+                        .map_err(|error| DedupError::Message(error.to_string()))?;
+                        break;
+                    }
+                    Ok(DownloadOutcome::Insufficient {
+                        successful,
+                        candidates,
+                    }) => {
+                        if candidate_limit >= max_metadata_pair_candidates {
+                            sampling_error = Some(DedupError::Message(format!(
+                                "requested {} complete Metadata media pairs, but only {successful} of {candidates} image-qualified pairs downloaded successfully",
+                                config.sample_pairs
+                            )));
+                            break;
+                        }
+                        let next_limit = candidate_limit
+                            .saturating_mul(2)
+                            .max(candidate_limit.saturating_add(1))
+                            .min(max_metadata_pair_candidates);
+                        let mut retry_options = load_options.clone();
+                        retry_options.load_names = false;
+                        retry_options.load_token_uris = false;
+                        retry_options.load_image_uris = true;
+                        retry_options.load_metadata = true;
+                        let mut retry_store =
+                            load_entities_with_options(&config.inputs, &retry_options, progress)?;
+                        retry_store.release_completed_dimension_data_preserving_image_uris();
+                        let mut retry_acc = SummaryAccumulator::default();
+                        let retry_result = run_metadata_with_samples(
+                            &mut retry_store,
+                            &evm,
+                            config.metadata_anchors,
+                            config.metadata_threshold,
+                            &mut retry_acc,
+                            progress,
+                            next_limit,
+                        )?;
+                        candidate_limit = next_limit;
+                        candidate_samples = retry_result.image_samples;
+                        candidate_pairs = retry_result.samples;
+                    }
+                    Err(error) => {
+                        sampling_error = Some(DedupError::Message(format!(
+                            "failed to build a complete Metadata media sample: {error}"
+                        )));
+                        break;
+                    }
+                }
+            }
+            stage_timings.push(StageTiming {
+                stage: "sample_images",
+                elapsed_secs: stage_started.elapsed().as_secs_f64(),
+            });
+        }
     }
 
     let phase_timings = progress
@@ -173,6 +277,68 @@ pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupEr
     )
     .map_err(|error| DedupError::Message(error.to_string()))?;
     progress.add_completed(3);
+    if let Some(error) = sampling_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
+}
+
+fn retain_downloaded_pairs(
+    mut pairs: DuplicatePairSamples,
+    downloaded: &[MetadataImagePairSample],
+) -> DuplicatePairSamples {
+    let retained = downloaded
+        .iter()
+        .map(|sample| {
+            (
+                sample.contract_a_chain.clone(),
+                sample.contract_a_address.clone(),
+                sample.contract_b_chain.clone(),
+                sample.contract_b_address.clone(),
+            )
+        })
+        .collect::<HashSet<_>>();
+    let keep = |pair: &DuplicatePairSample| {
+        retained.contains(&(
+            pair.contract_a_chain.clone(),
+            pair.contract_a_address.clone(),
+            pair.contract_b_chain.clone(),
+            pair.contract_b_address.clone(),
+        ))
+    };
+    pairs.all_chains.retain(&keep);
+    for scope in &mut pairs.intra_chain {
+        scope.pairs.retain(&keep);
+    }
+    pairs.intra_chain.retain(|scope| !scope.pairs.is_empty());
+    for scope in &mut pairs.chain_pairs {
+        scope.pairs.retain(&keep);
+    }
+    pairs.chain_pairs.retain(|scope| !scope.pairs.is_empty());
+    for scope in &mut pairs.cross_chain_summary {
+        scope.pairs.retain(&keep);
+    }
+    pairs
+        .cross_chain_summary
+        .retain(|scope| !scope.pairs.is_empty());
+    pairs
+}
+
+fn clear_previous_metadata_samples(output_dir: &std::path::Path) -> Result<(), DedupError> {
+    clear_published_metadata_image_samples(output_dir)
+        .map_err(|error| DedupError::Message(error.to_string()))?;
+    for name in [
+        "metadata_duplicate_pairs.csv",
+        "metadata_duplicate_pairs_intra_chain.csv",
+        "metadata_duplicate_pairs_chain_matrix.csv",
+        "metadata_duplicate_pairs_cross_chain_summary.csv",
+    ] {
+        let path = output_dir.join(name);
+        if path.exists() {
+            std::fs::remove_file(path).map_err(|error| DedupError::Message(error.to_string()))?;
+        }
+    }
     Ok(())
 }
 

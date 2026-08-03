@@ -1,6 +1,7 @@
 mod pipeline;
 mod progress;
 mod report;
+mod sample_images;
 
 use clap::{Parser, Subcommand};
 use dedup_core::DedupError;
@@ -39,8 +40,8 @@ struct CommonArgs {
     metadata_anchors: Option<usize>,
     #[arg(
         long,
-        default_value_t = 1_000,
-        help = "Random duplicate contract pairs written per Name/Metadata report group"
+        default_value_t = 0,
+        help = "Explicitly enable bounded contract-pair sampling; Metadata samples require both compared tokens to have image URIs and download those images"
     )]
     sample_pairs: usize,
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]

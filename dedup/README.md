@@ -21,7 +21,18 @@ cargo build --release --manifest-path dedup/Cargo.toml
   --evm-chains base,ethereum,polygon
 ```
 
-默认不执行 Name 查重；只有显式传入 `--name-threshold <百分比>` 时才执行。默认不限制 Metadata anchor 数量，所有具有有效 Metadata 的 NFT 都参与查重；如需主动限制，显式传入 `--metadata-anchors <数量>`。Name 与 Metadata 各自按“各链单链、链对跨链、各链跨链汇总、全链汇总”分别随机导出最多 1000 个已确认的重复合约对；使用 `--sample-pairs <数量>` 修改每个分组的上限，设为 `0` 可关闭抽样。
+默认不执行 Name 查重；只有显式传入 `--name-threshold <百分比>` 时才执行。默认不限制 Metadata anchor 数量，所有具有有效 Metadata 的 NFT 都参与查重；如需主动限制，显式传入 `--metadata-anchors <数量>`。
+
+抽样默认关闭，不加载抽样所需的图片 URI，也不发起图片网络请求。显式传入 `--sample-pairs <正整数>` 后，Name 与 Metadata 的合约对抽样才作为一个整体启用。Name 导出有界的已确认重复合约对；Metadata 则从实际命中比较所选择的两个 token 中抽样，并且只有双方 `image_uri_norm` 均非空且两张媒体均成功下载的合约对，才会同时写入 `metadata_duplicate_pairs*.csv`、`metadata_image_samples.csv` 和 `metadata_sample_images/`。任意一侧下载失败会舍弃整对并扩大候选集继续补位，成功运行时最终恰好得到 `--sample-pairs N` 对完整媒体；如果穷尽合格重复对仍不足 N，命令会在正常写出查重统计后明确报错，且不会发布本轮不完整的媒体样本。HTTP、IPFS、Arweave 和 base64 `data:image/...` URI 均支持，图片不转码。
+
+```bash
+./dedup run-metadata \
+  --input ./data/ethereum.parquet \
+  --output-dir ./out \
+  --chains ethereum \
+  --evm-chains ethereum \
+  --sample-pairs 100
+```
 
 程序不设置内存预算或内存上限，不会因内存估算切换算法、降低并行度、跳过数据或输出内存警告。索引仍使用紧凑整数、字符串驻留、分块临时缓冲和流式候选评分来减少实际内存占用；若物理内存不足，由系统分配失败直接终止。
 
@@ -55,7 +66,9 @@ python3 scripts/compare_smt.py \
 - `name_duplicate_pairs.csv`（Name 全链汇总随机样本）
 - `name_duplicate_pairs_intra_chain.csv` / `name_duplicate_pairs_chain_matrix.csv` / `name_duplicate_pairs_cross_chain_summary.csv`
 - `uri_summary.csv` / `uri_chain_matrix.csv`（URI 阶段完成后立即提交）
-- `metadata_duplicate_pairs.csv`（Metadata 全链汇总随机样本）
+- `metadata_duplicate_pairs.csv`（双方实际比较 token 均有图片 URI 的 Metadata 全链样本）
 - `metadata_duplicate_pairs_intra_chain.csv` / `metadata_duplicate_pairs_chain_matrix.csv` / `metadata_duplicate_pairs_cross_chain_summary.csv`
+- `metadata_image_samples.csv`（最终成功样本的实际 Metadata 比较 token、图片 URI 与下载路径；仅显式抽样时生成）
+- `metadata_sample_images/<序号>/<序号>a.<原扩展名>` / `<序号>b.<原扩展名>`（仅成功下载时生成）
 
 设计说明：`docs/superpowers/specs/2026-07-18-dedup2-experimental-design.md`

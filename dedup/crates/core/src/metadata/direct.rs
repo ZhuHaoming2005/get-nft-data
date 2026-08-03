@@ -1,3 +1,4 @@
+use super::MetadataImagePairSample;
 use crate::entity::{ChainId, ContractId, Dimension, EntityStore, NftId, ScopeKind};
 use crate::error::DedupError;
 #[cfg(test)]
@@ -8,13 +9,16 @@ use crate::metadata::bm25::{
 };
 use crate::progress::ProgressObserver;
 use crate::radix::{sort_u32_pairs_while, sort_u32_triples_while};
-use crate::sampling::{DuplicatePairSamples, PairSampler, PairSamplingPlan, materialize_samples};
+use crate::sampling::{
+    ChainDuplicatePairSamples, ChainPairDuplicatePairSamples, DuplicatePairSample,
+    DuplicatePairSamples, PairSampler, PairSamplingPlan,
+};
 use crate::scope::{ScopeCounts, ScopeKey};
 use crate::stats::SummaryAccumulator;
 use ahash::{AHashMap, AHasher};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, BinaryHeap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::mem::MaybeUninit;
 use std::sync::Mutex;
@@ -262,6 +266,198 @@ struct DirectIndex {
     eligible_members: u64,
     anchor_count: u64,
     unique_terms: u64,
+    image_witnesses: Option<AHashMap<(ContractId, TokenKeyId, DocumentId), NftId>>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct MetadataImagePair {
+    contract_a: ContractId,
+    nft_a: NftId,
+    contract_b: ContractId,
+    nft_b: NftId,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct MetadataImageSampleEntry {
+    priority: u64,
+    pair: MetadataImagePair,
+}
+
+#[derive(Default)]
+struct MetadataImageSampler {
+    capacity: usize,
+    heap: BinaryHeap<MetadataImageSampleEntry>,
+    retained: AHashMap<(ContractId, ContractId), MetadataImagePair>,
+}
+
+struct MetadataSamplingResult {
+    pairs: PairSampler,
+    images: MetadataImageSampler,
+}
+
+#[derive(Clone)]
+struct CrossSamplingPlan {
+    pairs: PairSamplingPlan,
+    image_sample_size: usize,
+}
+
+impl MetadataImageSampler {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            ..Self::default()
+        }
+    }
+
+    fn enabled(&self) -> bool {
+        self.capacity != 0
+    }
+
+    fn observe(
+        &mut self,
+        left_contract: ContractId,
+        left_nft: NftId,
+        right_contract: ContractId,
+        right_nft: NftId,
+    ) {
+        if self.capacity == 0 || left_contract == right_contract {
+            return;
+        }
+        let (contract_a, nft_a, contract_b, nft_b) = if left_contract < right_contract {
+            (left_contract, left_nft, right_contract, right_nft)
+        } else {
+            (right_contract, right_nft, left_contract, left_nft)
+        };
+        let pair = MetadataImagePair {
+            contract_a,
+            nft_a,
+            contract_b,
+            nft_b,
+        };
+        if let Some(current) = self.retained.get_mut(&(contract_a, contract_b)) {
+            if pair < *current {
+                *current = pair;
+            }
+            return;
+        }
+        let priority =
+            splitmix64_image_sample((u64::from(contract_a) << 32) | u64::from(contract_b));
+        let entry = MetadataImageSampleEntry { priority, pair };
+        if self.heap.len() == self.capacity
+            && self.heap.peek().is_some_and(|current| entry >= *current)
+        {
+            return;
+        }
+        if self.heap.len() == self.capacity {
+            let removed = self
+                .heap
+                .pop()
+                .expect("a full image sample heap is non-empty");
+            self.retained
+                .remove(&(removed.pair.contract_a, removed.pair.contract_b));
+        }
+        self.heap.push(entry);
+        self.retained.insert((contract_a, contract_b), pair);
+    }
+
+    fn observe_cross(
+        &mut self,
+        left: &[(ContractId, NftId)],
+        right: &[(ContractId, NftId)],
+        salt: u64,
+    ) {
+        if !self.enabled() || left.is_empty() || right.is_empty() {
+            return;
+        }
+        let remaining = self.capacity.saturating_sub(self.heap.len()).max(1);
+        let pair_count = left.len().saturating_mul(right.len());
+        if pair_count <= self.capacity.saturating_mul(8) {
+            for &(left_contract, left_nft) in left {
+                for &(right_contract, right_nft) in right {
+                    self.observe(left_contract, left_nft, right_contract, right_nft);
+                }
+            }
+            return;
+        }
+        for attempt in 0..remaining.saturating_mul(6).max(12) {
+            let left_index = image_sample_index(salt, attempt as u64 * 2, left.len());
+            let right_index = image_sample_index(salt, attempt as u64 * 2 + 1, right.len());
+            let (left_contract, left_nft) = left[left_index];
+            let (right_contract, right_nft) = right[right_index];
+            self.observe(left_contract, left_nft, right_contract, right_nft);
+        }
+    }
+
+    fn observe_clique(&mut self, members: &[(ContractId, NftId)], salt: u64) {
+        if !self.enabled() || members.len() < 2 {
+            return;
+        }
+        let remaining = self.capacity.saturating_sub(self.heap.len()).max(1);
+        let pair_count = members.len().saturating_mul(members.len() - 1) / 2;
+        if pair_count <= self.capacity.saturating_mul(8) {
+            for left in 0..members.len() - 1 {
+                for right in left + 1..members.len() {
+                    let (left_contract, left_nft) = members[left];
+                    let (right_contract, right_nft) = members[right];
+                    self.observe(left_contract, left_nft, right_contract, right_nft);
+                }
+            }
+            return;
+        }
+        for attempt in 0..remaining.saturating_mul(8).max(16) {
+            let left = image_sample_index(salt, attempt as u64 * 2, members.len());
+            let mut right = image_sample_index(salt, attempt as u64 * 2 + 1, members.len() - 1);
+            if right >= left {
+                right += 1;
+            }
+            let (left_contract, left_nft) = members[left];
+            let (right_contract, right_nft) = members[right];
+            self.observe(left_contract, left_nft, right_contract, right_nft);
+        }
+    }
+
+    fn merge(&mut self, other: Self) {
+        for pair in other.retained.into_values() {
+            self.observe(pair.contract_a, pair.nft_a, pair.contract_b, pair.nft_b);
+        }
+    }
+
+    fn into_samples(self, store: &EntityStore) -> Vec<MetadataImagePairSample> {
+        let mut pairs = self.retained.into_values().collect::<Vec<_>>();
+        pairs.sort_unstable();
+        pairs
+            .into_iter()
+            .filter_map(|pair| {
+                let contract_a = &store.contracts[pair.contract_a as usize];
+                let contract_b = &store.contracts[pair.contract_b as usize];
+                let nft_a = &store.nfts[pair.nft_a as usize];
+                let nft_b = &store.nfts[pair.nft_b as usize];
+                let image_uri_a = store.string(nft_a.image_uri_id?).to_owned();
+                let image_uri_b = store.string(nft_b.image_uri_id?).to_owned();
+                Some(MetadataImagePairSample {
+                    contract_a_chain: store.chain_name(contract_a.chain_id).to_owned(),
+                    contract_a_address: contract_a.address.clone(),
+                    token_id_a: nft_a.token_id.clone(),
+                    image_uri_a,
+                    contract_b_chain: store.chain_name(contract_b.chain_id).to_owned(),
+                    contract_b_address: contract_b.address.clone(),
+                    token_id_b: nft_b.token_id.clone(),
+                    image_uri_b,
+                })
+            })
+            .collect()
+    }
+}
+
+fn splitmix64_image_sample(mut value: u64) -> u64 {
+    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
+    value ^ (value >> 31)
+}
+
+fn image_sample_index(salt: u64, ordinal: u64, len: usize) -> usize {
+    splitmix64_image_sample(salt ^ ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15)) as usize % len
 }
 
 impl DirectIndex {
@@ -290,6 +486,29 @@ impl DirectIndex {
 
     fn logical_member_pairs(&self) -> u64 {
         choose_two(self.eligible_members)
+    }
+
+    fn image_member(
+        &self,
+        member: MetadataMember,
+        anchor: (TokenKeyId, DocumentId),
+    ) -> Option<(ContractId, NftId)> {
+        self.image_witnesses
+            .as_ref()?
+            .get(&(member.contract_id, anchor.0, anchor.1))
+            .copied()
+            .map(|nft| (member.contract_id, nft))
+    }
+
+    fn image_members(
+        &self,
+        profile: &ContractProfile,
+        anchor: (TokenKeyId, DocumentId),
+    ) -> Vec<(ContractId, NftId)> {
+        self.members(profile)
+            .iter()
+            .filter_map(|&member| self.image_member(member, anchor))
+            .collect()
     }
 }
 
@@ -933,8 +1152,9 @@ pub fn run_direct(
         acc,
         progress,
         PairSamplingPlan::disabled(),
+        0,
     )
-    .map(|(stats, _)| stats)
+    .map(|(stats, _, _)| stats)
 }
 
 pub fn run_direct_releasing(
@@ -954,8 +1174,9 @@ pub fn run_direct_releasing(
         acc,
         progress,
         PairSamplingPlan::disabled(),
+        0,
     )
-    .map(|(stats, _)| stats)
+    .map(|(stats, _, _)| stats)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -967,8 +1188,21 @@ pub fn run_direct_releasing_with_samples(
     acc: &mut SummaryAccumulator,
     progress: &dyn ProgressObserver,
     sample_size: usize,
-) -> Result<(MetadataStats, DuplicatePairSamples), DedupError> {
-    let index = build_index(store, evm_chains, anchors_k.into(), progress)?;
+) -> Result<
+    (
+        MetadataStats,
+        DuplicatePairSamples,
+        Vec<MetadataImagePairSample>,
+    ),
+    DedupError,
+> {
+    let index = build_index_with_image_witnesses(
+        store,
+        evm_chains,
+        anchors_k.into(),
+        progress,
+        sample_size != 0,
+    )?;
     if sample_size == 0 {
         store.release_metadata();
         return run_prepared_direct(
@@ -978,22 +1212,93 @@ pub fn run_direct_releasing_with_samples(
             acc,
             progress,
             PairSamplingPlan::disabled(),
+            0,
         )
-        .map(|(stats, _)| (stats, DuplicatePairSamples::default()));
+        .map(|(stats, _, _)| (stats, DuplicatePairSamples::default(), Vec::new()));
     }
 
-    store.release_metadata_payloads();
+    store.release_metadata_records();
     let result = run_prepared_direct(
         store,
         index,
         threshold,
         acc,
         progress,
-        PairSamplingPlan::new(store, sample_size),
+        PairSamplingPlan::disabled(),
+        sample_size,
     );
-    let result = result.map(|(stats, samples)| (stats, materialize_samples(store, samples)));
-    store.release_contract_addresses();
+    let result = result.map(|(stats, _, image_samples)| {
+        let image_samples = image_samples.into_samples(store);
+        let contract_samples = contract_samples_from_images(&image_samples);
+        (stats, contract_samples, image_samples)
+    });
+    store.release_metadata();
     result
+}
+
+fn contract_samples_from_images(image_samples: &[MetadataImagePairSample]) -> DuplicatePairSamples {
+    let all_chains = image_samples
+        .iter()
+        .map(|sample| DuplicatePairSample {
+            contract_a_chain: sample.contract_a_chain.clone(),
+            contract_a_address: sample.contract_a_address.clone(),
+            contract_b_chain: sample.contract_b_chain.clone(),
+            contract_b_address: sample.contract_b_address.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut intra_chain = BTreeMap::<String, Vec<DuplicatePairSample>>::new();
+    let mut chain_pairs = BTreeMap::<(String, String), Vec<DuplicatePairSample>>::new();
+    let mut cross_chain_summary = BTreeMap::<String, Vec<DuplicatePairSample>>::new();
+
+    for pair in &all_chains {
+        if pair.contract_a_chain == pair.contract_b_chain {
+            intra_chain
+                .entry(pair.contract_a_chain.clone())
+                .or_default()
+                .push(pair.clone());
+            continue;
+        }
+
+        let (chain_a, chain_b) = if pair.contract_a_chain < pair.contract_b_chain {
+            (&pair.contract_a_chain, &pair.contract_b_chain)
+        } else {
+            (&pair.contract_b_chain, &pair.contract_a_chain)
+        };
+        chain_pairs
+            .entry((chain_a.clone(), chain_b.clone()))
+            .or_default()
+            .push(pair.clone());
+        cross_chain_summary
+            .entry(chain_a.clone())
+            .or_default()
+            .push(pair.clone());
+        cross_chain_summary
+            .entry(chain_b.clone())
+            .or_default()
+            .push(pair.clone());
+    }
+
+    DuplicatePairSamples {
+        all_chains,
+        intra_chain: intra_chain
+            .into_iter()
+            .map(|(chain, pairs)| ChainDuplicatePairSamples { chain, pairs })
+            .collect(),
+        chain_pairs: chain_pairs
+            .into_iter()
+            .map(
+                |((chain_a, chain_b), pairs)| ChainPairDuplicatePairSamples {
+                    chain_a,
+                    chain_b,
+                    pairs,
+                },
+            )
+            .collect(),
+        cross_chain_summary: cross_chain_summary
+            .into_iter()
+            .map(|(chain, pairs)| ChainDuplicatePairSamples { chain, pairs })
+            .collect(),
+    }
 }
 
 fn run_prepared_direct(
@@ -1003,10 +1308,15 @@ fn run_prepared_direct(
     acc: &mut SummaryAccumulator,
     progress: &dyn ProgressObserver,
     sampling: PairSamplingPlan,
-) -> Result<(MetadataStats, PairSampler), DedupError> {
+    image_sample_size: usize,
+) -> Result<(MetadataStats, PairSampler, MetadataImageSampler), DedupError> {
     let eligible_members = index.eligible_members;
     if eligible_members < 2 {
-        return Ok((base_stats(store, &index, 0, 0, 0), sampling.sampler()));
+        return Ok((
+            base_stats(store, &index, 0, 0, 0),
+            sampling.sampler(),
+            MetadataImageSampler::new(image_sample_size),
+        ));
     }
 
     let logical_contract_pairs = index.logical_member_pairs();
@@ -1040,8 +1350,14 @@ fn run_prepared_direct(
     };
     let equivalent_work = equivalent_scoring_work(&index);
     progress.begin_phase("direct_bm25_equivalent", Some(equivalent_work));
-    let mut samples =
-        score_equivalent_profiles(&index, &hits, &stats, progress, scoring_sampling.clone())?;
+    let mut samples = score_equivalent_profiles(
+        &index,
+        &hits,
+        &stats,
+        progress,
+        scoring_sampling.clone(),
+        image_sample_size,
+    )?;
     let (cross_summary, cross_samples) = score_cross_profiles(
         &index,
         &hits,
@@ -1049,13 +1365,17 @@ fn run_prepared_direct(
         &stats,
         progress,
         &cross_profile_plan,
-        scoring_sampling,
+        CrossSamplingPlan {
+            pairs: scoring_sampling,
+            image_sample_size,
+        },
     )?;
     if let Some(full_universe_samples) = full_universe_samples {
-        samples = full_universe_samples;
+        samples.pairs = full_universe_samples;
     } else {
-        samples.merge(cross_samples);
+        samples.pairs.merge(cross_samples.pairs);
     }
+    samples.images.merge(cross_samples.images);
     candidate_stats.prefix_terms = cross_summary.prefix_terms;
     candidate_stats.pair_emissions = cross_summary.pair_emissions;
     candidate_stats.candidate_pairs = cross_summary.pair_count;
@@ -1264,7 +1584,7 @@ fn run_prepared_direct(
     result.bm25_iterative_upper_bound_prune_ratio =
         ratio(result.bm25_iterative_upper_bound_prunes, result.bm25_scores);
     result.matched_profile_pair_ratio = ratio(result.matched_profile_pairs, profile_pair_tasks);
-    Ok((result, samples))
+    Ok((result, samples.pairs, samples.images))
 }
 
 fn sample_all_eligible_contract_pairs(
@@ -1321,6 +1641,16 @@ fn build_index(
     evm_chains: &HashSet<String>,
     anchors_k: impl Into<Option<usize>>,
     progress: &dyn ProgressObserver,
+) -> Result<DirectIndex, DedupError> {
+    build_index_with_image_witnesses(store, evm_chains, anchors_k, progress, false)
+}
+
+fn build_index_with_image_witnesses(
+    store: &EntityStore,
+    evm_chains: &HashSet<String>,
+    anchors_k: impl Into<Option<usize>>,
+    progress: &dyn ProgressObserver,
+    retain_image_witnesses: bool,
 ) -> Result<DirectIndex, DedupError> {
     let anchors_k = anchors_k.into();
     progress.begin_phase("prepare_direct", Some(store.contracts.len() as u64));
@@ -1614,7 +1944,7 @@ fn build_index(
     );
     profiles.par_sort_unstable_by_key(|profile| (profile.max_document(), profile.is_solana));
     let query_profile_count = profiles.len();
-    Ok(DirectIndex {
+    let mut index = DirectIndex {
         documents,
         terms,
         document_context_weights: document_context_weights.into_boxed_slice(),
@@ -1630,7 +1960,62 @@ fn build_index(
         eligible_members: eligible_members.load(Ordering::Relaxed),
         anchor_count: anchor_count.load(Ordering::Relaxed),
         unique_terms,
-    })
+        image_witnesses: None,
+    };
+    if retain_image_witnesses {
+        index.image_witnesses = Some(build_image_witnesses(store, &index)?);
+    }
+    Ok(index)
+}
+
+fn build_image_witnesses(
+    store: &EntityStore,
+    index: &DirectIndex,
+) -> Result<AHashMap<(ContractId, TokenKeyId, DocumentId), NftId>, DedupError> {
+    let mut witnesses = AHashMap::new();
+    for profile in &index.profiles {
+        let anchors = index.anchors(profile);
+        for &member in index.members(profile) {
+            if let Some(nft_id) = member.nft_id {
+                let nft = &store.nfts[nft_id as usize];
+                if nft.image_uri_id.is_some() {
+                    let anchor = anchors
+                        .first()
+                        .copied()
+                        .expect("a Solana metadata profile has one anchor");
+                    witnesses.insert((member.contract_id, anchor.0, anchor.1), nft_id);
+                }
+                continue;
+            }
+            let contract = &store.contracts[member.contract_id as usize];
+            let records = if profile.is_evm {
+                &contract.metadata_by_token[..anchors.len()]
+            } else {
+                let start = contract.metadata_by_token.len().saturating_sub(1);
+                &contract.metadata_by_token[start..]
+            };
+            if records.len() != anchors.len() {
+                return Err(DedupError::invalid(
+                    "metadata",
+                    "metadata image witness layout does not match profile anchors",
+                ));
+            }
+            for (&anchor, record) in anchors.iter().zip(records) {
+                let nft_id = store
+                    .nft_id(member.contract_id, &record.token_id)
+                    .ok_or_else(|| {
+                        DedupError::invalid(
+                            "metadata",
+                            "metadata image witness has no matching NFT",
+                        )
+                    })?;
+                if store.nfts[nft_id as usize].image_uri_id.is_some() {
+                    witnesses.insert((member.contract_id, anchor.0, anchor.1), nft_id);
+                }
+            }
+        }
+    }
+    Ok(witnesses)
 }
 
 fn empty_profile_buckets() -> RawProfileBuckets {
@@ -3652,14 +4037,18 @@ fn score_equivalent_profiles(
     stats: &AtomicStats,
     progress: &dyn ProgressObserver,
     sampling: PairSamplingPlan,
-) -> Result<PairSampler, DedupError> {
+    image_sample_size: usize,
+) -> Result<MetadataSamplingResult, DedupError> {
     let cancelled = AtomicBool::new(false);
     let samples = index
         .profiles
         .par_chunks(PREPARE_BATCH)
         .enumerate()
         .fold(
-            || sampling.sampler(),
+            || MetadataSamplingResult {
+                pairs: sampling.sampler(),
+                images: MetadataImageSampler::new(image_sample_size),
+            },
             |mut samples, (chunk_id, profiles)| {
                 if progress.check_cancelled().is_err() {
                     cancelled.store(true, Ordering::Relaxed);
@@ -3677,13 +4066,26 @@ fn score_equivalent_profiles(
                             hits.insert(profile_id, chain);
                         }
                     }
-                    if samples.enabled() {
+                    if samples.pairs.enabled() {
                         let members = index.members(profile);
-                        samples.observe_clique_by(
+                        samples.pairs.observe_clique_by(
                             members.len(),
                             |member| members[member].contract_id,
                             0x4d45_5441_4551_0000 ^ profile_id as u64,
                         );
+                    }
+                    if samples.images.enabled()
+                        && let Some((left_anchor, _)) = selected_image_anchors(
+                            profile,
+                            index.anchors(profile),
+                            profile,
+                            index.anchors(profile),
+                        )
+                    {
+                        let members = index.image_members(profile, left_anchor);
+                        samples
+                            .images
+                            .observe_clique(&members, 0x494d_4745_4551_0000 ^ profile_id as u64);
                     }
                     equivalent += 1;
                     completed = completed.saturating_add(choose_two(u64::from(profile.member_len)));
@@ -3699,9 +4101,13 @@ fn score_equivalent_profiles(
             },
         )
         .reduce(
-            || sampling.sampler(),
+            || MetadataSamplingResult {
+                pairs: sampling.sampler(),
+                images: MetadataImageSampler::new(image_sample_size),
+            },
             |mut left, right| {
-                left.merge(right);
+                left.pairs.merge(right.pairs);
+                left.images.merge(right.images);
                 left
             },
         );
@@ -3756,12 +4162,13 @@ struct WorkerScorer<'a> {
     single_chain_word: bool,
     local_stats: LocalStats,
     samples: PairSampler,
+    image_samples: MetadataImageSampler,
 }
 
 impl<'a> WorkerScorer<'a> {
     #[cfg(test)]
     fn new(index: &'a DirectIndex, hits: &'a ProfileHits, threshold: f64) -> Self {
-        Self::new_with_sampling(index, hits, threshold, PairSamplingPlan::disabled())
+        Self::new_with_sampling(index, hits, threshold, PairSamplingPlan::disabled(), 0)
     }
 
     fn new_with_sampling(
@@ -3769,6 +4176,7 @@ impl<'a> WorkerScorer<'a> {
         hits: &'a ProfileHits,
         threshold: f64,
         sampling: PairSamplingPlan,
+        image_sample_size: usize,
     ) -> Self {
         Self {
             index,
@@ -3777,6 +4185,7 @@ impl<'a> WorkerScorer<'a> {
             single_chain_word: hits.is_single_word(),
             local_stats: LocalStats::default(),
             samples: sampling.sampler(),
+            image_samples: MetadataImageSampler::new(image_sample_size),
         }
     }
 
@@ -3923,18 +4332,36 @@ impl<'a> WorkerScorer<'a> {
         right_id: usize,
         right: &ContractProfile,
     ) {
-        if !self.samples.enabled() {
+        if !self.samples.enabled() && !self.image_samples.enabled() {
             return;
         }
         let left_members = self.index.members(left);
         let right_members = self.index.members(right);
-        self.samples.observe_cross_by(
-            left_members.len(),
-            right_members.len(),
-            |member| left_members[member].contract_id,
-            |member| right_members[member].contract_id,
-            0x4d45_5441_4352_0000 ^ ((left_id as u64) << 32) ^ right_id as u64,
-        );
+        if self.samples.enabled() {
+            self.samples.observe_cross_by(
+                left_members.len(),
+                right_members.len(),
+                |member| left_members[member].contract_id,
+                |member| right_members[member].contract_id,
+                0x4d45_5441_4352_0000 ^ ((left_id as u64) << 32) ^ right_id as u64,
+            );
+        }
+        if self.image_samples.enabled()
+            && let Some((left_anchor, right_anchor)) = selected_image_anchors(
+                left,
+                self.index.anchors(left),
+                right,
+                self.index.anchors(right),
+            )
+        {
+            let left_images = self.index.image_members(left, left_anchor);
+            let right_images = self.index.image_members(right, right_anchor);
+            self.image_samples.observe_cross(
+                &left_images,
+                &right_images,
+                0x494d_4745_4352_0000 ^ ((left_id as u64) << 32) ^ right_id as u64,
+            );
+        }
     }
 
     #[inline]
@@ -3986,9 +4413,12 @@ impl<'a> WorkerScorer<'a> {
         decision.matched
     }
 
-    fn finish(self, stats: &AtomicStats) -> PairSampler {
+    fn finish(self, stats: &AtomicStats) -> MetadataSamplingResult {
         self.local_stats.flush(stats);
-        self.samples
+        MetadataSamplingResult {
+            pairs: self.samples,
+            images: self.image_samples,
+        }
     }
 }
 
@@ -4339,8 +4769,8 @@ fn score_cross_profiles(
     stats: &AtomicStats,
     progress: &dyn ProgressObserver,
     plan: &CrossProfilePlan,
-    sampling: PairSamplingPlan,
-) -> Result<(CandidateScoreSummary, PairSampler), DedupError> {
+    sampling: CrossSamplingPlan,
+) -> Result<(CandidateScoreSummary, MetadataSamplingResult), DedupError> {
     if let CrossProfilePlan::Indexed(candidates) = plan {
         return score_streamed_candidates(
             index, hits, threshold, stats, progress, candidates, sampling,
@@ -4366,8 +4796,13 @@ fn score_cross_profiles(
     let worker_samples = (0..workers)
         .into_par_iter()
         .map(|_| {
-            let mut scorer =
-                WorkerScorer::new_with_sampling(index, hits, threshold, sampling.clone());
+            let mut scorer = WorkerScorer::new_with_sampling(
+                index,
+                hits,
+                threshold,
+                sampling.pairs.clone(),
+                sampling.image_sample_size,
+            );
             'work: loop {
                 let scheduled = next_tile.load(Ordering::Relaxed);
                 let remaining = tile_count.saturating_sub(scheduled);
@@ -4408,7 +4843,8 @@ fn score_cross_profiles(
                         for right_block_index in first_right_block..right_tile.block_end {
                             let left_block = &blocks[left_block_index];
                             let right_block = &blocks[right_block_index];
-                            if hits.is_single_word()
+                            if sampling.image_sample_size == 0
+                                && hits.is_single_word()
                                 && hits
                                     .block_contains_mask(left_block_index, right_block.chain_mask)
                                 && hits
@@ -4470,9 +4906,13 @@ fn score_cross_profiles(
     if cancelled.load(Ordering::Relaxed) {
         Err(DedupError::Interrupted)
     } else {
-        let mut samples = sampling.sampler();
+        let mut samples = MetadataSamplingResult {
+            pairs: sampling.pairs.sampler(),
+            images: MetadataImageSampler::new(sampling.image_sample_size),
+        };
         for worker in worker_samples {
-            samples.merge(worker);
+            samples.pairs.merge(worker.pairs);
+            samples.images.merge(worker.images);
         }
         Ok((CandidateScoreSummary::default(), samples))
     }
@@ -4485,8 +4925,8 @@ fn score_streamed_candidates(
     stats: &AtomicStats,
     progress: &dyn ProgressObserver,
     candidates: &ResidentCandidateIndex,
-    sampling: PairSamplingPlan,
-) -> Result<(CandidateScoreSummary, PairSampler), DedupError> {
+    sampling: CrossSamplingPlan,
+) -> Result<(CandidateScoreSummary, MetadataSamplingResult), DedupError> {
     score_candidate_sources(
         index, hits, threshold, stats, progress, candidates, sampling,
     )
@@ -4499,12 +4939,18 @@ fn score_candidate_sources(
     stats: &AtomicStats,
     progress: &dyn ProgressObserver,
     candidates: &ResidentCandidateIndex,
-    sampling: PairSamplingPlan,
-) -> Result<(CandidateScoreSummary, PairSampler), DedupError> {
+    sampling: CrossSamplingPlan,
+) -> Result<(CandidateScoreSummary, MetadataSamplingResult), DedupError> {
     let profile_count = index.profiles.len();
     let query_profile_count = index.query_profile_count;
     if query_profile_count == 0 || profile_count < 2 {
-        return Ok((CandidateScoreSummary::default(), sampling.sampler()));
+        return Ok((
+            CandidateScoreSummary::default(),
+            MetadataSamplingResult {
+                pairs: sampling.pairs.sampler(),
+                images: MetadataImageSampler::new(sampling.image_sample_size),
+            },
+        ));
     }
     let lane_count = candidate_seen_lanes(query_profile_count);
     let schedule = InterleavedProfileSchedule::new(query_profile_count, lane_count);
@@ -4514,8 +4960,13 @@ fn score_candidate_sources(
         .into_par_iter()
         .map(|_| {
             let mut seen = None;
-            let mut scorer =
-                WorkerScorer::new_with_sampling(index, hits, threshold, sampling.clone());
+            let mut scorer = WorkerScorer::new_with_sampling(
+                index,
+                hits,
+                threshold,
+                sampling.pairs.clone(),
+                sampling.image_sample_size,
+            );
             let mut summary = CandidateScoreSummary::default();
             let mut unchecked_emissions = 0_u64;
             loop {
@@ -4602,11 +5053,15 @@ fn score_candidate_sources(
         .collect::<Vec<_>>()
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-    let mut samples = sampling.sampler();
+    let mut samples = MetadataSamplingResult {
+        pairs: sampling.pairs.sampler(),
+        images: MetadataImageSampler::new(sampling.image_sample_size),
+    };
     let summary = lanes.into_iter().fold(
         CandidateScoreSummary::default(),
         |mut total, (lane, worker_samples)| {
-            samples.merge(worker_samples);
+            samples.pairs.merge(worker_samples.pairs);
+            samples.images.merge(worker_samples.images);
             total.pair_count = total.pair_count.saturating_add(lane.pair_count);
             total.pair_emissions = total.pair_emissions.saturating_add(lane.pair_emissions);
             total.prefix_terms = total.prefix_terms.saturating_add(lane.prefix_terms);
@@ -5110,6 +5565,33 @@ fn selected_documents(
     (left.max_document(), right.max_document())
 }
 
+fn selected_image_anchors(
+    left: &ContractProfile,
+    left_anchors: &[(TokenKeyId, DocumentId)],
+    right: &ContractProfile,
+    right_anchors: &[(TokenKeyId, DocumentId)],
+) -> Option<((TokenKeyId, DocumentId), (TokenKeyId, DocumentId))> {
+    if left.is_evm
+        && right.is_evm
+        && anchor_token_ranges_overlap(left_anchors, right_anchors)
+        && token_masks_overlap(&left.token_mask, &right.token_mask)
+        && let Some(anchors) = highest_shared_anchor_entries(left_anchors, right_anchors)
+    {
+        return Some(anchors);
+    }
+    let left_anchor = left_anchors
+        .iter()
+        .rev()
+        .find(|anchor| anchor.1 == left.max_document())
+        .copied()?;
+    let right_anchor = right_anchors
+        .iter()
+        .rev()
+        .find(|anchor| anchor.1 == right.max_document())
+        .copied()?;
+    Some((left_anchor, right_anchor))
+}
+
 #[inline]
 fn selected_evm_documents(
     left: &ContractProfile,
@@ -5180,6 +5662,24 @@ fn highest_shared_anchor(
         let right_anchor = right[right_end - 1];
         match left_anchor.0.cmp(&right_anchor.0) {
             std::cmp::Ordering::Equal => return Some((left_anchor.1, right_anchor.1)),
+            std::cmp::Ordering::Greater => left_end -= 1,
+            std::cmp::Ordering::Less => right_end -= 1,
+        }
+    }
+    None
+}
+
+fn highest_shared_anchor_entries(
+    left: &[(TokenKeyId, DocumentId)],
+    right: &[(TokenKeyId, DocumentId)],
+) -> Option<((TokenKeyId, DocumentId), (TokenKeyId, DocumentId))> {
+    let mut left_end = left.len();
+    let mut right_end = right.len();
+    while left_end != 0 && right_end != 0 {
+        let left_anchor = left[left_end - 1];
+        let right_anchor = right[right_end - 1];
+        match left_anchor.0.cmp(&right_anchor.0) {
+            std::cmp::Ordering::Equal => return Some((left_anchor, right_anchor)),
             std::cmp::Ordering::Greater => left_end -= 1,
             std::cmp::Ordering::Less => right_end -= 1,
         }
@@ -5615,6 +6115,7 @@ mod tests {
             eligible_members: 0,
             anchor_count: 0,
             unique_terms,
+            image_witnesses: None,
         };
         let term_count = usize::try_from(unique_terms).unwrap();
         let term_ranks = (0..term_count as u32).rev().collect::<Vec<_>>();
@@ -5666,6 +6167,7 @@ mod tests {
             eligible_members: 0,
             anchor_count: 0,
             unique_terms: 0,
+            image_witnesses: None,
         };
         let progress = PhaseProgress::default();
         let prefixes = build_document_prefixes(&index, &[], 0.6, &progress).unwrap();
@@ -5752,6 +6254,7 @@ mod tests {
             eligible_members: profile_documents.len() as u64,
             anchor_count: profile_documents.len() as u64,
             unique_terms,
+            image_witnesses: None,
         }
     }
 
@@ -6924,6 +7427,79 @@ mod tests {
         }
     }
 
+    fn input_with_image(
+        chain: &str,
+        address: &str,
+        token_id: &str,
+        image_uri: &str,
+        metadata: &str,
+    ) -> InputRow {
+        let mut row = input(chain, address, token_id, metadata);
+        row.image_uri_norm = image_uri.to_owned();
+        row
+    }
+
+    #[test]
+    fn image_samples_use_the_selected_metadata_token_and_require_both_uris() {
+        let evm = HashSet::from(["ethereum".to_owned()]);
+        let mut store = EntityStore::with_options(8, &evm.iter().cloned().collect());
+        for address in ["0xa", "0xb", "0xc"] {
+            store
+                .try_ingest_row(input_with_image(
+                    "ethereum",
+                    address,
+                    "1",
+                    "",
+                    r#"{"token":"one"}"#,
+                ))
+                .unwrap();
+            let image = if address == "0xc" {
+                String::new()
+            } else {
+                format!("https://images.example/{address}.png")
+            };
+            store
+                .try_ingest_row(input_with_image(
+                    "ethereum",
+                    address,
+                    "2",
+                    &image,
+                    r#"{"token":"two"}"#,
+                ))
+                .unwrap();
+        }
+        let mut acc = SummaryAccumulator::default();
+        let (_, contract_samples, image_samples) = run_direct_releasing_with_samples(
+            &mut store,
+            &evm,
+            8,
+            1.0,
+            &mut acc,
+            &NoopProgress,
+            10,
+        )
+        .unwrap();
+
+        assert_eq!(contract_samples.all_chains.len(), 1);
+        assert_eq!(image_samples.len(), 1);
+        assert_eq!(
+            contract_samples.all_chains[0].contract_a_address,
+            image_samples[0].contract_a_address
+        );
+        assert_eq!(
+            contract_samples.all_chains[0].contract_b_address,
+            image_samples[0].contract_b_address
+        );
+        assert_eq!(image_samples[0].token_id_a, "2");
+        assert_eq!(image_samples[0].token_id_b, "2");
+        assert!(image_samples[0].image_uri_a.contains("images.example"));
+        assert!(image_samples[0].image_uri_b.contains("images.example"));
+        assert_ne!(
+            image_samples[0].contract_a_address,
+            image_samples[0].contract_b_address
+        );
+    }
+
     #[test]
     fn direct_run_preserves_intra_and_cross_chain_membership() {
         let evm = ["ethereum".to_owned(), "base".to_owned()]
@@ -7155,7 +7731,10 @@ mod tests {
             &full_stats,
             &NoopProgress,
             &CrossProfilePlan::Full,
-            PairSamplingPlan::disabled(),
+            CrossSamplingPlan {
+                pairs: PairSamplingPlan::disabled(),
+                image_sample_size: 0,
+            },
         )
         .unwrap();
         let solana = store.chain_ids["solana"];
@@ -7280,18 +7859,24 @@ mod tests {
     }
 
     #[test]
-    fn metadata_samples_include_every_pair_hidden_by_chain_saturation() {
+    fn metadata_image_samples_include_every_pair_that_chain_saturation_would_hide() {
         let evm = ["ethereum".to_owned()].into_iter().collect::<HashSet<_>>();
         let mut store = EntityStore::with_options(8, &evm.iter().cloned().collect());
         for (address, suffix) in [("0xa", "alpha"), ("0xb", "beta"), ("0xc", "gamma")] {
             let metadata = format!(r#"{{"shared":"common value {suffix}"}}"#);
             store
-                .try_ingest_row(input("ethereum", address, "1", &metadata))
+                .try_ingest_row(input_with_image(
+                    "ethereum",
+                    address,
+                    "1",
+                    &format!("https://images.example/{address}.png"),
+                    &metadata,
+                ))
                 .unwrap();
         }
 
         let mut acc = SummaryAccumulator::default();
-        let (_, samples) = run_direct_releasing_with_samples(
+        let (_, samples, _) = run_direct_releasing_with_samples(
             &mut store,
             &evm,
             8,
@@ -7356,7 +7941,7 @@ mod tests {
     }
 
     #[test]
-    fn full_fallback_samples_the_complete_eligible_contract_universe() {
+    fn full_fallback_samples_the_image_qualified_contract_universe() {
         let evm = ["ethereum".to_owned(), "base".to_owned()]
             .into_iter()
             .collect::<HashSet<_>>();
@@ -7369,11 +7954,17 @@ mod tests {
             };
             let metadata = format!(r#"{{"unique{contract}":"value{contract}"}}"#);
             store
-                .try_ingest_row(input(chain, &format!("0x{contract:x}"), "1", &metadata))
+                .try_ingest_row(input_with_image(
+                    chain,
+                    &format!("0x{contract:x}"),
+                    "1",
+                    &format!("https://images.example/{contract}.png"),
+                    &metadata,
+                ))
                 .unwrap();
         }
         let mut acc = SummaryAccumulator::default();
-        let (stats, samples) = run_direct_releasing_with_samples(
+        let (stats, samples, image_samples) = run_direct_releasing_with_samples(
             &mut store,
             &evm,
             1,
@@ -7384,23 +7975,30 @@ mod tests {
         )
         .unwrap();
 
-        assert!(stats.block_saturated_profile_pairs > 0);
+        assert_eq!(stats.block_saturated_profile_pairs, 0);
         assert_eq!(samples.all_chains.len(), 1_000);
+        assert_eq!(image_samples.len(), samples.all_chains.len());
+        assert!(
+            image_samples
+                .iter()
+                .all(|sample| !sample.image_uri_a.is_empty() && !sample.image_uri_b.is_empty())
+        );
         assert_eq!(samples.intra_chain.len(), 2);
         assert!(
             samples
                 .intra_chain
                 .iter()
-                .all(|scope| scope.pairs.len() == 1_000)
+                .all(|scope| !scope.pairs.is_empty() && scope.pairs.len() <= 1_000)
         );
         assert_eq!(samples.chain_pairs.len(), 1);
-        assert_eq!(samples.chain_pairs[0].pairs.len(), 1_000);
+        assert!(!samples.chain_pairs[0].pairs.is_empty());
+        assert!(samples.chain_pairs[0].pairs.len() <= 1_000);
         assert_eq!(samples.cross_chain_summary.len(), 2);
         assert!(
             samples
                 .cross_chain_summary
                 .iter()
-                .all(|scope| scope.pairs.len() == 1_000)
+                .all(|scope| !scope.pairs.is_empty() && scope.pairs.len() <= 1_000)
         );
     }
 

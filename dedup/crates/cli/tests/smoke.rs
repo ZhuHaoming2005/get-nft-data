@@ -50,7 +50,7 @@ fn all_writes_summary_files() {
                 "1",
                 "collection",
                 "ipfs://shared/1",
-                "",
+                "data:image/png;base64,iVBORw0KGgo=",
                 r#"{"collection":{"name":"shared"},"name":"t1"}"#,
             ],
             [
@@ -59,7 +59,7 @@ fn all_writes_summary_files() {
                 "1",
                 "collection",
                 "ipfs://shared/1",
-                "",
+                "data:image/png;base64,iVBORw0KGgo=",
                 r#"{"collection":{"name":"shared"},"name":"t1"}"#,
             ],
             [
@@ -68,7 +68,7 @@ fn all_writes_summary_files() {
                 "1",
                 "collection",
                 "ipfs://other/1",
-                "",
+                "data:image/png;base64,iVBORw0KGgo=",
                 r#"{"collection":{"name":"shared"},"name":"t1"}"#,
             ],
         ],
@@ -146,7 +146,10 @@ fn all_writes_summary_files() {
         }
         assert!(row_count > 0);
     }
-    for name in ["name_duplicate_pairs.csv", "metadata_duplicate_pairs.csv"] {
+    for (name, expected_rows) in [
+        ("name_duplicate_pairs.csv", 1),
+        ("metadata_duplicate_pairs.csv", 1),
+    ] {
         let path = out.join(name);
         assert!(path.is_file(), "missing duplicate-pair sample {name}");
         let mut reader = csv::Reader::from_path(path).unwrap();
@@ -161,9 +164,41 @@ fn all_writes_summary_files() {
             .as_slice()
         );
         let rows = reader.records().collect::<Result<Vec<_>, _>>().unwrap();
-        assert_eq!(rows.len(), 1, "sample limit was not applied to {name}");
-        assert!(rows[0].iter().all(|value| !value.is_empty()));
+        assert_eq!(
+            rows.len(),
+            expected_rows,
+            "unexpected image-qualified sample count in {name}"
+        );
+        assert!(
+            rows.iter()
+                .all(|row| row.iter().all(|value| !value.is_empty()))
+        );
     }
+    let image_manifest = out.join("metadata_image_samples.csv");
+    assert!(image_manifest.is_file());
+    let mut image_reader = csv::Reader::from_path(image_manifest).unwrap();
+    assert_eq!(
+        image_reader.headers().unwrap(),
+        [
+            "row",
+            "contract_a_chain",
+            "contract_a_address",
+            "token_id_a",
+            "image_uri_a",
+            "file_a",
+            "error_a",
+            "contract_b_chain",
+            "contract_b_address",
+            "token_id_b",
+            "image_uri_b",
+            "file_b",
+            "error_b",
+        ]
+        .as_slice()
+    );
+    assert_eq!(image_reader.records().count(), 1);
+    assert!(out.join("metadata_sample_images/1/1a.png").is_file());
+    assert!(out.join("metadata_sample_images/1/1b.png").is_file());
     for dimension in ["name", "metadata"] {
         for (suffix, group_columns) in [
             ("intra_chain", &["chain"][..]),
@@ -336,9 +371,216 @@ fn omitted_name_threshold_disables_name_and_omitted_anchors_are_unbounded() {
     assert!(status.success());
     assert!(!out.join("name_summary.csv").exists());
     assert!(!out.join("name_chain_matrix.csv").exists());
+    for name in [
+        "name_duplicate_pairs.csv",
+        "metadata_duplicate_pairs.csv",
+        "metadata_image_samples.csv",
+    ] {
+        assert!(
+            !out.join(name).exists(),
+            "sampling must be explicitly enabled"
+        );
+    }
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(out.join("run_manifest.json")).unwrap()).unwrap();
     assert!(manifest["name_threshold"].is_null());
     assert!(manifest["metadata_anchors"].is_null());
     assert_eq!(manifest["interned_strings"], 0);
+}
+
+#[test]
+fn explicit_sampling_does_not_change_dedup_results() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input.parquet");
+    write_parquet(
+        &input,
+        &[
+            [
+                "ethereum",
+                "0xa",
+                "1",
+                "",
+                "",
+                "data:image/png;base64,iVBORw0KGgo=",
+                r#"{"collection":"shared","name":"one"}"#,
+            ],
+            [
+                "ethereum",
+                "0xb",
+                "1",
+                "",
+                "",
+                "data:image/png;base64,iVBORw0KGgo=",
+                r#"{"collection":"shared","name":"one"}"#,
+            ],
+        ],
+    );
+    let without_sampling = temp.path().join("without-sampling");
+    let with_sampling = temp.path().join("with-sampling");
+    let exe = env!("CARGO_BIN_EXE_dedup");
+
+    for (output, sample_pairs) in [(&without_sampling, None), (&with_sampling, Some("1"))] {
+        let mut command = Command::new(exe);
+        command.args([
+            "run-metadata",
+            "--input",
+            input.to_str().unwrap(),
+            "--output-dir",
+            output.to_str().unwrap(),
+            "--evm-chains",
+            "ethereum",
+            "--progress",
+            "off",
+        ]);
+        if let Some(limit) = sample_pairs {
+            command.args(["--sample-pairs", limit]);
+        }
+        assert!(command.status().unwrap().success());
+    }
+
+    for report in ["summary.csv", "chain_matrix.csv"] {
+        assert_eq!(
+            std::fs::read(without_sampling.join(report)).unwrap(),
+            std::fs::read(with_sampling.join(report)).unwrap(),
+            "sampling changed {report}"
+        );
+    }
+    assert!(
+        !without_sampling
+            .join("metadata_duplicate_pairs.csv")
+            .exists()
+    );
+    assert!(with_sampling.join("metadata_duplicate_pairs.csv").exists());
+    assert!(with_sampling.join("metadata_image_samples.csv").exists());
+}
+
+#[test]
+fn failed_media_pairs_are_replaced_until_the_target_is_complete() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input.parquet");
+    let good = "data:image/png;base64,iVBORw0KGgo=";
+    write_parquet(
+        &input,
+        &[
+            [
+                "ethereum",
+                "0x0",
+                "1",
+                "",
+                "",
+                "unsupported://zero",
+                r#"{"collection":"shared"}"#,
+            ],
+            [
+                "ethereum",
+                "0x1",
+                "1",
+                "",
+                "",
+                good,
+                r#"{"collection":"shared"}"#,
+            ],
+            [
+                "ethereum",
+                "0x2",
+                "1",
+                "",
+                "",
+                good,
+                r#"{"collection":"shared"}"#,
+            ],
+            [
+                "ethereum",
+                "0x3",
+                "1",
+                "",
+                "",
+                "unsupported://three",
+                r#"{"collection":"shared"}"#,
+            ],
+        ],
+    );
+    let out = temp.path().join("out");
+    let status = Command::new(env!("CARGO_BIN_EXE_dedup"))
+        .args([
+            "run-metadata",
+            "--input",
+            input.to_str().unwrap(),
+            "--output-dir",
+            out.to_str().unwrap(),
+            "--evm-chains",
+            "ethereum",
+            "--progress",
+            "off",
+            "--sample-pairs",
+            "1",
+        ])
+        .status()
+        .unwrap();
+
+    assert!(status.success());
+    let mut manifest = csv::Reader::from_path(out.join("metadata_image_samples.csv")).unwrap();
+    let rows = manifest.records().collect::<Result<Vec<_>, _>>().unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][2], "0x1");
+    assert_eq!(&rows[0][8], "0x2");
+    assert!(out.join("metadata_sample_images/1/1a.png").is_file());
+    assert!(out.join("metadata_sample_images/1/1b.png").is_file());
+}
+
+#[test]
+fn exhausted_media_candidates_fail_without_hiding_dedup_reports() {
+    let temp = tempfile::tempdir().unwrap();
+    let input = temp.path().join("input.parquet");
+    write_parquet(
+        &input,
+        &[
+            [
+                "ethereum",
+                "0xa",
+                "1",
+                "",
+                "",
+                "unsupported://a",
+                r#"{"collection":"shared"}"#,
+            ],
+            [
+                "ethereum",
+                "0xb",
+                "1",
+                "",
+                "",
+                "unsupported://b",
+                r#"{"collection":"shared"}"#,
+            ],
+        ],
+    );
+    let out = temp.path().join("out");
+    std::fs::create_dir_all(out.join("metadata_sample_images/1")).unwrap();
+    std::fs::write(out.join("metadata_sample_images/1/stale.png"), b"stale").unwrap();
+    std::fs::write(out.join("metadata_image_samples.csv"), b"stale").unwrap();
+    std::fs::write(out.join("metadata_duplicate_pairs.csv"), b"stale").unwrap();
+    let status = Command::new(env!("CARGO_BIN_EXE_dedup"))
+        .args([
+            "run-metadata",
+            "--input",
+            input.to_str().unwrap(),
+            "--output-dir",
+            out.to_str().unwrap(),
+            "--evm-chains",
+            "ethereum",
+            "--progress",
+            "off",
+            "--sample-pairs",
+            "1",
+        ])
+        .status()
+        .unwrap();
+
+    assert!(!status.success());
+    assert!(out.join("summary.csv").is_file());
+    assert!(out.join("chain_matrix.csv").is_file());
+    assert!(!out.join("metadata_image_samples.csv").exists());
+    assert!(!out.join("metadata_sample_images").exists());
+    assert!(!out.join("metadata_duplicate_pairs.csv").exists());
 }
