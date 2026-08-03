@@ -106,13 +106,16 @@ pub fn download_metadata_image_samples(
         .num_threads(DOWNLOAD_WORKERS.min(samples.len()).max(1))
         .build()?;
     let mut successful = Vec::with_capacity(target);
-    for (chunk_index, chunk) in samples.chunks(DOWNLOAD_WORKERS).enumerate() {
+    let ordered_samples = random_candidate_order(samples).map_err(|error| {
+        std::io::Error::other(format!("operating-system randomness unavailable: {error}"))
+    })?;
+    for (chunk_index, chunk) in ordered_samples.chunks(DOWNLOAD_WORKERS).enumerate() {
         check_cancelled(progress)?;
         let attempted = pool.install(|| {
             chunk
                 .par_iter()
                 .enumerate()
-                .map(|(offset, sample)| {
+                .map(|(offset, &sample)| {
                     let candidate_index = chunk_index * DOWNLOAD_WORKERS + offset + 1;
                     let staged = stage_pair(
                         &client,
@@ -211,6 +214,24 @@ pub fn download_metadata_image_samples(
     fs::rename(&publish_root, &image_root)?;
     write_manifest(output_dir, &selected, &rows)?;
     Ok(DownloadOutcome::Complete(selected))
+}
+
+fn random_candidate_order(
+    samples: &[MetadataImagePairSample],
+) -> Result<Vec<&MetadataImagePairSample>, getrandom::Error> {
+    let mut shuffled = samples.iter().collect::<Vec<_>>();
+    for upper in (2..=shuffled.len()).rev() {
+        let limit = u64::try_from(upper).expect("candidate count fits in u64");
+        let unbiased_end = u64::MAX - u64::MAX % limit;
+        let index = loop {
+            let value = getrandom::u64()?;
+            if value < unbiased_end {
+                break usize::try_from(value % limit).expect("random index fits in usize");
+            }
+        };
+        shuffled.swap(upper - 1, index);
+    }
+    Ok(shuffled)
 }
 
 fn build_http_client() -> Result<Client, reqwest::Error> {
@@ -817,6 +838,26 @@ mod tests {
             validate_request_url(&redirect).unwrap_err().kind(),
             std::io::ErrorKind::PermissionDenied
         );
+    }
+
+    #[test]
+    fn random_candidate_order_preserves_every_pair_and_allows_reuse() {
+        let good = "data:image/png;base64,iVBORw0KGgo=";
+        let mut first = sample("0xhub", good);
+        first.contract_b_address = "0xone".to_owned();
+        let mut repeated = sample("0xhub", good);
+        repeated.contract_b_address = "0xtwo".to_owned();
+        let mut disjoint = sample("0xthree", good);
+        disjoint.contract_b_address = "0xfour".to_owned();
+        let candidates = [first, repeated, disjoint];
+
+        let ordered = random_candidate_order(&candidates).unwrap();
+        let mut addresses = ordered
+            .iter()
+            .map(|sample| sample.contract_a_address.as_str())
+            .collect::<Vec<_>>();
+        addresses.sort_unstable();
+        assert_eq!(addresses, vec!["0xhub", "0xhub", "0xthree"]);
     }
 
     #[test]

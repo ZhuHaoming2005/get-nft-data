@@ -8,7 +8,7 @@ use crate::metadata::bm25::{
     similarity_at_least_after_overlap_filter,
 };
 use crate::progress::ProgressObserver;
-use crate::radix::{sort_u32_pairs_while, sort_u32_triples_while};
+use crate::radix::{sort_by_u32_bool_key_while, sort_u32_pairs_while, sort_u32_triples_while};
 use crate::sampling::{
     ChainDuplicatePairSamples, ChainPairDuplicatePairSamples, DuplicatePairSample,
     DuplicatePairSamples, PairSampler, PairSamplingPlan,
@@ -147,7 +147,7 @@ impl AnchorKey {
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Copy, Debug)]
 struct ContractProfile {
     is_evm: bool,
     is_solana: bool,
@@ -425,22 +425,38 @@ impl MetadataImageSampler {
     fn into_samples(
         self,
         store: &EntityStore,
-        image_metadata: &AHashMap<NftId, String>,
-    ) -> Vec<MetadataImagePairSample> {
-        let mut pairs = self.retained.into_values().collect::<Vec<_>>();
-        pairs.sort_unstable();
+        progress: &dyn ProgressObserver,
+    ) -> Result<Vec<MetadataImagePairSample>, DedupError> {
+        let pairs = self.retained.into_values().collect::<Vec<_>>();
+        let image_metadata = build_selected_image_metadata(store, &pairs, progress)?;
         pairs
             .into_iter()
-            .filter_map(|pair| {
+            .map(|pair| {
                 let contract_a = &store.contracts[pair.contract_a as usize];
                 let contract_b = &store.contracts[pair.contract_b as usize];
                 let nft_a = &store.nfts[pair.nft_a as usize];
                 let nft_b = &store.nfts[pair.nft_b as usize];
-                let image_uri_a = store.string(nft_a.image_uri_id?).to_owned();
-                let image_uri_b = store.string(nft_b.image_uri_id?).to_owned();
-                let metadata_json_a = image_metadata.get(&pair.nft_a)?.clone();
-                let metadata_json_b = image_metadata.get(&pair.nft_b)?.clone();
-                Some(MetadataImagePairSample {
+                let image_uri_a = nft_a
+                    .image_uri_id
+                    .map(|id| store.string(id).to_owned())
+                    .ok_or_else(|| {
+                        DedupError::invalid("metadata", "sampled NFT A has no image URI")
+                    })?;
+                let image_uri_b = nft_b
+                    .image_uri_id
+                    .map(|id| store.string(id).to_owned())
+                    .ok_or_else(|| {
+                        DedupError::invalid("metadata", "sampled NFT B has no image URI")
+                    })?;
+                let metadata_json_a =
+                    image_metadata.get(&pair.nft_a).cloned().ok_or_else(|| {
+                        DedupError::invalid("metadata", "sampled NFT A has no Metadata record")
+                    })?;
+                let metadata_json_b =
+                    image_metadata.get(&pair.nft_b).cloned().ok_or_else(|| {
+                        DedupError::invalid("metadata", "sampled NFT B has no Metadata record")
+                    })?;
+                Ok(MetadataImagePairSample {
                     contract_a_chain: store.chain_name(contract_a.chain_id).to_owned(),
                     contract_a_address: contract_a.address.clone(),
                     token_id_a: nft_a.token_id.clone(),
@@ -1225,8 +1241,6 @@ pub fn run_direct_releasing_with_samples(
         .map(|(stats, _, _)| (stats, DuplicatePairSamples::default(), Vec::new()));
     }
 
-    let image_metadata = build_image_metadata(store, &index)?;
-    store.release_metadata_records();
     let result = run_prepared_direct(
         store,
         index,
@@ -1236,39 +1250,75 @@ pub fn run_direct_releasing_with_samples(
         PairSamplingPlan::disabled(),
         sample_size,
     );
-    let result = result.map(|(stats, _, image_samples)| {
-        let image_samples = image_samples.into_samples(store, &image_metadata);
+    let result = result.and_then(|(stats, _, image_samples)| {
+        let image_samples = image_samples.into_samples(store, progress)?;
         let contract_samples = contract_samples_from_images(&image_samples);
-        (stats, contract_samples, image_samples)
+        Ok((stats, contract_samples, image_samples))
     });
     store.release_metadata();
     result
 }
 
-fn build_image_metadata(
+fn build_selected_image_metadata(
     store: &EntityStore,
-    index: &DirectIndex,
+    pairs: &[MetadataImagePair],
+    progress: &dyn ProgressObserver,
 ) -> Result<AHashMap<NftId, String>, DedupError> {
-    let witnesses = index.image_witnesses.as_ref().ok_or_else(|| {
-        DedupError::invalid("metadata", "image sampling has no image witness index")
-    })?;
-    let mut metadata = AHashMap::with_capacity(witnesses.len());
-    for &nft_id in witnesses.values() {
-        if metadata.contains_key(&nft_id) {
-            continue;
+    progress.begin_phase(
+        "selected_image_metadata_index",
+        Some((pairs.len() as u64).saturating_mul(2)),
+    );
+    let mut required = AHashMap::<ContractId, AHashMap<&str, NftId>>::new();
+    let mut completed = 0_u64;
+    for pair in pairs {
+        for nft_id in [pair.nft_a, pair.nft_b] {
+            let nft = &store.nfts[nft_id as usize];
+            required
+                .entry(nft.contract_id)
+                .or_default()
+                .insert(&nft.token_id, nft_id);
+            completed += 1;
+            if completed == PREPARE_BATCH as u64 {
+                progress.add_completed(completed);
+                progress.check_cancelled()?;
+                completed = 0;
+            }
         }
-        let nft = &store.nfts[nft_id as usize];
-        let contract = &store.contracts[nft.contract_id as usize];
-        let canonical_json = contract
-            .metadata_by_token
-            .iter()
-            .find(|record| record.token_id == nft.token_id)
-            .ok_or_else(|| {
-                DedupError::invalid("metadata", "image witness has no matching metadata record")
-            })?
-            .canonical_json
-            .clone();
-        metadata.insert(nft_id, canonical_json);
+    }
+    progress.add_completed(completed);
+    progress.check_cancelled()?;
+
+    let required_nfts = required.values().map(|tokens| tokens.len()).sum::<usize>();
+    let metadata_work = required.keys().fold(0_u64, |total, &contract_id| {
+        total.saturating_add(
+            store.contracts[contract_id as usize]
+                .metadata_by_token
+                .len() as u64,
+        )
+    });
+    progress.begin_phase("selected_image_metadata", Some(metadata_work));
+    let mut metadata = AHashMap::with_capacity(required_nfts);
+    completed = 0;
+    for (contract_id, required_tokens) in required {
+        for record in &store.contracts[contract_id as usize].metadata_by_token {
+            if let Some(&nft_id) = required_tokens.get(record.token_id.as_str()) {
+                metadata.insert(nft_id, record.canonical_json.clone());
+            }
+            completed += 1;
+            if completed == PREPARE_BATCH as u64 {
+                progress.add_completed(completed);
+                progress.check_cancelled()?;
+                completed = 0;
+            }
+        }
+    }
+    progress.add_completed(completed);
+    progress.check_cancelled()?;
+    if metadata.len() != required_nfts {
+        return Err(DedupError::invalid(
+            "metadata",
+            "one or more sampled NFTs have no matching metadata record",
+        ));
     }
     Ok(metadata)
 }
@@ -1979,7 +2029,18 @@ fn build_index_with_image_witnesses(
             )
         },
     );
-    profiles.par_sort_unstable_by_key(|profile| (profile.max_document(), profile.is_solana));
+    let profile_sort_passes = if profiles.len() > 1 { 4 } else { 0 };
+    progress.begin_phase("profile_sort", Some(profile_sort_passes));
+    if !sort_by_u32_bool_key_while(
+        &mut profiles,
+        |profile| (profile.max_document(), profile.is_solana),
+        || {
+            progress.add_completed(1);
+            progress.check_cancelled().is_ok()
+        },
+    ) {
+        return Err(DedupError::Interrupted);
+    }
     let query_profile_count = profiles.len();
     let mut index = DirectIndex {
         documents,
@@ -2000,7 +2061,7 @@ fn build_index_with_image_witnesses(
         image_witnesses: None,
     };
     if retain_image_witnesses {
-        index.image_witnesses = Some(build_image_witnesses(store, &index)?);
+        index.image_witnesses = Some(build_image_witnesses(store, &index, progress)?);
     }
     Ok(index)
 }
@@ -2008,8 +2069,11 @@ fn build_index_with_image_witnesses(
 fn build_image_witnesses(
     store: &EntityStore,
     index: &DirectIndex,
+    progress: &dyn ProgressObserver,
 ) -> Result<AHashMap<(ContractId, TokenKeyId, DocumentId), NftId>, DedupError> {
     let mut witnesses = AHashMap::new();
+    progress.begin_phase("image_witnesses", Some(index.profiles.len() as u64));
+    let mut completed = 0_u64;
     for profile in &index.profiles {
         let anchors = index.anchors(profile);
         for &member in index.members(profile) {
@@ -2051,7 +2115,15 @@ fn build_image_witnesses(
                 }
             }
         }
+        completed += 1;
+        if completed == PREPARE_BATCH as u64 {
+            progress.add_completed(completed);
+            progress.check_cancelled()?;
+            completed = 0;
+        }
     }
+    progress.add_completed(completed);
+    progress.check_cancelled()?;
     Ok(witnesses)
 }
 

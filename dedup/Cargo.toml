@@ -21,6 +21,7 @@ rapidfuzz = "=0.5.0"
 rayon = "1.11"
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
 base64 = "0.22"
+getrandom = "0.3"
 url = "2"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = { version = "1.0", features = ["arbitrary_precision"] }

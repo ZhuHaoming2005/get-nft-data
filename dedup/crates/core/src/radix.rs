@@ -253,6 +253,26 @@ pub(crate) fn sort_u64_while(values: &mut Vec<u64>, completed_pass: impl FnMut()
     )
 }
 
+pub(crate) fn sort_by_u32_bool_key_while<T: Copy + Send + Sync>(
+    values: &mut Vec<T>,
+    key: impl Fn(T) -> (u32, bool) + Sync,
+    completed_pass: impl FnMut() -> bool,
+) -> bool {
+    sort_by_digits_while(
+        values,
+        |pass, value| {
+            let (number, flag) = key(value);
+            if pass == 0 {
+                usize::from(flag)
+            } else {
+                u32_digit(number, pass - 1)
+            }
+        },
+        4,
+        completed_pass,
+    )
+}
+
 #[cfg(test)]
 pub(crate) fn sort_u32(values: &mut Vec<u32>) {
     sort_by_digits(values, |pass, value| u32_digit(value, pass), 3);
@@ -377,5 +397,27 @@ mod tests {
         assert_eq!(completed_passes, 1);
         values.sort_unstable();
         assert_eq!(values, expected);
+    }
+
+    #[test]
+    fn generic_u32_bool_key_matches_lexicographic_sort() {
+        let mut values = vec![
+            (2_u32, true, 0_u8),
+            (1, true, 1),
+            (2, false, 2),
+            (1, false, 3),
+        ];
+        assert!(sort_by_u32_bool_key_while(
+            &mut values,
+            |value| (value.0, value.1),
+            || true
+        ));
+        assert_eq!(
+            values
+                .iter()
+                .map(|value| (value.0, value.1))
+                .collect::<Vec<_>>(),
+            vec![(1, false), (1, true), (2, false), (2, true)]
+        );
     }
 }

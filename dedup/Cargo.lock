@@ -513,6 +513,7 @@ dependencies = [
  "csv",
  "ctrlc",
  "dedup_core",
+ "getrandom 0.3.4",
  "parquet",
  "rayon",
  "reqwest",
