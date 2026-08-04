@@ -312,7 +312,7 @@ pub fn run_name_with_samples(
         threshold,
         acc,
         progress,
-        PairSamplingPlan::new(store, sample_size),
+        PairSamplingPlan::new(store, sample_size)?,
     )?;
     Ok(materialize_samples(store, sampler))
 }

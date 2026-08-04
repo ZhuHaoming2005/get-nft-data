@@ -531,6 +531,7 @@ dependencies = [
  "arrow-array",
  "arrow-cast",
  "arrow-schema",
+ "getrandom 0.3.4",
  "parquet",
  "rapidfuzz",
  "rayon",

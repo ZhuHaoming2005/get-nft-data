@@ -222,10 +222,10 @@ fn random_candidate_order(
     let mut shuffled = samples.iter().collect::<Vec<_>>();
     for upper in (2..=shuffled.len()).rev() {
         let limit = u64::try_from(upper).expect("candidate count fits in u64");
-        let unbiased_end = u64::MAX - u64::MAX % limit;
+        let minimum = limit.wrapping_neg() % limit;
         let index = loop {
             let value = getrandom::u64()?;
-            if value < unbiased_end {
+            if value >= minimum {
                 break usize::try_from(value % limit).expect("random index fits in usize");
             }
         };

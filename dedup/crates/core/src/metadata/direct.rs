@@ -11,7 +11,7 @@ use crate::progress::ProgressObserver;
 use crate::radix::{sort_by_u32_bool_key_while, sort_u32_pairs_while, sort_u32_triples_while};
 use crate::sampling::{
     ChainDuplicatePairSamples, ChainPairDuplicatePairSamples, DuplicatePairSample,
-    DuplicatePairSamples, PairSampler, PairSamplingPlan,
+    DuplicatePairSamples, PairSampler, PairSamplingPlan, SamplingRandomness,
 };
 use crate::scope::{ScopeCounts, ScopeKey};
 use crate::stats::SummaryAccumulator;
@@ -283,9 +283,9 @@ struct MetadataImageSampleEntry {
     pair: MetadataImagePair,
 }
 
-#[derive(Default)]
 struct MetadataImageSampler {
     capacity: usize,
+    randomness: SamplingRandomness,
     heap: BinaryHeap<MetadataImageSampleEntry>,
     retained: AHashMap<(ContractId, ContractId), MetadataImagePair>,
 }
@@ -299,13 +299,16 @@ struct MetadataSamplingResult {
 struct CrossSamplingPlan {
     pairs: PairSamplingPlan,
     image_sample_size: usize,
+    image_randomness: SamplingRandomness,
 }
 
 impl MetadataImageSampler {
-    fn new(capacity: usize) -> Self {
+    fn new(capacity: usize, randomness: SamplingRandomness) -> Self {
         Self {
             capacity,
-            ..Self::default()
+            randomness,
+            heap: BinaryHeap::new(),
+            retained: AHashMap::new(),
         }
     }
 
@@ -335,13 +338,33 @@ impl MetadataImageSampler {
             nft_b,
         };
         if let Some(current) = self.retained.get_mut(&(contract_a, contract_b)) {
-            if pair < *current {
+            let candidate_priority = self.randomness.score(
+                b"metadata-image-nft-pair",
+                &[
+                    u64::from(pair.contract_a),
+                    u64::from(pair.nft_a),
+                    u64::from(pair.contract_b),
+                    u64::from(pair.nft_b),
+                ],
+            );
+            let current_priority = self.randomness.score(
+                b"metadata-image-nft-pair",
+                &[
+                    u64::from(current.contract_a),
+                    u64::from(current.nft_a),
+                    u64::from(current.contract_b),
+                    u64::from(current.nft_b),
+                ],
+            );
+            if (candidate_priority, pair) < (current_priority, *current) {
                 *current = pair;
             }
             return;
         }
-        let priority =
-            splitmix64_image_sample((u64::from(contract_a) << 32) | u64::from(contract_b));
+        let priority = self.randomness.score(
+            b"metadata-image-contract-pair",
+            &[u64::from(contract_a), u64::from(contract_b)],
+        );
         let entry = MetadataImageSampleEntry { priority, pair };
         if self.heap.len() == self.capacity
             && self.heap.peek().is_some_and(|current| entry >= *current)
@@ -380,8 +403,18 @@ impl MetadataImageSampler {
             return;
         }
         for attempt in 0..remaining.saturating_mul(6).max(12) {
-            let left_index = image_sample_index(salt, attempt as u64 * 2, left.len());
-            let right_index = image_sample_index(salt, attempt as u64 * 2 + 1, right.len());
+            let left_index = self.randomness.index(
+                b"metadata-image-cross-left",
+                salt,
+                attempt as u64,
+                left.len(),
+            );
+            let right_index = self.randomness.index(
+                b"metadata-image-cross-right",
+                salt,
+                attempt as u64,
+                right.len(),
+            );
             let (left_contract, left_nft) = left[left_index];
             let (right_contract, right_nft) = right[right_index];
             self.observe(left_contract, left_nft, right_contract, right_nft);
@@ -405,8 +438,18 @@ impl MetadataImageSampler {
             return;
         }
         for attempt in 0..remaining.saturating_mul(8).max(16) {
-            let left = image_sample_index(salt, attempt as u64 * 2, members.len());
-            let mut right = image_sample_index(salt, attempt as u64 * 2 + 1, members.len() - 1);
+            let left = self.randomness.index(
+                b"metadata-image-clique-left",
+                salt,
+                attempt as u64,
+                members.len(),
+            );
+            let mut right = self.randomness.index(
+                b"metadata-image-clique-right",
+                salt,
+                attempt as u64,
+                members.len() - 1,
+            );
             if right >= left {
                 right += 1;
             }
@@ -417,6 +460,7 @@ impl MetadataImageSampler {
     }
 
     fn merge(&mut self, other: Self) {
+        assert_eq!(self.randomness, other.randomness);
         for pair in other.retained.into_values() {
             self.observe(pair.contract_a, pair.nft_a, pair.contract_b, pair.nft_b);
         }
@@ -471,17 +515,6 @@ impl MetadataImageSampler {
             })
             .collect()
     }
-}
-
-fn splitmix64_image_sample(mut value: u64) -> u64 {
-    value = value.wrapping_add(0x9e37_79b9_7f4a_7c15);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
-fn image_sample_index(salt: u64, ordinal: u64, len: usize) -> usize {
-    splitmix64_image_sample(salt ^ ordinal.wrapping_mul(0x9e37_79b9_7f4a_7c15)) as usize % len
 }
 
 impl DirectIndex {
@@ -1175,8 +1208,11 @@ pub fn run_direct(
         threshold,
         acc,
         progress,
-        PairSamplingPlan::disabled(),
-        0,
+        CrossSamplingPlan {
+            pairs: PairSamplingPlan::disabled(),
+            image_sample_size: 0,
+            image_randomness: SamplingRandomness::DISABLED,
+        },
     )
     .map(|(stats, _, _)| stats)
 }
@@ -1197,8 +1233,11 @@ pub fn run_direct_releasing(
         threshold,
         acc,
         progress,
-        PairSamplingPlan::disabled(),
-        0,
+        CrossSamplingPlan {
+            pairs: PairSamplingPlan::disabled(),
+            image_sample_size: 0,
+            image_randomness: SamplingRandomness::DISABLED,
+        },
     )
     .map(|(stats, _, _)| stats)
 }
@@ -1235,20 +1274,27 @@ pub fn run_direct_releasing_with_samples(
             threshold,
             acc,
             progress,
-            PairSamplingPlan::disabled(),
-            0,
+            CrossSamplingPlan {
+                pairs: PairSamplingPlan::disabled(),
+                image_sample_size: 0,
+                image_randomness: SamplingRandomness::DISABLED,
+            },
         )
         .map(|(stats, _, _)| (stats, DuplicatePairSamples::default(), Vec::new()));
     }
 
+    let image_randomness = SamplingRandomness::from_os()?;
     let result = run_prepared_direct(
         store,
         index,
         threshold,
         acc,
         progress,
-        PairSamplingPlan::disabled(),
-        sample_size,
+        CrossSamplingPlan {
+            pairs: PairSamplingPlan::disabled(),
+            image_sample_size: sample_size,
+            image_randomness,
+        },
     );
     let result = result.and_then(|(stats, _, image_samples)| {
         let image_samples = image_samples.into_samples(store, progress)?;
@@ -1394,15 +1440,14 @@ fn run_prepared_direct(
     threshold: f64,
     acc: &mut SummaryAccumulator,
     progress: &dyn ProgressObserver,
-    sampling: PairSamplingPlan,
-    image_sample_size: usize,
+    sampling: CrossSamplingPlan,
 ) -> Result<(MetadataStats, PairSampler, MetadataImageSampler), DedupError> {
     let eligible_members = index.eligible_members;
     if eligible_members < 2 {
         return Ok((
             base_stats(store, &index, 0, 0, 0),
-            sampling.sampler(),
-            MetadataImageSampler::new(image_sample_size),
+            sampling.pairs.sampler(),
+            MetadataImageSampler::new(sampling.image_sample_size, sampling.image_randomness),
         ));
     }
 
@@ -1422,7 +1467,7 @@ fn run_prepared_direct(
     );
     let stats = AtomicStats::default();
     let full_universe_samples = if threshold <= 0.0 {
-        let samples = sampling.sampler();
+        let samples = sampling.pairs.sampler();
         samples
             .enabled()
             .then(|| sample_all_eligible_contract_pairs(store, &index, samples, progress))
@@ -1433,7 +1478,7 @@ fn run_prepared_direct(
     let scoring_sampling = if full_universe_samples.is_some() {
         PairSamplingPlan::disabled()
     } else {
-        sampling.clone()
+        sampling.pairs.clone()
     };
     let equivalent_work = equivalent_scoring_work(&index);
     progress.begin_phase("direct_bm25_equivalent", Some(equivalent_work));
@@ -1443,7 +1488,8 @@ fn run_prepared_direct(
         &stats,
         progress,
         scoring_sampling.clone(),
-        image_sample_size,
+        sampling.image_sample_size,
+        sampling.image_randomness,
     )?;
     let (cross_summary, cross_samples) = score_cross_profiles(
         &index,
@@ -1454,7 +1500,8 @@ fn run_prepared_direct(
         &cross_profile_plan,
         CrossSamplingPlan {
             pairs: scoring_sampling,
-            image_sample_size,
+            image_sample_size: sampling.image_sample_size,
+            image_randomness: sampling.image_randomness,
         },
     )?;
     if let Some(full_universe_samples) = full_universe_samples {
@@ -4147,6 +4194,7 @@ fn score_equivalent_profiles(
     progress: &dyn ProgressObserver,
     sampling: PairSamplingPlan,
     image_sample_size: usize,
+    image_randomness: SamplingRandomness,
 ) -> Result<MetadataSamplingResult, DedupError> {
     let cancelled = AtomicBool::new(false);
     let samples = index
@@ -4156,7 +4204,7 @@ fn score_equivalent_profiles(
         .fold(
             || MetadataSamplingResult {
                 pairs: sampling.sampler(),
-                images: MetadataImageSampler::new(image_sample_size),
+                images: MetadataImageSampler::new(image_sample_size, image_randomness),
             },
             |mut samples, (chunk_id, profiles)| {
                 if progress.check_cancelled().is_err() {
@@ -4212,7 +4260,7 @@ fn score_equivalent_profiles(
         .reduce(
             || MetadataSamplingResult {
                 pairs: sampling.sampler(),
-                images: MetadataImageSampler::new(image_sample_size),
+                images: MetadataImageSampler::new(image_sample_size, image_randomness),
             },
             |mut left, right| {
                 left.pairs.merge(right.pairs);
@@ -4277,7 +4325,14 @@ struct WorkerScorer<'a> {
 impl<'a> WorkerScorer<'a> {
     #[cfg(test)]
     fn new(index: &'a DirectIndex, hits: &'a ProfileHits, threshold: f64) -> Self {
-        Self::new_with_sampling(index, hits, threshold, PairSamplingPlan::disabled(), 0)
+        Self::new_with_sampling(
+            index,
+            hits,
+            threshold,
+            PairSamplingPlan::disabled(),
+            0,
+            SamplingRandomness::DISABLED,
+        )
     }
 
     fn new_with_sampling(
@@ -4286,6 +4341,7 @@ impl<'a> WorkerScorer<'a> {
         threshold: f64,
         sampling: PairSamplingPlan,
         image_sample_size: usize,
+        image_randomness: SamplingRandomness,
     ) -> Self {
         Self {
             index,
@@ -4294,7 +4350,7 @@ impl<'a> WorkerScorer<'a> {
             single_chain_word: hits.is_single_word(),
             local_stats: LocalStats::default(),
             samples: sampling.sampler(),
-            image_samples: MetadataImageSampler::new(image_sample_size),
+            image_samples: MetadataImageSampler::new(image_sample_size, image_randomness),
         }
     }
 
@@ -4911,6 +4967,7 @@ fn score_cross_profiles(
                 threshold,
                 sampling.pairs.clone(),
                 sampling.image_sample_size,
+                sampling.image_randomness,
             );
             'work: loop {
                 let scheduled = next_tile.load(Ordering::Relaxed);
@@ -5017,7 +5074,10 @@ fn score_cross_profiles(
     } else {
         let mut samples = MetadataSamplingResult {
             pairs: sampling.pairs.sampler(),
-            images: MetadataImageSampler::new(sampling.image_sample_size),
+            images: MetadataImageSampler::new(
+                sampling.image_sample_size,
+                sampling.image_randomness,
+            ),
         };
         for worker in worker_samples {
             samples.pairs.merge(worker.pairs);
@@ -5057,7 +5117,10 @@ fn score_candidate_sources(
             CandidateScoreSummary::default(),
             MetadataSamplingResult {
                 pairs: sampling.pairs.sampler(),
-                images: MetadataImageSampler::new(sampling.image_sample_size),
+                images: MetadataImageSampler::new(
+                    sampling.image_sample_size,
+                    sampling.image_randomness,
+                ),
             },
         ));
     }
@@ -5075,6 +5138,7 @@ fn score_candidate_sources(
                 threshold,
                 sampling.pairs.clone(),
                 sampling.image_sample_size,
+                sampling.image_randomness,
             );
             let mut summary = CandidateScoreSummary::default();
             let mut unchecked_emissions = 0_u64;
@@ -5164,7 +5228,7 @@ fn score_candidate_sources(
         .collect::<Result<Vec<_>, _>>()?;
     let mut samples = MetadataSamplingResult {
         pairs: sampling.pairs.sampler(),
-        images: MetadataImageSampler::new(sampling.image_sample_size),
+        images: MetadataImageSampler::new(sampling.image_sample_size, sampling.image_randomness),
     };
     let summary = lanes.into_iter().fold(
         CandidateScoreSummary::default(),
@@ -7549,6 +7613,35 @@ mod tests {
     }
 
     #[test]
+    fn image_sampler_uses_random_priorities_for_contract_and_matching_nft_pairs() {
+        let randomness = (0_u8..=u8::MAX)
+            .map(SamplingRandomness::for_test)
+            .find(|randomness| {
+                randomness.score(b"metadata-image-contract-pair", &[3, 4])
+                    < randomness.score(b"metadata-image-contract-pair", &[1, 2])
+                    && randomness.score(b"metadata-image-nft-pair", &[3, 31, 4, 41])
+                        < randomness.score(b"metadata-image-nft-pair", &[3, 30, 4, 40])
+            })
+            .expect("a test key with the required random priority ordering");
+
+        let mut sampler = MetadataImageSampler::new(1, randomness);
+        sampler.observe(1, 10, 2, 20);
+        sampler.observe(3, 30, 4, 40);
+        sampler.observe(3, 31, 4, 41);
+
+        assert_eq!(sampler.retained.len(), 1);
+        assert_eq!(
+            sampler.retained.get(&(3, 4)),
+            Some(&MetadataImagePair {
+                contract_a: 3,
+                nft_a: 31,
+                contract_b: 4,
+                nft_b: 41,
+            })
+        );
+    }
+
+    #[test]
     fn image_samples_use_the_selected_metadata_token_and_require_both_uris() {
         let evm = HashSet::from(["ethereum".to_owned()]);
         let mut store = EntityStore::with_options(8, &evm.iter().cloned().collect());
@@ -7845,6 +7938,7 @@ mod tests {
             CrossSamplingPlan {
                 pairs: PairSamplingPlan::disabled(),
                 image_sample_size: 0,
+                image_randomness: SamplingRandomness::DISABLED,
             },
         )
         .unwrap();

@@ -1,10 +1,56 @@
 use crate::entity::{ChainId, ContractId, EntityStore};
+use crate::error::DedupError;
 use ahash::{AHashMap, AHashSet};
+use sha2::{Digest, Sha256};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
-use std::hash::{BuildHasher, Hasher};
 
 const IMPLICIT_EXHAUSTIVE_SAMPLE_MULTIPLIER: usize = 8;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct SamplingRandomness {
+    key: [u8; 32],
+}
+
+impl SamplingRandomness {
+    pub(crate) const DISABLED: Self = Self { key: [0; 32] };
+
+    pub(crate) fn from_os() -> Result<Self, DedupError> {
+        let mut key = [0_u8; 32];
+        getrandom::fill(&mut key)
+            .map_err(|error| DedupError::Message(format!("OS random source failed: {error}")))?;
+        Ok(Self { key })
+    }
+
+    pub(crate) fn score(&self, domain: &[u8], values: &[u64]) -> u64 {
+        let mut digest = Sha256::new();
+        digest.update(self.key);
+        digest.update(domain);
+        for value in values {
+            digest.update(value.to_le_bytes());
+        }
+        u64::from_le_bytes(digest.finalize()[..8].try_into().expect("SHA-256 prefix"))
+    }
+
+    pub(crate) fn index(&self, domain: &[u8], salt: u64, ordinal: u64, len: usize) -> usize {
+        debug_assert_ne!(len, 0);
+        let len = len as u64;
+        let minimum = len.wrapping_neg() % len;
+        let mut retry = 0_u64;
+        loop {
+            let value = self.score(domain, &[salt, ordinal, retry]);
+            if value >= minimum {
+                return (value % len) as usize;
+            }
+            retry = retry.wrapping_add(1);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn for_test(byte: u8) -> Self {
+        Self { key: [byte; 32] }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DuplicatePairSample {
@@ -77,18 +123,18 @@ impl PartialOrd for SampleEntry {
 #[derive(Clone, Debug)]
 pub(crate) struct PairSamplingPlan {
     capacity: usize,
-    seed: u64,
+    randomness: SamplingRandomness,
     contract_chains: std::sync::Arc<[ChainId]>,
 }
 
 impl PairSamplingPlan {
-    pub(crate) fn new(store: &EntityStore, capacity: usize) -> Self {
-        let random = std::collections::hash_map::RandomState::new();
-        let mut hasher = random.build_hasher();
-        hasher.write_u64(capacity as u64);
-        Self {
+    pub(crate) fn new(store: &EntityStore, capacity: usize) -> Result<Self, DedupError> {
+        if capacity == 0 {
+            return Ok(Self::disabled());
+        }
+        Ok(Self {
             capacity,
-            seed: hasher.finish(),
+            randomness: SamplingRandomness::from_os()?,
             contract_chains: if capacity == 0 {
                 std::sync::Arc::from([])
             } else {
@@ -99,13 +145,13 @@ impl PairSamplingPlan {
                     .collect::<Vec<_>>()
                     .into()
             },
-        }
+        })
     }
 
     pub(crate) fn disabled() -> Self {
         Self {
             capacity: 0,
-            seed: 0,
+            randomness: SamplingRandomness::DISABLED,
             contract_chains: std::sync::Arc::from([]),
         }
     }
@@ -113,7 +159,7 @@ impl PairSamplingPlan {
     pub(crate) fn sampler(&self) -> PairSampler {
         PairSampler {
             capacity: self.capacity,
-            seed: self.seed,
+            randomness: self.randomness,
             contract_chains: self.contract_chains.clone(),
             all_chains: PairReservoir::default(),
             intra_chain: AHashMap::new(),
@@ -125,7 +171,7 @@ impl PairSamplingPlan {
 
 pub(crate) struct PairSampler {
     capacity: usize,
-    seed: u64,
+    randomness: SamplingRandomness,
     contract_chains: std::sync::Arc<[ChainId]>,
     all_chains: PairReservoir,
     intra_chain: AHashMap<ChainId, PairReservoir>,
@@ -152,7 +198,10 @@ impl PairSampler {
             return false;
         };
         let entry = SampleEntry {
-            priority: pair_priority(self.seed, pair),
+            priority: self.randomness.score(
+                b"contract-pair-priority",
+                &[u64::from(pair.left), u64::from(pair.right)],
+            ),
             pair,
         };
         let changed = self.all_chains.observe(entry, self.capacity);
@@ -275,7 +324,7 @@ impl PairSampler {
 
     pub(crate) fn merge(&mut self, other: Self) {
         debug_assert_eq!(self.capacity, other.capacity);
-        debug_assert_eq!(self.seed, other.seed);
+        debug_assert_eq!(self.randomness, other.randomness);
         self.all_chains.merge(other.all_chains, self.capacity);
         merge_reservoir_maps(&mut self.intra_chain, other.intra_chain, self.capacity);
         merge_reservoir_maps(&mut self.chain_pairs, other.chain_pairs, self.capacity);
@@ -287,10 +336,8 @@ impl PairSampler {
     }
 
     fn random_index(&self, group_salt: u64, ordinal: u64, len: usize) -> usize {
-        debug_assert!(len != 0);
-        splitmix64(self.seed ^ group_salt.rotate_left(17) ^ ordinal.wrapping_mul(MIX_GAMMA))
-            as usize
-            % len
+        self.randomness
+            .index(b"contract-pair-probe", group_salt, ordinal, len)
     }
 
     fn reservoir_remaining<K: Eq + std::hash::Hash>(
@@ -537,20 +584,6 @@ fn merge_reservoir_maps<K: Eq + std::hash::Hash>(
     }
 }
 
-const MIX_GAMMA: u64 = 0x9e37_79b9_7f4a_7c15;
-
-fn splitmix64(mut value: u64) -> u64 {
-    value = value.wrapping_add(MIX_GAMMA);
-    value = (value ^ (value >> 30)).wrapping_mul(0xbf58_476d_1ce4_e5b9);
-    value = (value ^ (value >> 27)).wrapping_mul(0x94d0_49bb_1331_11eb);
-    value ^ (value >> 31)
-}
-
-fn pair_priority(seed: u64, pair: ContractPair) -> u64 {
-    let packed = (u64::from(pair.left) << 32) | u64::from(pair.right);
-    splitmix64(seed ^ packed)
-}
-
 pub(crate) fn materialize_samples(
     store: &EntityStore,
     sampler: PairSampler,
@@ -617,7 +650,7 @@ mod tests {
     fn plan(capacity: usize) -> PairSamplingPlan {
         PairSamplingPlan {
             capacity,
-            seed: 7,
+            randomness: SamplingRandomness::for_test(7),
             contract_chains: vec![0; 30_000].into(),
         }
     }
@@ -631,6 +664,30 @@ mod tests {
         }
         assert_eq!(sampler.all_chains.heap.len(), 3);
         assert_eq!(sampler.all_chains.retained.len(), 3);
+    }
+
+    #[test]
+    fn contract_pair_selection_uses_random_priority_instead_of_pair_order() {
+        let randomness = (0_u8..=u8::MAX)
+            .map(SamplingRandomness::for_test)
+            .find(|randomness| {
+                randomness.score(b"contract-pair-priority", &[3, 4])
+                    < randomness.score(b"contract-pair-priority", &[1, 2])
+            })
+            .expect("a test key with reverse pair priority");
+        let plan = PairSamplingPlan {
+            capacity: 1,
+            randomness,
+            contract_chains: vec![0; 5].into(),
+        };
+        let mut sampler = plan.sampler();
+        sampler.observe(1, 2);
+        sampler.observe(3, 4);
+
+        assert_eq!(
+            sampler.all_chains.into_pairs(),
+            vec![ContractPair { left: 3, right: 4 }]
+        );
     }
 
     #[test]
@@ -687,7 +744,7 @@ mod tests {
     fn routes_pairs_to_every_requested_report_scope() {
         let plan = PairSamplingPlan {
             capacity: 10,
-            seed: 7,
+            randomness: SamplingRandomness::for_test(7),
             contract_chains: vec![0, 0, 1, 2].into(),
         };
         let mut sampler = plan.sampler();
@@ -710,7 +767,7 @@ mod tests {
         chains[10_000] = 1;
         let plan = PairSamplingPlan {
             capacity: 25,
-            seed: 7,
+            randomness: SamplingRandomness::for_test(7),
             contract_chains: chains.into(),
         };
         let mut sampler = plan.sampler();
