@@ -20,6 +20,30 @@ pub enum MetadataSamplePool {
     CrossChain,
 }
 
+#[derive(Clone, Debug)]
+pub struct MetadataSampleDownloadCandidate {
+    pub id: u64,
+    pub pool: MetadataSamplePool,
+    pub sample: MetadataImagePairSample,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MetadataSampleDownloadResult {
+    pub id: u64,
+    pub success: bool,
+}
+
+/// Asynchronous media sink used only by the opt-in Metadata sampler.
+///
+/// `submit` must preserve the supplied candidate IDs. `poll(false)` is
+/// non-blocking; `poll(true)` waits until at least one submitted candidate
+/// finishes or cancellation is observed.
+pub trait MetadataSampleDownloadSink {
+    fn submit(&mut self, candidates: &[MetadataSampleDownloadCandidate]) -> Result<(), DedupError>;
+
+    fn poll(&mut self, wait: bool) -> Result<Vec<MetadataSampleDownloadResult>, DedupError>;
+}
+
 pub struct MetadataFastSampleResult {
     pub intra_chain: Vec<MetadataImagePairSample>,
     pub cross_chain: Vec<MetadataImagePairSample>,
@@ -64,18 +88,16 @@ pub fn run_metadata(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn sample_metadata<F>(
+pub fn sample_metadata(
     store: &mut EntityStore,
     evm_chains: &std::collections::HashSet<String>,
     anchors_k: Option<usize>,
     content_threshold: f64,
     target_per_pool: usize,
+    candidate_cache_root: Option<&std::path::Path>,
     progress: &dyn ProgressObserver,
-    mut accept: F,
-) -> Result<MetadataFastSampleResult, DedupError>
-where
-    F: FnMut(&[(MetadataSamplePool, MetadataImagePairSample)]) -> Result<Vec<bool>, DedupError>,
-{
+    downloads: &mut dyn MetadataSampleDownloadSink,
+) -> Result<MetadataFastSampleResult, DedupError> {
     progress.set_stage("sample_metadata");
     direct::sample_direct_releasing(
         store,
@@ -83,7 +105,8 @@ where
         anchors_k,
         content_threshold,
         target_per_pool,
+        candidate_cache_root,
         progress,
-        &mut accept,
+        downloads,
     )
 }

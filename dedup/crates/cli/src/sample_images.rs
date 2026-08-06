@@ -1,18 +1,25 @@
 use crate::report::{metadata_sample_pair_reports, write_duplicate_pair_sample_files};
 use base64::Engine;
-use dedup_core::{MetadataImagePairSample, MetadataSamplePool, ProgressObserver};
-use rayon::prelude::*;
+use dedup_core::{
+    DedupError, MetadataImagePairSample, MetadataSampleDownloadCandidate,
+    MetadataSampleDownloadResult, MetadataSampleDownloadSink, MetadataSamplePool, ProgressObserver,
+};
 use reqwest::blocking::Client;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use reqwest::header::{CONTENT_TYPE, LOCATION, RETRY_AFTER};
 use reqwest::redirect::Policy;
 use reqwest::{StatusCode, Url};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tempfile::NamedTempFile;
 
@@ -22,7 +29,10 @@ const MAX_ATTEMPTS: usize = 2;
 const MAX_REDIRECTS: usize = 10;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
+const TOTAL_IMAGE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+const DOWNLOAD_QUEUE_CAPACITY: usize = DOWNLOAD_WORKERS * 2;
+const IMAGE_CACHE_DIR: &str = ".metadata-image-cache";
 const TRANSACTION_ITEMS: &str = ".sample-transaction-items.json";
 const TRANSACTION_STATE: &str = ".sample-transaction-state";
 const TRANSACTION_BACKUP: &str = ".sample-transaction-backup";
@@ -46,6 +56,70 @@ impl Resolve for PublicDnsResolver {
 struct DownloadedImage {
     bytes: Vec<u8>,
     suffix: &'static str,
+}
+
+#[derive(Clone)]
+struct CachedImage {
+    file: PathBuf,
+    suffix: &'static str,
+}
+
+#[derive(Serialize, Deserialize)]
+struct CachedImageRecord {
+    suffix: String,
+}
+
+#[derive(Clone, Copy)]
+enum ImageSide {
+    A,
+    B,
+}
+
+struct ImageConsumer {
+    candidate_id: u64,
+    side: ImageSide,
+}
+
+enum UriState {
+    Loading(Vec<ImageConsumer>),
+    Ready(CachedImage),
+}
+
+struct ImageJob {
+    uri: String,
+    cache_key: String,
+}
+
+struct ImageJobResult {
+    uri: String,
+    result: Result<CachedImage, std::io::Error>,
+}
+
+struct PendingPair {
+    candidate: MetadataSampleDownloadCandidate,
+    row_dir: PathBuf,
+    file_a: Option<(PathBuf, &'static str)>,
+    file_b: Option<(PathBuf, &'static str)>,
+}
+
+struct WorkerProgress {
+    parent: Arc<dyn ProgressObserver>,
+    shutdown: Arc<AtomicBool>,
+}
+
+impl ProgressObserver for WorkerProgress {
+    fn set_stage(&self, _stage: &str) {}
+    fn begin_phase(&self, _phase: &str, _total: Option<u64>) {}
+    fn set_total(&self, _total: Option<u64>) {}
+    fn add_completed(&self, _delta: u64) {}
+
+    fn check_cancelled(&self) -> Result<(), DedupError> {
+        if self.shutdown.load(Ordering::SeqCst) {
+            Err(DedupError::Interrupted)
+        } else {
+            self.parent.check_cancelled()
+        }
+    }
 }
 
 struct DownloadRow {
@@ -81,95 +155,133 @@ struct NftSampleRecord<'a> {
 
 pub struct StreamingDownloadSession {
     output_dir: PathBuf,
-    staging: tempfile::TempDir,
-    client: Client,
-    pool: rayon::ThreadPool,
+    staging: Option<tempfile::TempDir>,
+    cache_dir: PathBuf,
+    progress: Arc<dyn ProgressObserver>,
+    shutdown: Arc<AtomicBool>,
+    job_tx: Option<SyncSender<ImageJob>>,
+    result_rx: Receiver<ImageJobResult>,
+    workers: Vec<JoinHandle<()>>,
+    uri_states: HashMap<String, UriState>,
+    pending_pairs: HashMap<u64, PendingPair>,
+    completed: VecDeque<MetadataSampleDownloadResult>,
     intra_chain: Vec<StagedPair>,
     cross_chain: Vec<StagedPair>,
     attempted: usize,
+    cache_hits: usize,
+    coalesced_uris: usize,
+    network_jobs: usize,
+    failed_pairs: usize,
 }
 
 impl StreamingDownloadSession {
-    pub fn new(output_dir: &Path, target_per_pool: usize) -> Result<Self, std::io::Error> {
+    pub fn new(
+        output_dir: &Path,
+        target_per_pool: usize,
+        progress: Arc<dyn ProgressObserver>,
+    ) -> Result<Self, std::io::Error> {
         fs::create_dir_all(output_dir)?;
         recover_sample_transactions(output_dir)?;
         let staging = tempfile::Builder::new()
             .prefix(".metadata-fast-sample-")
             .tempdir_in(output_dir)?;
+        let cache_dir = output_dir.join(IMAGE_CACHE_DIR);
+        fs::create_dir_all(&cache_dir)?;
         let client = build_http_client().map_err(std::io::Error::other)?;
-        let pool = rayon::ThreadPoolBuilder::new()
-            .num_threads(DOWNLOAD_WORKERS)
-            .build()
-            .map_err(std::io::Error::other)?;
+        let (job_tx, job_rx) = mpsc::sync_channel(DOWNLOAD_QUEUE_CAPACITY);
+        let job_rx = Arc::new(Mutex::new(job_rx));
+        let (result_tx, result_rx) = mpsc::channel();
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let mut workers = Vec::with_capacity(DOWNLOAD_WORKERS);
+        for worker_id in 0..DOWNLOAD_WORKERS {
+            let client = client.clone();
+            let cache_dir = cache_dir.clone();
+            let worker_progress = WorkerProgress {
+                parent: Arc::clone(&progress),
+                shutdown: Arc::clone(&shutdown),
+            };
+            let job_rx = Arc::clone(&job_rx);
+            let result_tx = result_tx.clone();
+            workers.push(
+                std::thread::Builder::new()
+                    .name(format!("sample-image-{worker_id}"))
+                    .spawn(move || {
+                        image_download_worker(
+                            &client,
+                            &cache_dir,
+                            &worker_progress,
+                            &job_rx,
+                            &result_tx,
+                        );
+                    })?,
+            );
+        }
+        drop(result_tx);
         Ok(Self {
             output_dir: output_dir.to_owned(),
-            staging,
-            client,
-            pool,
+            staging: Some(staging),
+            cache_dir,
+            progress,
+            shutdown,
+            job_tx: Some(job_tx),
+            result_rx,
+            workers,
+            uri_states: HashMap::new(),
+            pending_pairs: HashMap::new(),
+            completed: VecDeque::new(),
             intra_chain: Vec::with_capacity(target_per_pool),
             cross_chain: Vec::with_capacity(target_per_pool),
             attempted: 0,
+            cache_hits: 0,
+            coalesced_uris: 0,
+            network_jobs: 0,
+            failed_pairs: 0,
         })
     }
 
+    #[cfg(test)]
     pub fn try_batch(
         &mut self,
         candidates: &[(MetadataSamplePool, MetadataImagePairSample)],
-        progress: &dyn ProgressObserver,
+        _progress: &dyn ProgressObserver,
     ) -> Result<Vec<bool>, std::io::Error> {
-        let first_index = self.attempted + 1;
-        self.attempted += candidates.len();
-        let attempted = self.pool.install(|| {
-            candidates
-                .par_iter()
-                .enumerate()
-                .map(|(offset, (_, sample))| {
-                    stage_pair(
-                        &self.client,
-                        sample,
-                        first_index + offset,
-                        self.staging.path(),
-                        progress,
-                    )
-                })
-                .collect::<Vec<_>>()
-        });
-        let mut accepted = Vec::with_capacity(candidates.len());
-        for ((pool, _), staged) in candidates.iter().zip(attempted) {
-            match staged {
-                Ok(staged) => {
-                    progress.add_activity(1);
-                    match pool {
-                        MetadataSamplePool::IntraChain => self.intra_chain.push(staged),
-                        MetadataSamplePool::CrossChain => self.cross_chain.push(staged),
-                    }
-                    accepted.push(true);
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                    return Err(error);
-                }
-                Err(_) => {
-                    progress.add_activity(1);
-                    accepted.push(false);
-                }
+        let first_id = self.attempted as u64 + 1;
+        let submitted = candidates
+            .iter()
+            .enumerate()
+            .map(|(offset, (pool, sample))| MetadataSampleDownloadCandidate {
+                id: first_id + offset as u64,
+                pool: *pool,
+                sample: sample.clone(),
+            })
+            .collect::<Vec<_>>();
+        self.submit(&submitted).map_err(dedup_to_io)?;
+        let mut by_id = HashMap::with_capacity(submitted.len());
+        while by_id.len() < submitted.len() {
+            for result in self.poll(true).map_err(dedup_to_io)? {
+                by_id.insert(result.id, result.success);
             }
         }
-        Ok(accepted)
+        Ok(submitted
+            .iter()
+            .map(|candidate| by_id[&candidate.id])
+            .collect())
     }
 
     pub fn finish(
-        self,
+        mut self,
     ) -> Result<Vec<MetadataImagePairSample>, Box<dyn std::error::Error + Send + Sync>> {
-        let output_dir = self.output_dir;
-        let staging = self.staging;
+        self.shutdown_workers();
+        let output_dir = self.output_dir.clone();
+        let staging = self.staging.take().expect("staging directory is present");
         let mut successful = self
             .intra_chain
-            .into_iter()
+            .drain(..)
             .map(|pair| (MetadataSamplePool::IntraChain, pair))
             .collect::<Vec<_>>();
         successful.extend(
             self.cross_chain
-                .into_iter()
+                .drain(..)
                 .map(|pair| (MetadataSamplePool::CrossChain, pair)),
         );
         shuffle_staged_pairs(&mut successful)?;
@@ -179,6 +291,391 @@ impl StreamingDownloadSession {
             let _ = fs::remove_dir_all(&staging_root);
         }
         published
+    }
+
+    fn submit_candidate(
+        &mut self,
+        candidate: &MetadataSampleDownloadCandidate,
+    ) -> Result<(), std::io::Error> {
+        check_cancelled(self.progress.as_ref())?;
+        self.attempted = self.attempted.saturating_add(1);
+        self.progress.add_activity(1);
+        let staging_root = self
+            .staging
+            .as_ref()
+            .expect("staging directory is present")
+            .path();
+        let row_dir = staging_root.join(format!("candidate-{}", candidate.id));
+        fs::create_dir(&row_dir)?;
+        if self
+            .pending_pairs
+            .insert(
+                candidate.id,
+                PendingPair {
+                    candidate: candidate.clone(),
+                    row_dir,
+                    file_a: None,
+                    file_b: None,
+                },
+            )
+            .is_some()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "duplicate media download candidate ID",
+            ));
+        }
+        self.request_image(candidate.id, ImageSide::A, &candidate.sample.image_uri_a)?;
+        self.request_image(candidate.id, ImageSide::B, &candidate.sample.image_uri_b)?;
+        Ok(())
+    }
+
+    fn request_image(
+        &mut self,
+        candidate_id: u64,
+        side: ImageSide,
+        uri: &str,
+    ) -> Result<(), std::io::Error> {
+        let uri = uri.trim().to_owned();
+        let consumer = ImageConsumer { candidate_id, side };
+        let ready = match self.uri_states.get_mut(&uri) {
+            Some(UriState::Loading(consumers)) => {
+                self.coalesced_uris = self.coalesced_uris.saturating_add(1);
+                consumers.push(consumer);
+                return Ok(());
+            }
+            Some(UriState::Ready(image)) => {
+                self.cache_hits = self.cache_hits.saturating_add(1);
+                Some(image.clone())
+            }
+            None => None,
+        };
+        if let Some(image) = ready {
+            self.deliver_image(consumer, Ok(&image));
+            return Ok(());
+        }
+        let cache_key = image_cache_key(&uri);
+        if let Some(image) = load_cached_image(&self.cache_dir, &cache_key)? {
+            self.cache_hits = self.cache_hits.saturating_add(1);
+            self.uri_states.insert(uri, UriState::Ready(image.clone()));
+            self.deliver_image(consumer, Ok(&image));
+            return Ok(());
+        }
+        self.uri_states
+            .insert(uri.clone(), UriState::Loading(vec![consumer]));
+        self.network_jobs = self.network_jobs.saturating_add(1);
+        self.send_job(ImageJob { uri, cache_key })
+    }
+
+    fn send_job(&self, mut job: ImageJob) -> Result<(), std::io::Error> {
+        let sender = self
+            .job_tx
+            .as_ref()
+            .ok_or_else(|| std::io::Error::other("image downloader is shutting down"))?;
+        loop {
+            check_cancelled(self.progress.as_ref())?;
+            match sender.try_send(job) {
+                Ok(()) => return Ok(()),
+                Err(TrySendError::Full(returned)) => {
+                    job = returned;
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                Err(TrySendError::Disconnected(_)) => {
+                    return Err(std::io::Error::other(
+                        "image download worker queue disconnected",
+                    ));
+                }
+            }
+        }
+    }
+
+    fn receive_worker_result(&mut self, wait: bool) -> Result<bool, std::io::Error> {
+        let result = if wait {
+            loop {
+                check_cancelled(self.progress.as_ref())?;
+                match self.result_rx.recv_timeout(Duration::from_millis(100)) {
+                    Ok(result) => break Some(result),
+                    Err(mpsc::RecvTimeoutError::Timeout) => continue,
+                    Err(mpsc::RecvTimeoutError::Disconnected) => break None,
+                }
+            }
+        } else {
+            self.result_rx.try_recv().ok()
+        };
+        let Some(result) = result else {
+            return Ok(false);
+        };
+        self.process_worker_result(result)?;
+        Ok(true)
+    }
+
+    fn process_worker_result(&mut self, result: ImageJobResult) -> Result<(), std::io::Error> {
+        let Some(UriState::Loading(consumers)) = self.uri_states.remove(&result.uri) else {
+            return Ok(());
+        };
+        match result.result {
+            Ok(image) => {
+                self.uri_states
+                    .insert(result.uri, UriState::Ready(image.clone()));
+                for consumer in consumers {
+                    self.deliver_image(consumer, Ok(&image));
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => return Err(error),
+            Err(error) => {
+                for consumer in consumers {
+                    self.deliver_image(consumer, Err(&error));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn deliver_image(
+        &mut self,
+        consumer: ImageConsumer,
+        image: Result<&CachedImage, &std::io::Error>,
+    ) {
+        let Some(pair) = self.pending_pairs.get_mut(&consumer.candidate_id) else {
+            return;
+        };
+        let delivered = image
+            .map_err(|error| std::io::Error::new(error.kind(), error.to_string()))
+            .and_then(|image| {
+                let destination = pair.row_dir.join(match consumer.side {
+                    ImageSide::A => format!("a{}", image.suffix),
+                    ImageSide::B => format!("b{}", image.suffix),
+                });
+                materialize_cached_image(&image.file, &destination)?;
+                Ok((destination, image.suffix))
+            });
+        match delivered {
+            Ok(file) => match consumer.side {
+                ImageSide::A => pair.file_a = Some(file),
+                ImageSide::B => pair.file_b = Some(file),
+            },
+            Err(_) => {
+                let failed = self
+                    .pending_pairs
+                    .remove(&consumer.candidate_id)
+                    .expect("pending pair was just borrowed");
+                let _ = fs::remove_dir_all(failed.row_dir);
+                self.completed.push_back(MetadataSampleDownloadResult {
+                    id: consumer.candidate_id,
+                    success: false,
+                });
+                self.failed_pairs = self.failed_pairs.saturating_add(1);
+                return;
+            }
+        }
+        if pair.file_a.is_none() || pair.file_b.is_none() {
+            return;
+        }
+        let completed = self
+            .pending_pairs
+            .remove(&consumer.candidate_id)
+            .expect("completed pair exists");
+        let (file_a, suffix_a) = completed.file_a.expect("A image completed");
+        let (file_b, suffix_b) = completed.file_b.expect("B image completed");
+        let pool = completed.candidate.pool;
+        let staged = StagedPair {
+            sample: completed.candidate.sample,
+            file_a,
+            suffix_a,
+            file_b,
+            suffix_b,
+        };
+        match pool {
+            MetadataSamplePool::IntraChain => self.intra_chain.push(staged),
+            MetadataSamplePool::CrossChain => self.cross_chain.push(staged),
+        }
+        self.completed.push_back(MetadataSampleDownloadResult {
+            id: consumer.candidate_id,
+            success: true,
+        });
+    }
+
+    fn shutdown_workers(&mut self) {
+        self.shutdown.store(true, Ordering::SeqCst);
+        self.job_tx.take();
+        for worker in self.workers.drain(..) {
+            let _ = worker.join();
+        }
+    }
+
+    pub fn summary(&self) -> String {
+        format!(
+            "downloaded_pairs={}, failed_pairs={}, submitted_pairs={}, network_uris={}, reused_uris={}, coalesced_uris={}",
+            self.intra_chain.len() + self.cross_chain.len(),
+            self.failed_pairs,
+            self.attempted,
+            self.network_jobs,
+            self.cache_hits,
+            self.coalesced_uris,
+        )
+    }
+}
+
+impl MetadataSampleDownloadSink for StreamingDownloadSession {
+    fn submit(&mut self, candidates: &[MetadataSampleDownloadCandidate]) -> Result<(), DedupError> {
+        for candidate in candidates {
+            self.submit_candidate(candidate).map_err(io_to_dedup)?;
+        }
+        Ok(())
+    }
+
+    fn poll(&mut self, wait: bool) -> Result<Vec<MetadataSampleDownloadResult>, DedupError> {
+        if self.completed.is_empty() {
+            self.receive_worker_result(wait).map_err(io_to_dedup)?;
+        }
+        while self.receive_worker_result(false).map_err(io_to_dedup)? {}
+        Ok(self.completed.drain(..).collect())
+    }
+}
+
+impl Drop for StreamingDownloadSession {
+    fn drop(&mut self) {
+        self.shutdown_workers();
+    }
+}
+
+fn image_download_worker(
+    client: &Client,
+    cache_dir: &Path,
+    progress: &dyn ProgressObserver,
+    job_rx: &Arc<Mutex<Receiver<ImageJob>>>,
+    result_tx: &Sender<ImageJobResult>,
+) {
+    loop {
+        let job = {
+            let Ok(receiver) = job_rx.lock() else {
+                return;
+            };
+            match receiver.recv() {
+                Ok(job) => job,
+                Err(_) => return,
+            }
+        };
+        if progress.check_cancelled().is_err() {
+            return;
+        }
+        let result = load_cached_image(cache_dir, &job.cache_key).and_then(|cached| {
+            if let Some(cached) = cached {
+                return Ok(cached);
+            }
+            let image = download_image(client, &job.uri, progress)?;
+            persist_cached_image(cache_dir, &job.cache_key, image)
+        });
+        if result_tx
+            .send(ImageJobResult {
+                uri: job.uri,
+                result,
+            })
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
+fn image_cache_key(uri: &str) -> String {
+    let digest = Sha256::digest(uri.trim().as_bytes());
+    let mut key = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        use std::fmt::Write as _;
+        let _ = write!(key, "{byte:02x}");
+    }
+    key
+}
+
+fn cache_paths(cache_dir: &Path, key: &str) -> (PathBuf, PathBuf) {
+    (
+        cache_dir.join(format!("{key}.media")),
+        cache_dir.join(format!("{key}.json")),
+    )
+}
+
+fn load_cached_image(cache_dir: &Path, key: &str) -> Result<Option<CachedImage>, std::io::Error> {
+    let (media, record) = cache_paths(cache_dir, key);
+    let Ok(metadata) = fs::metadata(&media) else {
+        return Ok(None);
+    };
+    if metadata.len() > MAX_IMAGE_BYTES {
+        return Ok(None);
+    }
+    let Ok(record) = fs::read(&record) else {
+        return Ok(None);
+    };
+    let Ok(record) = serde_json::from_slice::<CachedImageRecord>(&record) else {
+        return Ok(None);
+    };
+    let Some(suffix) = cached_suffix(&record.suffix) else {
+        return Ok(None);
+    };
+    Ok(Some(CachedImage {
+        file: media,
+        suffix,
+    }))
+}
+
+fn persist_cached_image(
+    cache_dir: &Path,
+    key: &str,
+    image: DownloadedImage,
+) -> Result<CachedImage, std::io::Error> {
+    let (media, record) = cache_paths(cache_dir, key);
+    atomic_write(&media, &image.bytes)?;
+    let record_bytes = serde_json::to_vec(&CachedImageRecord {
+        suffix: image.suffix.to_owned(),
+    })
+    .map_err(std::io::Error::other)?;
+    atomic_write(&record, &record_bytes)?;
+    Ok(CachedImage {
+        file: media,
+        suffix: image.suffix,
+    })
+}
+
+fn cached_suffix(suffix: &str) -> Option<&'static str> {
+    match suffix {
+        ".png" => Some(".png"),
+        ".jpg" => Some(".jpg"),
+        ".gif" => Some(".gif"),
+        ".webp" => Some(".webp"),
+        ".svg" => Some(".svg"),
+        ".avif" => Some(".avif"),
+        ".bmp" => Some(".bmp"),
+        ".tiff" => Some(".tiff"),
+        ".ico" => Some(".ico"),
+        _ => None,
+    }
+}
+
+fn materialize_cached_image(source: &Path, destination: &Path) -> Result<(), std::io::Error> {
+    match fs::hard_link(source, destination) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(source, destination)?;
+            Ok(())
+        }
+    }
+}
+
+fn io_to_dedup(error: std::io::Error) -> DedupError {
+    if error.kind() == std::io::ErrorKind::Interrupted {
+        DedupError::Interrupted
+    } else {
+        DedupError::Message(error.to_string())
+    }
+}
+
+#[cfg(test)]
+fn dedup_to_io(error: DedupError) -> std::io::Error {
+    match error {
+        DedupError::Interrupted => {
+            std::io::Error::new(std::io::ErrorKind::Interrupted, "interrupted")
+        }
+        other => std::io::Error::other(other.to_string()),
     }
 }
 
@@ -478,32 +975,6 @@ fn build_http_client() -> Result<Client, reqwest::Error> {
         .build()
 }
 
-fn stage_pair(
-    client: &Client,
-    sample: &MetadataImagePairSample,
-    candidate_index: usize,
-    staging_root: &Path,
-    progress: &dyn ProgressObserver,
-) -> Result<StagedPair, std::io::Error> {
-    check_cancelled(progress)?;
-    let row_dir = staging_root.join(format!("candidate-{candidate_index}"));
-    fs::create_dir(&row_dir)?;
-    let image_a = download_image(client, &sample.image_uri_a, progress)?;
-    let file_a = row_dir.join(format!("a{}", image_a.suffix));
-    atomic_write(&file_a, &image_a.bytes)?;
-    check_cancelled(progress)?;
-    let image_b = download_image(client, &sample.image_uri_b, progress)?;
-    let file_b = row_dir.join(format!("b{}", image_b.suffix));
-    atomic_write(&file_b, &image_b.bytes)?;
-    Ok(StagedPair {
-        sample: sample.clone(),
-        file_a,
-        suffix_a: image_a.suffix,
-        file_b,
-        suffix_b: image_b.suffix,
-    })
-}
-
 fn relative_image_path(pool_name: &str, pool_index: usize, path: &Path) -> String {
     let file_name = path
         .file_name()
@@ -522,10 +993,12 @@ fn download_image(
         return decode_data_image(data);
     }
     let url = normalize_image_uri(image_uri)?;
+    let deadline = Instant::now() + TOTAL_IMAGE_TIMEOUT;
     let mut last_error = None;
     for attempt in 0..MAX_ATTEMPTS {
         check_cancelled(progress)?;
-        match send_public_get(client, &url, progress) {
+        check_deadline(deadline)?;
+        match send_public_get(client, &url, progress, deadline) {
             Ok((response, final_url)) if response.status().is_success() => {
                 if response
                     .content_length()
@@ -539,7 +1012,7 @@ fn download_image(
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or("")
                     .to_owned();
-                let bytes = read_response_body(response, progress)?;
+                let bytes = read_response_body(response, progress, deadline)?;
                 if bytes.len() as u64 > MAX_IMAGE_BYTES {
                     return Err(std::io::Error::other("image exceeds 50 MiB limit"));
                 }
@@ -565,6 +1038,7 @@ fn download_image(
                             .min(MAX_RETRY_DELAY.as_secs()),
                     ),
                     progress,
+                    deadline,
                 )?;
             }
             Err(error) => {
@@ -580,6 +1054,7 @@ fn download_image(
                 cancellable_sleep(
                     Duration::from_secs(1_u64 << attempt.min(2)).min(MAX_RETRY_DELAY),
                     progress,
+                    deadline,
                 )?;
             }
         }
@@ -593,14 +1068,17 @@ fn send_public_get(
     client: &Client,
     initial_url: &str,
     progress: &dyn ProgressObserver,
+    deadline: Instant,
 ) -> Result<(reqwest::blocking::Response, String), std::io::Error> {
     let mut current = Url::parse(initial_url)
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     for redirect in 0..=MAX_REDIRECTS {
         check_cancelled(progress)?;
+        let remaining = remaining_before(deadline)?;
         validate_request_url(&current)?;
         let response = client
             .get(current.clone())
+            .timeout(remaining.min(REQUEST_TIMEOUT))
             .send()
             .map_err(std::io::Error::other)?;
         if !is_followed_redirect(response.status()) {
@@ -630,12 +1108,14 @@ fn send_public_get(
 fn read_response_body(
     response: reqwest::blocking::Response,
     progress: &dyn ProgressObserver,
+    deadline: Instant,
 ) -> Result<Vec<u8>, std::io::Error> {
     let mut reader = response.take(MAX_IMAGE_BYTES + 1);
     let mut bytes = Vec::new();
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         check_cancelled(progress)?;
+        check_deadline(deadline)?;
         let read = reader.read(&mut buffer)?;
         if read == 0 {
             break;
@@ -648,16 +1128,33 @@ fn read_response_body(
 fn cancellable_sleep(
     duration: Duration,
     progress: &dyn ProgressObserver,
+    request_deadline: Instant,
 ) -> Result<(), std::io::Error> {
-    let deadline = Instant::now() + duration;
+    let deadline = (Instant::now() + duration).min(request_deadline);
     loop {
         check_cancelled(progress)?;
         let remaining = deadline.saturating_duration_since(Instant::now());
         if remaining.is_zero() {
-            return Ok(());
+            return check_deadline(request_deadline);
         }
         std::thread::sleep(remaining.min(Duration::from_millis(100)));
     }
+}
+
+fn remaining_before(deadline: Instant) -> Result<Duration, std::io::Error> {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "image download exceeded total deadline",
+        ))
+    } else {
+        Ok(remaining)
+    }
+}
+
+fn check_deadline(deadline: Instant) -> Result<(), std::io::Error> {
+    remaining_before(deadline).map(|_| ())
 }
 
 fn check_cancelled(progress: &dyn ProgressObserver) -> Result<(), std::io::Error> {
@@ -1049,9 +1546,14 @@ mod tests {
 
         let client = build_http_client().unwrap();
         assert_eq!(
-            send_public_get(&client, "http://127.0.0.1/image.png", &NoopProgress,)
-                .unwrap_err()
-                .kind(),
+            send_public_get(
+                &client,
+                "http://127.0.0.1/image.png",
+                &NoopProgress,
+                Instant::now() + TOTAL_IMAGE_TIMEOUT,
+            )
+            .unwrap_err()
+            .kind(),
             std::io::ErrorKind::PermissionDenied
         );
         let redirect = Url::parse("https://example.com/image.png")
@@ -1072,7 +1574,8 @@ mod tests {
             sample("0xfail", "unsupported://image"),
             sample("0xok", good),
         ];
-        let mut session = StreamingDownloadSession::new(temp.path(), 1).unwrap();
+        let mut session =
+            StreamingDownloadSession::new(temp.path(), 1, Arc::new(NoopProgress)).unwrap();
         let batch = candidates
             .into_iter()
             .map(|sample| (MetadataSamplePool::IntraChain, sample))
@@ -1080,6 +1583,14 @@ mod tests {
         assert_eq!(
             session.try_batch(&batch, &NoopProgress).unwrap(),
             vec![false, true]
+        );
+        assert!(session.summary().contains("network_uris=2"));
+        assert!(session.summary().contains("coalesced_uris=2"));
+        assert_eq!(
+            fs::read_dir(temp.path().join(IMAGE_CACHE_DIR))
+                .unwrap()
+                .count(),
+            2
         );
         let selected = session.finish().unwrap();
         assert_eq!(selected.len(), 1);
@@ -1143,7 +1654,8 @@ mod tests {
     fn insufficient_candidates_do_not_publish_partial_output() {
         let temp = tempfile::tempdir().unwrap();
         let candidate = sample("0xok", "data:image/png;base64,iVBORw0KGgo=");
-        let mut session = StreamingDownloadSession::new(temp.path(), 2).unwrap();
+        let mut session =
+            StreamingDownloadSession::new(temp.path(), 2, Arc::new(NoopProgress)).unwrap();
         assert_eq!(
             session
                 .try_batch(
@@ -1265,7 +1777,8 @@ mod tests {
     fn cancellation_stops_before_starting_candidate_downloads() {
         let temp = tempfile::tempdir().unwrap();
         let candidate = sample("0xcancelled", "data:image/png;base64,iVBORw0KGgo=");
-        let mut session = StreamingDownloadSession::new(temp.path(), 1).unwrap();
+        let mut session =
+            StreamingDownloadSession::new(temp.path(), 1, Arc::new(CancelledProgress)).unwrap();
         let error = match session.try_batch(
             &[(MetadataSamplePool::IntraChain, candidate)],
             &CancelledProgress,

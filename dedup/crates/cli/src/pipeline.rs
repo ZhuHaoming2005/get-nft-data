@@ -194,8 +194,12 @@ pub fn sample_metadata(
     load_options.load_token_uris = false;
     load_options.load_image_uris = true;
     load_options.load_metadata = true;
-    let mut downloads = StreamingDownloadSession::new(&config.output_dir, config.sample_pairs)
-        .map_err(|error| DedupError::Message(error.to_string()))?;
+    let mut downloads = StreamingDownloadSession::new(
+        &config.output_dir,
+        config.sample_pairs,
+        std::sync::Arc::new(progress.clone()),
+    )
+    .map_err(|error| DedupError::Message(error.to_string()))?;
     let mut store = load_entities_with_options(&config.inputs, &load_options, progress)?;
     let evm = evm_names.into_iter().collect();
     let result = sample_metadata_core(
@@ -204,22 +208,15 @@ pub fn sample_metadata(
         config.metadata_anchors,
         config.metadata_threshold,
         config.sample_pairs,
+        Some(&config.output_dir),
         progress,
-        |candidates| {
-            downloads.try_batch(candidates, progress).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::Interrupted {
-                    DedupError::Interrupted
-                } else {
-                    DedupError::Message(error.to_string())
-                }
-            })
-        },
+        &mut downloads,
     )?;
     if result.intra_chain.len() != config.sample_pairs
         || result.cross_chain.len() != config.sample_pairs
     {
         return Err(DedupError::Message(format!(
-            "random Metadata candidate search exhausted {}/{} profiles and scored {} candidate tasks with {} of {} intra-chain and {} of {} cross-chain complete media pairs",
+            "random Metadata candidate search exhausted {}/{} pool-profile slots and scored {} candidate tasks with {} of {} intra-chain and {} of {} cross-chain complete media pairs ({})",
             result.visited_profiles,
             result.total_profiles,
             result.scored_candidate_tasks,
@@ -227,6 +224,7 @@ pub fn sample_metadata(
             config.sample_pairs,
             result.cross_chain.len(),
             config.sample_pairs,
+            downloads.summary(),
         )));
     }
     downloads

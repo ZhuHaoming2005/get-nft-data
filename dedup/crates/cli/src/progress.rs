@@ -29,6 +29,15 @@ pub struct ProgressReporter {
     worker: Option<JoinHandle<()>>,
 }
 
+impl Clone for ProgressReporter {
+    fn clone(&self) -> Self {
+        Self {
+            shared: Arc::clone(&self.shared),
+            worker: None,
+        }
+    }
+}
+
 struct Shared {
     meta: Mutex<Meta>,
     completed: ProgressCounter,

@@ -13,8 +13,9 @@ pub mod uri;
 pub use entity::{Dimension, EntityStore, NftId, ScopeKind, StringId};
 pub use error::DedupError;
 pub use metadata::{
-    MetadataFastSampleResult, MetadataImagePairSample, MetadataRunResult, MetadataSamplePool,
-    MetadataStats, run_metadata, sample_metadata,
+    MetadataFastSampleResult, MetadataImagePairSample, MetadataRunResult,
+    MetadataSampleDownloadCandidate, MetadataSampleDownloadResult, MetadataSampleDownloadSink,
+    MetadataSamplePool, MetadataStats, run_metadata, sample_metadata,
 };
 pub use name::run_name;
 pub use parquet::{LoadOptions, load_entities, load_entities_with_options};
