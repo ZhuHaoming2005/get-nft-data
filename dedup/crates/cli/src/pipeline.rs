@@ -208,7 +208,6 @@ pub fn sample_metadata(
         config.metadata_anchors,
         config.metadata_threshold,
         config.sample_pairs,
-        Some(&config.output_dir),
         progress,
         &mut downloads,
     )?;

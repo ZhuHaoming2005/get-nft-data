@@ -7,7 +7,6 @@ publish.workspace = true
 
 [dependencies]
 ahash.workspace = true
-bincode.workspace = true
 getrandom.workspace = true
 arrow-array.workspace = true
 arrow-cast.workspace = true
@@ -19,5 +18,7 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
-tempfile.workspace = true
 unicode-normalization.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

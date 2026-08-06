@@ -94,7 +94,6 @@ pub fn sample_metadata(
     anchors_k: Option<usize>,
     content_threshold: f64,
     target_per_pool: usize,
-    candidate_cache_root: Option<&std::path::Path>,
     progress: &dyn ProgressObserver,
     downloads: &mut dyn MetadataSampleDownloadSink,
 ) -> Result<MetadataFastSampleResult, DedupError> {
@@ -105,7 +104,6 @@ pub fn sample_metadata(
         anchors_k,
         content_threshold,
         target_per_pool,
-        candidate_cache_root,
         progress,
         downloads,
     )

@@ -86,6 +86,8 @@ fn all_writes_complete_dedup_reports_without_sampling_outputs() {
     }
     assert!(!out.join("metadata_duplicate_pairs.csv").exists());
     assert!(!out.join("metadata_image_samples.csv").exists());
+    assert!(!out.join(".metadata-image-cache").exists());
+    assert!(!out.join(".metadata-candidate-cache").exists());
     let manifest: serde_json::Value =
         serde_json::from_slice(&std::fs::read(out.join("run_manifest.json")).unwrap()).unwrap();
     assert!(manifest.get("sample_pairs").is_none());
@@ -224,6 +226,8 @@ fn sample_metadata_fills_independent_intra_and_cross_chain_pools() {
         }
     }
     assert!(!out.join("metadata_sample_images/1").exists());
+    assert!(out.join(".metadata-image-cache").is_dir());
+    assert!(!out.join(".metadata-candidate-cache").exists());
     assert!(!out.join("summary.csv").exists());
     assert!(!out.join("run_manifest.json").exists());
 }

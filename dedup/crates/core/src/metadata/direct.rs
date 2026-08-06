@@ -14,15 +14,11 @@ use crate::sampling::{PairSampler, PairSamplingPlan, SamplingRandomness};
 use crate::scope::{ScopeCounts, ScopeKey};
 use crate::stats::SummaryAccumulator;
 use ahash::{AHashMap, AHashSet, AHasher};
-use bincode::Options;
 use rayon::prelude::*;
-use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use serde::Serialize;
 use std::collections::{BinaryHeap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::io::{Read, Write};
 use std::mem::MaybeUninit;
-use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 
@@ -53,9 +49,6 @@ const FAST_SAMPLE_MIN_TASKS_PER_PROFILE: usize = 16;
 const FAST_SAMPLE_PROBE_MULTIPLIER: usize = 16;
 const FAST_SAMPLE_DENSE_POSTING_TRIES: u64 = 128;
 const FAST_SAMPLE_ROUNDS: usize = 3;
-const FAST_SAMPLE_CANDIDATE_CACHE_VERSION: u32 = 1;
-const FAST_SAMPLE_CANDIDATE_CACHE_DIR: &str = ".metadata-candidate-cache";
-const FAST_SAMPLE_CANDIDATE_CACHE_FILE: &str = "candidate-index-v1.bin";
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct MetadataStats {
@@ -542,7 +535,6 @@ enum CrossProfilePlan {
     Indexed(ResidentCandidateIndex),
 }
 
-#[derive(Serialize, Deserialize)]
 struct ResidentCandidateIndex {
     shards: Box<[CompactCandidateEntries]>,
     token_ranges: Box<[TokenPostingRanges]>,
@@ -637,7 +629,7 @@ struct CandidatePlanStats {
     candidate_zero_overlap_prunes: u64,
 }
 
-#[derive(Default, Serialize, Deserialize)]
+#[derive(Default)]
 struct DocumentPrefixes {
     offsets: Box<[u32]>,
     terms: Box<[u32]>,
@@ -1749,258 +1741,6 @@ fn cross_profiles_may_supply_needed_pool(
     can_supply_intra || can_supply_cross
 }
 
-fn sample_candidate_fingerprint(
-    index: &DirectIndex,
-    threshold: f64,
-    image_eligible: &[bool],
-    progress: &dyn ProgressObserver,
-) -> Result<[u8; 32], DedupError> {
-    let total = (index.documents.len() as u64)
-        .saturating_add(index.profiles.len() as u64)
-        .saturating_add(index.token_profile_counts.len() as u64)
-        .saturating_add(image_eligible.len() as u64);
-    progress.begin_phase("candidate_cache_fingerprint", Some(total));
-    let mut digest = Sha256::new();
-    digest.update(b"dedup-metadata-sample-candidate-index");
-    digest.update(FAST_SAMPLE_CANDIDATE_CACHE_VERSION.to_le_bytes());
-    digest.update([
-        std::mem::size_of::<usize>() as u8,
-        u8::from(cfg!(target_endian = "big")),
-    ]);
-    digest.update(threshold.to_bits().to_le_bytes());
-    digest.update((index.query_profile_count as u64).to_le_bytes());
-    digest.update((index.profiles.len() as u64).to_le_bytes());
-    digest.update((index.documents.len() as u64).to_le_bytes());
-    let mut completed = 0_u64;
-    for (document_id, context_weight) in index.document_context_weights.iter().enumerate() {
-        digest.update(context_weight.to_le_bytes());
-        let terms = index.document_terms(document_id as DocumentId);
-        digest.update((terms.len() as u64).to_le_bytes());
-        for &(term, frequency) in terms {
-            digest.update(term.to_le_bytes());
-            digest.update(frequency.to_le_bytes());
-        }
-        completed += 1;
-        if completed.is_multiple_of(8_192) {
-            progress.add_completed(8_192);
-            progress.check_cancelled()?;
-            completed = 0;
-        }
-    }
-    for profile in &index.profiles {
-        digest.update([
-            u8::from(profile.is_evm),
-            u8::from(profile.is_solana),
-            u8::from(profile.has_empty_token_document),
-        ]);
-        digest.update(profile.max_document.to_le_bytes());
-        for word in profile.token_mask {
-            digest.update(word.to_le_bytes());
-        }
-        digest.update(profile.chain_mask.to_le_bytes());
-        let anchors = index.anchors(profile);
-        digest.update((anchors.len() as u64).to_le_bytes());
-        for &(token, document) in anchors {
-            digest.update(token.to_le_bytes());
-            digest.update(document.to_le_bytes());
-        }
-        let chains = index.chains(profile);
-        digest.update((chains.len() as u64).to_le_bytes());
-        for &(chain, count) in chains {
-            digest.update(chain.to_le_bytes());
-            digest.update(count.to_le_bytes());
-        }
-        completed += 1;
-        if completed.is_multiple_of(8_192) {
-            progress.add_completed(8_192);
-            progress.check_cancelled()?;
-            completed = 0;
-        }
-    }
-    digest.update((index.token_profile_counts.len() as u64).to_le_bytes());
-    for &count in &index.token_profile_counts {
-        digest.update(count.to_le_bytes());
-        completed += 1;
-        if completed.is_multiple_of(8_192) {
-            progress.add_completed(8_192);
-            progress.check_cancelled()?;
-            completed = 0;
-        }
-    }
-    digest.update((image_eligible.len() as u64).to_le_bytes());
-    for eligible in image_eligible {
-        digest.update([u8::from(*eligible)]);
-        completed += 1;
-        if completed.is_multiple_of(8_192) {
-            progress.add_completed(8_192);
-            progress.check_cancelled()?;
-            completed = 0;
-        }
-    }
-    progress.add_completed(completed);
-    progress.check_cancelled()?;
-    Ok(digest.finalize().into())
-}
-
-fn candidate_cache_options(limit: u64) -> impl Options {
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(limit)
-}
-
-struct CandidateCacheReader<'a> {
-    file: std::fs::File,
-    progress: &'a dyn ProgressObserver,
-}
-
-impl Read for CandidateCacheReader<'_> {
-    fn read(&mut self, buffer: &mut [u8]) -> Result<usize, std::io::Error> {
-        self.progress.check_cancelled().map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::Interrupted, error.to_string())
-        })?;
-        let read = self.file.read(buffer)?;
-        self.progress.add_completed(read as u64);
-        Ok(read)
-    }
-}
-
-struct CandidateCacheWriter<'a, W> {
-    inner: W,
-    progress: &'a dyn ProgressObserver,
-}
-
-impl<W: Write> Write for CandidateCacheWriter<'_, W> {
-    fn write(&mut self, buffer: &[u8]) -> Result<usize, std::io::Error> {
-        self.progress.check_cancelled().map_err(|error| {
-            std::io::Error::new(std::io::ErrorKind::Interrupted, error.to_string())
-        })?;
-        let written = self.inner.write(buffer)?;
-        self.progress.add_completed(written as u64);
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> Result<(), std::io::Error> {
-        self.inner.flush()
-    }
-}
-
-fn load_cached_candidate_plan(
-    cache_root: &Path,
-    fingerprint: [u8; 32],
-    progress: &dyn ProgressObserver,
-) -> Result<Option<ResidentCandidateIndex>, DedupError> {
-    let path = cache_root
-        .join(FAST_SAMPLE_CANDIDATE_CACHE_DIR)
-        .join(FAST_SAMPLE_CANDIDATE_CACHE_FILE);
-    let Ok(file) = std::fs::File::open(path) else {
-        return Ok(None);
-    };
-    let Ok(metadata) = file.metadata() else {
-        return Ok(None);
-    };
-    let length = metadata.len();
-    progress.begin_phase("candidate_cache_load", Some(length));
-    let mut reader = CandidateCacheReader { file, progress };
-    let mut version = [0_u8; 4];
-    let mut cached_fingerprint = [0_u8; 32];
-    if reader.read_exact(&mut version).is_err()
-        || reader.read_exact(&mut cached_fingerprint).is_err()
-    {
-        progress.check_cancelled()?;
-        return Ok(None);
-    }
-    if u32::from_le_bytes(version) != FAST_SAMPLE_CANDIDATE_CACHE_VERSION
-        || cached_fingerprint != fingerprint
-    {
-        return Ok(None);
-    }
-    match candidate_cache_options(length.saturating_sub(36).saturating_add(1))
-        .deserialize_from(reader)
-    {
-        Ok(index) => Ok(Some(index)),
-        Err(error) => {
-            if matches!(*error, bincode::ErrorKind::Io(ref io) if io.kind() == std::io::ErrorKind::Interrupted)
-            {
-                Err(DedupError::Interrupted)
-            } else {
-                Ok(None)
-            }
-        }
-    }
-}
-
-fn persist_candidate_plan(
-    cache_root: &Path,
-    fingerprint: [u8; 32],
-    index: &ResidentCandidateIndex,
-    progress: &dyn ProgressObserver,
-) -> Result<(), std::io::Error> {
-    let directory = cache_root.join(FAST_SAMPLE_CANDIDATE_CACHE_DIR);
-    std::fs::create_dir_all(&directory)?;
-    let path = directory.join(FAST_SAMPLE_CANDIDATE_CACHE_FILE);
-    let mut temporary = tempfile::NamedTempFile::new_in(&directory)?;
-    progress.begin_phase("candidate_cache_write", None);
-    {
-        let mut writer = CandidateCacheWriter {
-            inner: &mut temporary,
-            progress,
-        };
-        writer.write_all(&FAST_SAMPLE_CANDIDATE_CACHE_VERSION.to_le_bytes())?;
-        writer.write_all(&fingerprint)?;
-        candidate_cache_options(u64::MAX)
-            .serialize_into(&mut writer, index)
-            .map_err(std::io::Error::other)?;
-        writer.flush()?;
-    }
-    temporary.flush()?;
-    temporary.as_file().sync_all()?;
-    temporary.persist(path).map_err(|error| error.error)?;
-    Ok(())
-}
-
-fn sample_candidate_plan(
-    index: &DirectIndex,
-    threshold: f64,
-    exhaustive_cross_tasks: u64,
-    image_eligible: &[bool],
-    cache_root: Option<&Path>,
-    progress: &dyn ProgressObserver,
-) -> Result<CrossProfilePlan, DedupError> {
-    if threshold <= 0.0 || exhaustive_cross_tasks == 0 {
-        return build_candidate_plan(
-            index,
-            threshold,
-            exhaustive_cross_tasks,
-            Some(image_eligible),
-            progress,
-        )
-        .map(|(plan, _)| plan);
-    }
-    let fingerprint = cache_root
-        .map(|_| sample_candidate_fingerprint(index, threshold, image_eligible, progress))
-        .transpose()?;
-    if let (Some(cache_root), Some(fingerprint)) = (cache_root, fingerprint)
-        && let Some(cached) = load_cached_candidate_plan(cache_root, fingerprint, progress)?
-    {
-        return Ok(CrossProfilePlan::Indexed(cached));
-    }
-    let (plan, _) = build_candidate_plan(
-        index,
-        threshold,
-        exhaustive_cross_tasks,
-        Some(image_eligible),
-        progress,
-    )?;
-    if let (Some(cache_root), Some(fingerprint), CrossProfilePlan::Indexed(index)) =
-        (cache_root, fingerprint, &plan)
-        && let Err(error) = persist_candidate_plan(cache_root, fingerprint, index, progress)
-        && error.kind() == std::io::ErrorKind::Interrupted
-    {
-        return Err(DedupError::Interrupted);
-    }
-    Ok(plan)
-}
-
 #[allow(clippy::too_many_arguments)]
 pub fn sample_direct_releasing(
     store: &mut EntityStore,
@@ -2008,7 +1748,6 @@ pub fn sample_direct_releasing(
     anchors_k: Option<usize>,
     threshold: f64,
     target_per_pool: usize,
-    candidate_cache_root: Option<&Path>,
     progress: &dyn ProgressObserver,
     downloads: &mut dyn MetadataSampleDownloadSink,
 ) -> Result<MetadataFastSampleResult, DedupError> {
@@ -2037,12 +1776,11 @@ pub fn sample_direct_releasing(
         .take_while(|profile_id| (*profile_id as usize) < index.query_profile_count)
         .collect::<Vec<_>>();
     let exhaustive_cross_tasks = choose_two(all_image_profiles.len() as u64);
-    let candidate_plan = sample_candidate_plan(
+    let (candidate_plan, _) = build_candidate_plan(
         &index,
         threshold,
         exhaustive_cross_tasks,
-        &image_eligible,
-        candidate_cache_root,
+        Some(&image_eligible),
         progress,
     )?;
     let randomness = FastSamplingRandomness::from_os()?;
@@ -3345,7 +3083,6 @@ fn empty_profile_buckets() -> RawProfileBuckets {
     }
 }
 
-#[derive(Serialize, Deserialize)]
 struct DensePostingIndex {
     offsets: Box<[usize]>,
     profiles: Box<[u32]>,
@@ -3453,14 +3190,12 @@ struct CandidateEntries {
     token_exact: Vec<(u32, u32, u32)>,
 }
 
-#[derive(Serialize, Deserialize)]
 struct CompactCandidateEntries {
     token_full: CompactPosting<u64>,
     global_exact: CompactPosting<u32>,
     token_exact: CompactPosting<u64>,
 }
 
-#[derive(Serialize, Deserialize)]
 struct CompactPosting<K> {
     keys: Box<[K]>,
     offsets: Box<[usize]>,
@@ -3471,7 +3206,7 @@ struct CompactPosting<K> {
     logical_len: u64,
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy)]
 struct DensePosting {
     word_start: usize,
     word_len: u32,
@@ -3842,7 +3577,7 @@ impl<'a> CompactTokenPosting<'a> {
     }
 }
 
-#[derive(Clone, Copy, Serialize, Deserialize)]
+#[derive(Clone, Copy)]
 struct PostingKeyRange {
     start: usize,
     end: usize,
@@ -3857,7 +3592,7 @@ impl Default for PostingKeyRange {
     }
 }
 
-#[derive(Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Clone, Copy, Default)]
 struct TokenPostingRanges {
     full: PostingKeyRange,
     exact: PostingKeyRange,
@@ -9122,69 +8857,6 @@ mod tests {
     }
 
     #[test]
-    fn fast_sample_candidate_cache_round_trips_with_a_strict_fingerprint() {
-        let evm = HashSet::from(["ethereum".to_owned()]);
-        let mut store = EntityStore::with_options(1, &evm.iter().cloned().collect());
-        for contract in 0..32 {
-            store
-                .try_ingest_row(input_with_image(
-                    "ethereum",
-                    &format!("0x{contract:x}"),
-                    "1",
-                    &format!("https://images.example/{contract}.png"),
-                    &format!(r#"{{"shared":"alpha beta","unique":"{contract}"}}"#),
-                ))
-                .unwrap();
-        }
-        let index = build_index_with_image_witnesses(&store, &evm, 1, &NoopProgress, true).unwrap();
-        let eligible = vec![true; index.profiles.len()];
-        let fingerprint =
-            sample_candidate_fingerprint(&index, 0.1, &eligible, &NoopProgress).unwrap();
-        assert_ne!(
-            fingerprint,
-            sample_candidate_fingerprint(&index, 0.2, &eligible, &NoopProgress).unwrap()
-        );
-        let exhaustive = choose_two(index.profiles.len() as u64);
-        let (plan, _) =
-            build_candidate_plan(&index, 0.1, exhaustive, Some(&eligible), &NoopProgress).unwrap();
-        let CrossProfilePlan::Indexed(candidate_index) = plan else {
-            panic!("positive threshold should create a candidate index");
-        };
-        let cache_root = tempfile::tempdir().unwrap();
-        persist_candidate_plan(
-            cache_root.path(),
-            fingerprint,
-            &candidate_index,
-            &NoopProgress,
-        )
-        .unwrap();
-        let loaded = load_cached_candidate_plan(cache_root.path(), fingerprint, &NoopProgress)
-            .unwrap()
-            .unwrap();
-
-        assert_eq!(loaded.include_bm25, candidate_index.include_bm25);
-        assert_eq!(loaded.shards.len(), candidate_index.shards.len());
-        assert_eq!(
-            loaded.token_ranges.len(),
-            candidate_index.token_ranges.len()
-        );
-        assert_eq!(
-            loaded.global_full.logical_len,
-            candidate_index.global_full.logical_len
-        );
-        assert_eq!(loaded.prefixes.offsets, candidate_index.prefixes.offsets);
-        assert!(
-            load_cached_candidate_plan(
-                cache_root.path(),
-                sample_candidate_fingerprint(&index, 0.2, &eligible, &NoopProgress).unwrap(),
-                &NoopProgress,
-            )
-            .unwrap()
-            .is_none()
-        );
-    }
-
-    #[test]
     fn fast_sample_pair_coordinates_cover_each_pair_once() {
         for members in 2_u64..32 {
             let pairs = (0..choose_two(members))
@@ -9221,7 +8893,6 @@ mod tests {
             Some(8),
             1.0,
             1,
-            None,
             &NoopProgress,
             &mut downloads,
         )
@@ -9263,7 +8934,6 @@ mod tests {
             Some(8),
             1.0,
             1,
-            None,
             &NoopProgress,
             &mut downloads,
         )
@@ -9312,7 +8982,6 @@ mod tests {
             Some(8),
             1.0,
             1,
-            None,
             &NoopProgress,
             &mut downloads,
         )
@@ -9425,7 +9094,6 @@ mod tests {
             Some(8),
             1.0,
             1,
-            None,
             &NoopProgress,
             &mut downloads,
         )
