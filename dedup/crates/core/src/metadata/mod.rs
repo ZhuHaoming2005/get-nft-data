@@ -8,13 +8,24 @@ pub use direct::MetadataStats;
 use crate::entity::EntityStore;
 use crate::error::DedupError;
 use crate::progress::ProgressObserver;
-use crate::sampling::DuplicatePairSamples;
 use crate::stats::SummaryAccumulator;
 
 pub struct MetadataRunResult {
     pub stats: MetadataStats,
-    pub samples: DuplicatePairSamples,
-    pub image_samples: Vec<MetadataImagePairSample>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MetadataSamplePool {
+    IntraChain,
+    CrossChain,
+}
+
+pub struct MetadataFastSampleResult {
+    pub intra_chain: Vec<MetadataImagePairSample>,
+    pub cross_chain: Vec<MetadataImagePairSample>,
+    pub scored_candidate_tasks: u64,
+    pub visited_profiles: u64,
+    pub total_profiles: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -49,35 +60,30 @@ pub fn run_metadata(
         progress,
     )?;
 
-    Ok(MetadataRunResult {
-        stats,
-        samples: DuplicatePairSamples::default(),
-        image_samples: Vec::new(),
-    })
+    Ok(MetadataRunResult { stats })
 }
 
-pub fn run_metadata_with_samples(
+#[allow(clippy::too_many_arguments)]
+pub fn sample_metadata<F>(
     store: &mut EntityStore,
     evm_chains: &std::collections::HashSet<String>,
     anchors_k: Option<usize>,
     content_threshold: f64,
-    acc: &mut SummaryAccumulator,
+    target_per_pool: usize,
     progress: &dyn ProgressObserver,
-    sample_size: usize,
-) -> Result<MetadataRunResult, DedupError> {
-    progress.set_stage("metadata");
-    let (stats, samples, image_samples) = direct::run_direct_releasing_with_samples(
+    mut accept: F,
+) -> Result<MetadataFastSampleResult, DedupError>
+where
+    F: FnMut(&[(MetadataSamplePool, MetadataImagePairSample)]) -> Result<Vec<bool>, DedupError>,
+{
+    progress.set_stage("sample_metadata");
+    direct::sample_direct_releasing(
         store,
         evm_chains,
         anchors_k,
         content_threshold,
-        acc,
+        target_per_pool,
         progress,
-        sample_size,
-    )?;
-    Ok(MetadataRunResult {
-        stats,
-        samples,
-        image_samples,
-    })
+        &mut accept,
+    )
 }

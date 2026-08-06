@@ -1,8 +1,10 @@
 use dedup_core::{
-    Dimension, DuplicatePairSample, DuplicatePairSamples, EntityStore, MetadataStats, ScopeKind,
+    ChainDuplicatePairSamples, ChainPairDuplicatePairSamples, Dimension, DuplicatePairSample,
+    DuplicatePairSamples, EntityStore, MetadataImagePairSample, MetadataStats, ScopeKind,
     SummaryAccumulator,
 };
 use serde::Serialize;
+use std::collections::BTreeMap;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::Path;
@@ -55,8 +57,6 @@ struct RunManifest {
     name_threshold: Option<f64>,
     metadata_threshold: f64,
     metadata_anchors: Option<usize>,
-    sample_pairs: usize,
-    sample_candidate_limit: Option<usize>,
     threads: usize,
     metadata_direct: Option<MetadataStats>,
 }
@@ -90,8 +90,6 @@ pub struct ReportRequest<'a> {
     pub name_threshold: Option<f64>,
     pub metadata_threshold: f64,
     pub metadata_anchors: Option<usize>,
-    pub sample_pairs: usize,
-    pub sample_candidate_limit: Option<usize>,
     pub threads: usize,
     pub interned_strings: usize,
     pub token_uri_postings: usize,
@@ -139,8 +137,6 @@ pub fn write_reports(output_dir: &Path, request: ReportRequest<'_>) -> Result<()
         name_threshold: request.name_threshold,
         metadata_threshold: request.metadata_threshold,
         metadata_anchors: request.metadata_anchors,
-        sample_pairs: request.sample_pairs,
-        sample_candidate_limit: request.sample_candidate_limit,
         threads: request.threads,
         metadata_direct: request.metadata_direct,
     };
@@ -178,27 +174,24 @@ pub fn write_reports(output_dir: &Path, request: ReportRequest<'_>) -> Result<()
     commit_reports(output_dir, staging.path(), &REPORT_FILES)
 }
 
-pub fn write_duplicate_pair_samples(
-    output_dir: &Path,
-    file_name: &'static str,
+pub(crate) fn write_duplicate_pair_sample_files(
+    directory: &Path,
+    file_name: &str,
     samples: &DuplicatePairSamples,
-) -> Result<(), ReportError> {
-    fs::create_dir_all(output_dir)?;
-    let staging = Builder::new()
-        .prefix(".dedup-sample-staging-")
-        .tempdir_in(output_dir)?;
+) -> Result<[String; 4], ReportError> {
+    fs::create_dir_all(directory)?;
     let stem = file_name.strip_suffix(".csv").unwrap_or(file_name);
     let intra_name = format!("{stem}_intra_chain.csv");
     let matrix_name = format!("{stem}_chain_matrix.csv");
     let cross_summary_name = format!("{stem}_cross_chain_summary.csv");
 
-    let mut writer = csv::Writer::from_path(staging.path().join(file_name))?;
+    let mut writer = csv::Writer::from_path(directory.join(file_name))?;
     write_pair_header(&mut writer, &[])?;
     write_pairs(&mut writer, &[], &samples.all_chains)?;
     writer.flush()?;
     drop(writer);
 
-    let mut writer = csv::Writer::from_path(staging.path().join(&intra_name))?;
+    let mut writer = csv::Writer::from_path(directory.join(&intra_name))?;
     write_pair_header(&mut writer, &["chain"])?;
     for group in &samples.intra_chain {
         write_pairs(&mut writer, &[&group.chain], &group.pairs)?;
@@ -206,7 +199,7 @@ pub fn write_duplicate_pair_samples(
     writer.flush()?;
     drop(writer);
 
-    let mut writer = csv::Writer::from_path(staging.path().join(&matrix_name))?;
+    let mut writer = csv::Writer::from_path(directory.join(&matrix_name))?;
     write_pair_header(&mut writer, &["primary_chain", "secondary_chain"])?;
     for group in &samples.chain_pairs {
         write_pairs(&mut writer, &[&group.chain_a, &group.chain_b], &group.pairs)?;
@@ -214,7 +207,7 @@ pub fn write_duplicate_pair_samples(
     writer.flush()?;
     drop(writer);
 
-    let mut writer = csv::Writer::from_path(staging.path().join(&cross_summary_name))?;
+    let mut writer = csv::Writer::from_path(directory.join(&cross_summary_name))?;
     write_pair_header(&mut writer, &["chain"])?;
     for group in &samples.cross_chain_summary {
         write_pairs(&mut writer, &[&group.chain], &group.pairs)?;
@@ -222,13 +215,76 @@ pub fn write_duplicate_pair_samples(
     writer.flush()?;
     drop(writer);
 
-    let files = [
-        file_name,
-        intra_name.as_str(),
-        matrix_name.as_str(),
-        cross_summary_name.as_str(),
-    ];
-    commit_reports(output_dir, staging.path(), &files)
+    Ok([
+        file_name.to_owned(),
+        intra_name,
+        matrix_name,
+        cross_summary_name,
+    ])
+}
+
+pub(crate) fn metadata_sample_pair_reports(
+    samples: &[MetadataImagePairSample],
+) -> DuplicatePairSamples {
+    let all_chains = samples
+        .iter()
+        .map(|sample| DuplicatePairSample {
+            contract_a_chain: sample.contract_a_chain.clone(),
+            contract_a_address: sample.contract_a_address.clone(),
+            contract_b_chain: sample.contract_b_chain.clone(),
+            contract_b_address: sample.contract_b_address.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut intra_chain = BTreeMap::<String, Vec<DuplicatePairSample>>::new();
+    let mut chain_pairs = BTreeMap::<(String, String), Vec<DuplicatePairSample>>::new();
+    let mut cross_chain_summary = BTreeMap::<String, Vec<DuplicatePairSample>>::new();
+    for pair in &all_chains {
+        if pair.contract_a_chain == pair.contract_b_chain {
+            intra_chain
+                .entry(pair.contract_a_chain.clone())
+                .or_default()
+                .push(pair.clone());
+        } else {
+            let chains = if pair.contract_a_chain < pair.contract_b_chain {
+                (pair.contract_a_chain.clone(), pair.contract_b_chain.clone())
+            } else {
+                (pair.contract_b_chain.clone(), pair.contract_a_chain.clone())
+            };
+            chain_pairs
+                .entry(chains.clone())
+                .or_default()
+                .push(pair.clone());
+            cross_chain_summary
+                .entry(chains.0)
+                .or_default()
+                .push(pair.clone());
+            cross_chain_summary
+                .entry(chains.1)
+                .or_default()
+                .push(pair.clone());
+        }
+    }
+    DuplicatePairSamples {
+        all_chains,
+        intra_chain: intra_chain
+            .into_iter()
+            .map(|(chain, pairs)| ChainDuplicatePairSamples { chain, pairs })
+            .collect(),
+        chain_pairs: chain_pairs
+            .into_iter()
+            .map(
+                |((chain_a, chain_b), pairs)| ChainPairDuplicatePairSamples {
+                    chain_a,
+                    chain_b,
+                    pairs,
+                },
+            )
+            .collect(),
+        cross_chain_summary: cross_chain_summary
+            .into_iter()
+            .map(|(chain, pairs)| ChainDuplicatePairSamples { chain, pairs })
+            .collect(),
+    }
 }
 
 fn write_pair_header(

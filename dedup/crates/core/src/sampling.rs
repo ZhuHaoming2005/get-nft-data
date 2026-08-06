@@ -1,4 +1,4 @@
-use crate::entity::{ChainId, ContractId, EntityStore};
+use crate::entity::{ChainId, ContractId};
 use crate::error::DedupError;
 use ahash::{AHashMap, AHashSet};
 use sha2::{Digest, Sha256};
@@ -33,14 +33,17 @@ impl SamplingRandomness {
     }
 
     pub(crate) fn index(&self, domain: &[u8], salt: u64, ordinal: u64, len: usize) -> usize {
+        self.index_u64(domain, salt, ordinal, len as u64) as usize
+    }
+
+    pub(crate) fn index_u64(&self, domain: &[u8], salt: u64, ordinal: u64, len: u64) -> u64 {
         debug_assert_ne!(len, 0);
-        let len = len as u64;
         let minimum = len.wrapping_neg() % len;
         let mut retry = 0_u64;
         loop {
             let value = self.score(domain, &[salt, ordinal, retry]);
             if value >= minimum {
-                return (value % len) as usize;
+                return value % len;
             }
             retry = retry.wrapping_add(1);
         }
@@ -128,26 +131,6 @@ pub(crate) struct PairSamplingPlan {
 }
 
 impl PairSamplingPlan {
-    pub(crate) fn new(store: &EntityStore, capacity: usize) -> Result<Self, DedupError> {
-        if capacity == 0 {
-            return Ok(Self::disabled());
-        }
-        Ok(Self {
-            capacity,
-            randomness: SamplingRandomness::from_os()?,
-            contract_chains: if capacity == 0 {
-                std::sync::Arc::from([])
-            } else {
-                store
-                    .contracts
-                    .iter()
-                    .map(|contract| contract.chain_id)
-                    .collect::<Vec<_>>()
-                    .into()
-            },
-        })
-    }
-
     pub(crate) fn disabled() -> Self {
         Self {
             capacity: 0,
@@ -563,6 +546,7 @@ impl PairReservoir {
         }
     }
 
+    #[cfg(test)]
     fn into_pairs(self) -> Vec<ContractPair> {
         let mut pairs = self
             .heap
@@ -581,65 +565,6 @@ fn merge_reservoir_maps<K: Eq + std::hash::Hash>(
 ) {
     for (key, reservoir) in source {
         target.entry(key).or_default().merge(reservoir, capacity);
-    }
-}
-
-pub(crate) fn materialize_samples(
-    store: &EntityStore,
-    sampler: PairSampler,
-) -> DuplicatePairSamples {
-    fn materialize_pairs(
-        store: &EntityStore,
-        pairs: Vec<ContractPair>,
-    ) -> Vec<DuplicatePairSample> {
-        pairs
-            .into_iter()
-            .map(|pair| {
-                let left = &store.contracts[pair.left as usize];
-                let right = &store.contracts[pair.right as usize];
-                DuplicatePairSample {
-                    contract_a_chain: store.chain_name(left.chain_id).to_owned(),
-                    contract_a_address: left.address.clone(),
-                    contract_b_chain: store.chain_name(right.chain_id).to_owned(),
-                    contract_b_address: right.address.clone(),
-                }
-            })
-            .collect()
-    }
-
-    let mut intra_chain = sampler.intra_chain.into_iter().collect::<Vec<_>>();
-    intra_chain.sort_unstable_by_key(|(chain, _)| *chain);
-    let mut chain_pairs = sampler.chain_pairs.into_iter().collect::<Vec<_>>();
-    chain_pairs.sort_unstable_by_key(|(chains, _)| *chains);
-    let mut cross_chain_summary = sampler.cross_chain_summary.into_iter().collect::<Vec<_>>();
-    cross_chain_summary.sort_unstable_by_key(|(chain, _)| *chain);
-
-    DuplicatePairSamples {
-        all_chains: materialize_pairs(store, sampler.all_chains.into_pairs()),
-        intra_chain: intra_chain
-            .into_iter()
-            .map(|(chain, reservoir)| ChainDuplicatePairSamples {
-                chain: store.chain_name(chain).to_owned(),
-                pairs: materialize_pairs(store, reservoir.into_pairs()),
-            })
-            .collect(),
-        chain_pairs: chain_pairs
-            .into_iter()
-            .map(
-                |((chain_a, chain_b), reservoir)| ChainPairDuplicatePairSamples {
-                    chain_a: store.chain_name(chain_a).to_owned(),
-                    chain_b: store.chain_name(chain_b).to_owned(),
-                    pairs: materialize_pairs(store, reservoir.into_pairs()),
-                },
-            )
-            .collect(),
-        cross_chain_summary: cross_chain_summary
-            .into_iter()
-            .map(|(chain, reservoir)| ChainDuplicatePairSamples {
-                chain: store.chain_name(chain).to_owned(),
-                pairs: materialize_pairs(store, reservoir.into_pairs()),
-            })
-            .collect(),
     }
 }
 

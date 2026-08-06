@@ -1,5 +1,6 @@
+use crate::report::{metadata_sample_pair_reports, write_duplicate_pair_sample_files};
 use base64::Engine;
-use dedup_core::{MetadataImagePairSample, ProgressObserver};
+use dedup_core::{MetadataImagePairSample, MetadataSamplePool, ProgressObserver};
 use rayon::prelude::*;
 use reqwest::blocking::Client;
 use reqwest::dns::{Addrs, Name, Resolve, Resolving};
@@ -22,6 +23,11 @@ const MAX_REDIRECTS: usize = 10;
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
+const TRANSACTION_ITEMS: &str = ".sample-transaction-items.json";
+const TRANSACTION_STATE: &str = ".sample-transaction-state";
+const TRANSACTION_BACKUP: &str = ".sample-transaction-backup";
+const TRANSACTION_COMMITTING: &[u8] = b"committing\n";
+const TRANSACTION_COMMITTED: &[u8] = b"committed\n";
 
 #[derive(Debug)]
 struct PublicDnsResolver;
@@ -44,6 +50,8 @@ struct DownloadedImage {
 
 struct DownloadRow {
     index: usize,
+    pool: &'static str,
+    pool_index: usize,
     file_a: String,
     error_a: String,
     file_b: String,
@@ -62,6 +70,7 @@ struct StagedPair {
 
 #[derive(Serialize)]
 struct NftSampleRecord<'a> {
+    sample_pool: &'static str,
     chain: &'a str,
     contract_address: &'a str,
     token_id: &'a str,
@@ -70,99 +79,156 @@ struct NftSampleRecord<'a> {
     metadata: serde_json::Value,
 }
 
-pub enum DownloadOutcome {
-    Complete(Vec<MetadataImagePairSample>),
-    Insufficient {
-        successful: usize,
-        candidates: usize,
-    },
+pub struct StreamingDownloadSession {
+    output_dir: PathBuf,
+    staging: tempfile::TempDir,
+    client: Client,
+    pool: rayon::ThreadPool,
+    intra_chain: Vec<StagedPair>,
+    cross_chain: Vec<StagedPair>,
+    attempted: usize,
 }
 
-pub fn clear_published_metadata_image_samples(output_dir: &Path) -> Result<(), std::io::Error> {
-    let manifest = output_dir.join("metadata_image_samples.csv");
-    if manifest.exists() {
-        fs::remove_file(manifest)?;
+impl StreamingDownloadSession {
+    pub fn new(output_dir: &Path, target_per_pool: usize) -> Result<Self, std::io::Error> {
+        fs::create_dir_all(output_dir)?;
+        recover_sample_transactions(output_dir)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".metadata-fast-sample-")
+            .tempdir_in(output_dir)?;
+        let client = build_http_client().map_err(std::io::Error::other)?;
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(DOWNLOAD_WORKERS)
+            .build()
+            .map_err(std::io::Error::other)?;
+        Ok(Self {
+            output_dir: output_dir.to_owned(),
+            staging,
+            client,
+            pool,
+            intra_chain: Vec::with_capacity(target_per_pool),
+            cross_chain: Vec::with_capacity(target_per_pool),
+            attempted: 0,
+        })
     }
-    let image_root = output_dir.join("metadata_sample_images");
-    if image_root.exists() {
-        fs::remove_dir_all(image_root)?;
+
+    pub fn try_batch(
+        &mut self,
+        candidates: &[(MetadataSamplePool, MetadataImagePairSample)],
+        progress: &dyn ProgressObserver,
+    ) -> Result<Vec<bool>, std::io::Error> {
+        let first_index = self.attempted + 1;
+        self.attempted += candidates.len();
+        let attempted = self.pool.install(|| {
+            candidates
+                .par_iter()
+                .enumerate()
+                .map(|(offset, (_, sample))| {
+                    stage_pair(
+                        &self.client,
+                        sample,
+                        first_index + offset,
+                        self.staging.path(),
+                        progress,
+                    )
+                })
+                .collect::<Vec<_>>()
+        });
+        let mut accepted = Vec::with_capacity(candidates.len());
+        for ((pool, _), staged) in candidates.iter().zip(attempted) {
+            match staged {
+                Ok(staged) => {
+                    progress.add_activity(1);
+                    match pool {
+                        MetadataSamplePool::IntraChain => self.intra_chain.push(staged),
+                        MetadataSamplePool::CrossChain => self.cross_chain.push(staged),
+                    }
+                    accepted.push(true);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
+                    return Err(error);
+                }
+                Err(_) => {
+                    progress.add_activity(1);
+                    accepted.push(false);
+                }
+            }
+        }
+        Ok(accepted)
+    }
+
+    pub fn finish(
+        self,
+    ) -> Result<Vec<MetadataImagePairSample>, Box<dyn std::error::Error + Send + Sync>> {
+        let output_dir = self.output_dir;
+        let staging = self.staging;
+        let mut successful = self
+            .intra_chain
+            .into_iter()
+            .map(|pair| (MetadataSamplePool::IntraChain, pair))
+            .collect::<Vec<_>>();
+        successful.extend(
+            self.cross_chain
+                .into_iter()
+                .map(|pair| (MetadataSamplePool::CrossChain, pair)),
+        );
+        shuffle_staged_pairs(&mut successful)?;
+        let staging_root = staging.keep();
+        let published = publish_staged_pairs(&output_dir, &staging_root, successful);
+        if published.is_ok() || !staging_root.join(TRANSACTION_STATE).exists() {
+            let _ = fs::remove_dir_all(&staging_root);
+        }
+        published
+    }
+}
+
+fn shuffle_staged_pairs<T>(values: &mut [T]) -> Result<(), std::io::Error> {
+    for upper in (2..=values.len()).rev() {
+        let limit = upper as u64;
+        let minimum = limit.wrapping_neg() % limit;
+        let selected = loop {
+            let value = getrandom::u64().map_err(|error| {
+                std::io::Error::other(format!("operating-system randomness unavailable: {error}"))
+            })?;
+            if value >= minimum {
+                break (value % limit) as usize;
+            }
+        };
+        values.swap(upper - 1, selected);
     }
     Ok(())
 }
 
-pub fn download_metadata_image_samples(
+fn publish_staged_pairs(
     output_dir: &Path,
-    samples: &[MetadataImagePairSample],
-    target: usize,
-    progress: &dyn ProgressObserver,
-) -> Result<DownloadOutcome, Box<dyn std::error::Error + Send + Sync>> {
-    debug_assert!(target > 0);
-    fs::create_dir_all(output_dir)?;
-    let staging = tempfile::Builder::new()
-        .prefix(".metadata-sample-images-")
-        .tempdir_in(output_dir)?;
-    let client = build_http_client()?;
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(DOWNLOAD_WORKERS.min(samples.len()).max(1))
-        .build()?;
-    let mut successful = Vec::with_capacity(target);
-    let ordered_samples = random_candidate_order(samples).map_err(|error| {
-        std::io::Error::other(format!("operating-system randomness unavailable: {error}"))
-    })?;
-    for (chunk_index, chunk) in ordered_samples.chunks(DOWNLOAD_WORKERS).enumerate() {
-        check_cancelled(progress)?;
-        let attempted = pool.install(|| {
-            chunk
-                .par_iter()
-                .enumerate()
-                .map(|(offset, &sample)| {
-                    let candidate_index = chunk_index * DOWNLOAD_WORKERS + offset + 1;
-                    let staged = stage_pair(
-                        &client,
-                        sample,
-                        candidate_index,
-                        staging.path(),
-                        progress,
-                    );
-                    if !matches!(staged.as_ref(), Err(error) if error.kind() == std::io::ErrorKind::Interrupted)
-                    {
-                        progress.add_completed(1);
-                    }
-                    staged
-                })
-                .collect::<Vec<_>>()
-        });
-        for staged in attempted {
-            match staged {
-                Ok(staged) => successful.push(staged),
-                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
-                    return Err(error.into());
-                }
-                Err(_) => {}
-            }
-        }
-        if successful.len() >= target {
-            break;
-        }
-    }
-    if successful.len() < target {
-        return Ok(DownloadOutcome::Insufficient {
-            successful: successful.len(),
-            candidates: samples.len(),
-        });
-    }
-    successful.truncate(target);
-
-    let publish_root = staging.path().join("publish");
+    staging_root: &Path,
+    successful: Vec<(MetadataSamplePool, StagedPair)>,
+) -> Result<Vec<MetadataImagePairSample>, Box<dyn std::error::Error + Send + Sync>> {
+    let target = successful.len();
+    let publish_root = staging_root.join("metadata_sample_images");
     fs::create_dir(&publish_root)?;
+    fs::create_dir(publish_root.join("intra_chain"))?;
+    fs::create_dir(publish_root.join("cross_chain"))?;
     let mut rows = Vec::with_capacity(target);
     let mut selected = Vec::with_capacity(target);
-    for (offset, staged) in successful.into_iter().enumerate() {
+    let mut intra_index = 0_usize;
+    let mut cross_index = 0_usize;
+    for (offset, (pool, staged)) in successful.into_iter().enumerate() {
         let index = offset + 1;
-        let row_dir = publish_root.join(index.to_string());
+        let (pool_name, pool_index) = match pool {
+            MetadataSamplePool::IntraChain => {
+                intra_index += 1;
+                ("intra_chain", intra_index)
+            }
+            MetadataSamplePool::CrossChain => {
+                cross_index += 1;
+                ("cross_chain", cross_index)
+            }
+        };
+        let row_dir = publish_root.join(pool_name).join(pool_index.to_string());
         fs::create_dir(&row_dir)?;
-        let destination_a = row_dir.join(format!("{index}a{}", staged.suffix_a));
-        let destination_b = row_dir.join(format!("{index}b{}", staged.suffix_b));
+        let destination_a = row_dir.join(format!("{pool_index}a{}", staged.suffix_a));
+        let destination_b = row_dir.join(format!("{pool_index}b{}", staged.suffix_b));
         fs::rename(staged.file_a, &destination_a)?;
         fs::rename(staged.file_b, &destination_b)?;
         let file_name_a = destination_a
@@ -174,8 +240,9 @@ pub fn download_metadata_image_samples(
             .expect("published image always has a file name")
             .to_string_lossy();
         write_nft_record(
-            &row_dir.join(format!("{index}a.json")),
+            &row_dir.join(format!("{pool_index}a.json")),
             NftSampleRecord {
+                sample_pool: pool_name,
                 chain: &staged.sample.contract_a_chain,
                 contract_address: &staged.sample.contract_a_address,
                 token_id: &staged.sample.token_id_a,
@@ -185,8 +252,9 @@ pub fn download_metadata_image_samples(
             },
         )?;
         write_nft_record(
-            &row_dir.join(format!("{index}b.json")),
+            &row_dir.join(format!("{pool_index}b.json")),
             NftSampleRecord {
+                sample_pool: pool_name,
                 chain: &staged.sample.contract_b_chain,
                 contract_address: &staged.sample.contract_b_address,
                 token_id: &staged.sample.token_id_b,
@@ -197,41 +265,206 @@ pub fn download_metadata_image_samples(
         )?;
         rows.push(DownloadRow {
             index,
-            file_a: relative_image_path(index, &destination_a),
+            pool: pool_name,
+            pool_index,
+            file_a: relative_image_path(pool_name, pool_index, &destination_a),
             error_a: String::new(),
-            file_b: relative_image_path(index, &destination_b),
+            file_b: relative_image_path(pool_name, pool_index, &destination_b),
             error_b: String::new(),
-            record_a: format!("metadata_sample_images/{index}/{index}a.json"),
-            record_b: format!("metadata_sample_images/{index}/{index}b.json"),
+            record_a: format!("metadata_sample_images/{pool_name}/{pool_index}/{pool_index}a.json"),
+            record_b: format!("metadata_sample_images/{pool_name}/{pool_index}/{pool_index}b.json"),
         });
         selected.push(staged.sample);
     }
 
-    let image_root = output_dir.join("metadata_sample_images");
-    if image_root.exists() {
-        fs::remove_dir_all(&image_root)?;
-    }
-    fs::rename(&publish_root, &image_root)?;
-    write_manifest(output_dir, &selected, &rows)?;
-    Ok(DownloadOutcome::Complete(selected))
+    write_manifest(staging_root, &selected, &rows)?;
+    let pairs = metadata_sample_pair_reports(&selected);
+    let report_files =
+        write_duplicate_pair_sample_files(staging_root, "metadata_duplicate_pairs.csv", &pairs)?;
+    let mut bundle = vec![
+        "metadata_sample_images".to_owned(),
+        "metadata_image_samples.csv".to_owned(),
+    ];
+    bundle.extend(report_files);
+    commit_sample_bundle(output_dir, staging_root, &bundle)?;
+    Ok(selected)
 }
 
-fn random_candidate_order(
-    samples: &[MetadataImagePairSample],
-) -> Result<Vec<&MetadataImagePairSample>, getrandom::Error> {
-    let mut shuffled = samples.iter().collect::<Vec<_>>();
-    for upper in (2..=shuffled.len()).rev() {
-        let limit = u64::try_from(upper).expect("candidate count fits in u64");
-        let minimum = limit.wrapping_neg() % limit;
-        let index = loop {
-            let value = getrandom::u64()?;
-            if value >= minimum {
-                break usize::try_from(value % limit).expect("random index fits in usize");
-            }
-        };
-        shuffled.swap(upper - 1, index);
+fn commit_sample_bundle(
+    output_dir: &Path,
+    staging_root: &Path,
+    items: &[String],
+) -> Result<(), std::io::Error> {
+    commit_sample_bundle_with(output_dir, staging_root, items, |_, _| Ok(()))
+}
+
+fn commit_sample_bundle_with(
+    output_dir: &Path,
+    staging_root: &Path,
+    items: &[String],
+    mut before_install: impl FnMut(usize, &str) -> Result<(), std::io::Error>,
+) -> Result<(), std::io::Error> {
+    for item in items {
+        validate_transaction_item(item)?;
+        if !staging_root.join(item).exists() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                format!("staged sample output is missing: {item}"),
+            ));
+        }
     }
-    Ok(shuffled)
+    atomic_write(
+        &staging_root.join(TRANSACTION_ITEMS),
+        &serde_json::to_vec(items).map_err(std::io::Error::other)?,
+    )?;
+    atomic_write(
+        &staging_root.join(TRANSACTION_STATE),
+        TRANSACTION_COMMITTING,
+    )?;
+    let backup = staging_root.join(TRANSACTION_BACKUP);
+    fs::create_dir(&backup)?;
+    let mut backed_up = Vec::new();
+    for item in items {
+        let target = output_dir.join(item);
+        if target.exists() {
+            if let Err(error) = fs::rename(&target, backup.join(item)) {
+                if let Err(rollback) =
+                    restore_sample_bundle(output_dir, staging_root, &backup, &[], &backed_up)
+                {
+                    return Err(std::io::Error::other(format!(
+                        "failed to back up previous sample output {item}: {error}; rollback failed: {rollback}; recovery transaction remains in {}",
+                        staging_root.display()
+                    )));
+                }
+                return Err(std::io::Error::other(format!(
+                    "failed to back up previous sample output {item}: {error}"
+                )));
+            }
+            backed_up.push(item.as_str());
+        }
+    }
+    let mut installed = Vec::new();
+    for (index, item) in items.iter().enumerate() {
+        let install = before_install(index, item)
+            .and_then(|()| fs::rename(staging_root.join(item), output_dir.join(item)));
+        if let Err(error) = install {
+            if let Err(rollback) =
+                restore_sample_bundle(output_dir, staging_root, &backup, &installed, &backed_up)
+            {
+                return Err(std::io::Error::other(format!(
+                    "failed to install sample output {item}: {error}; rollback failed: {rollback}; recovery transaction remains in {}",
+                    staging_root.display()
+                )));
+            }
+            return Err(std::io::Error::other(format!(
+                "failed to install sample output {item}; previous sample set was restored: {error}"
+            )));
+        }
+        installed.push(item.as_str());
+    }
+    atomic_write(&staging_root.join(TRANSACTION_STATE), TRANSACTION_COMMITTED)?;
+    Ok(())
+}
+
+fn restore_sample_bundle(
+    output_dir: &Path,
+    staging_root: &Path,
+    backup_dir: &Path,
+    installed: &[&str],
+    backed_up: &[&str],
+) -> Result<(), std::io::Error> {
+    for item in installed.iter().rev() {
+        fs::rename(output_dir.join(item), staging_root.join(item))?;
+    }
+    for item in backed_up.iter().rev() {
+        fs::rename(backup_dir.join(item), output_dir.join(item))?;
+    }
+    Ok(())
+}
+
+fn validate_transaction_item(item: &str) -> Result<(), std::io::Error> {
+    let path = Path::new(item);
+    if item.is_empty()
+        || path.components().count() != 1
+        || !matches!(
+            path.components().next(),
+            Some(std::path::Component::Normal(_))
+        )
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("sample output must be a top-level file or directory name: {item}"),
+        ));
+    }
+    Ok(())
+}
+
+fn recover_sample_transactions(output_dir: &Path) -> Result<(), std::io::Error> {
+    for entry in fs::read_dir(output_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir()
+            || !entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".metadata-fast-sample-")
+        {
+            continue;
+        }
+        let root = entry.path();
+        let state_path = root.join(TRANSACTION_STATE);
+        if !state_path.is_file() {
+            continue;
+        }
+        let state = fs::read_to_string(&state_path)?;
+        if state.trim() == "committed" {
+            fs::remove_dir_all(root)?;
+            continue;
+        }
+        if state.trim() != "committing" {
+            return Err(std::io::Error::other(format!(
+                "unknown sample transaction state in {}",
+                state_path.display()
+            )));
+        }
+        let items: Vec<String> = serde_json::from_slice(&fs::read(root.join(TRANSACTION_ITEMS))?)
+            .map_err(std::io::Error::other)?;
+        for item in &items {
+            validate_transaction_item(item)?;
+        }
+        recover_sample_transaction(output_dir, &root, &items)?;
+        fs::remove_dir_all(root)?;
+    }
+    Ok(())
+}
+
+fn recover_sample_transaction(
+    output_dir: &Path,
+    staging_root: &Path,
+    items: &[String],
+) -> Result<(), std::io::Error> {
+    let backup = staging_root.join(TRANSACTION_BACKUP);
+    for item in items.iter().rev() {
+        let staged = staging_root.join(item);
+        let published = output_dir.join(item);
+        let previous = backup.join(item);
+        if previous.exists() {
+            remove_path(&published)?;
+            fs::rename(previous, published)?;
+        } else if !staged.exists() {
+            remove_path(&published)?;
+        }
+    }
+    Ok(())
+}
+
+fn remove_path(path: &Path) -> Result<(), std::io::Error> {
+    if path.is_dir() {
+        fs::remove_dir_all(path)
+    } else if path.exists() {
+        fs::remove_file(path)
+    } else {
+        Ok(())
+    }
 }
 
 fn build_http_client() -> Result<Client, reqwest::Error> {
@@ -271,12 +504,12 @@ fn stage_pair(
     })
 }
 
-fn relative_image_path(index: usize, path: &Path) -> String {
+fn relative_image_path(pool_name: &str, pool_index: usize, path: &Path) -> String {
     let file_name = path
         .file_name()
         .expect("published image always has a file name")
         .to_string_lossy();
-    format!("metadata_sample_images/{index}/{file_name}")
+    format!("metadata_sample_images/{pool_name}/{pool_index}/{file_name}")
 }
 
 fn download_image(
@@ -671,6 +904,8 @@ fn write_manifest(
         let mut writer = csv::Writer::from_writer(&mut temporary);
         writer.write_record([
             "row",
+            "pool",
+            "pool_row",
             "contract_a_chain",
             "contract_a_address",
             "token_id_a",
@@ -689,6 +924,8 @@ fn write_manifest(
         for (sample, row) in samples.iter().zip(rows) {
             writer.write_record([
                 row.index.to_string(),
+                row.pool.to_owned(),
+                row.pool_index.to_string(),
                 sample.contract_a_chain.clone(),
                 sample.contract_a_address.clone(),
                 sample.token_id_a.clone(),
@@ -715,19 +952,6 @@ fn write_manifest(
 mod tests {
     use super::*;
     use dedup_core::{DedupError, NoopProgress};
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    #[derive(Default)]
-    struct CountingProgress(AtomicU64);
-
-    impl ProgressObserver for CountingProgress {
-        fn set_stage(&self, _stage: &str) {}
-        fn begin_phase(&self, _phase: &str, _total: Option<u64>) {}
-        fn set_total(&self, _total: Option<u64>) {}
-        fn add_completed(&self, delta: u64) {
-            self.0.fetch_add(delta, Ordering::Relaxed);
-        }
-    }
 
     struct CancelledProgress;
 
@@ -841,26 +1065,6 @@ mod tests {
     }
 
     #[test]
-    fn random_candidate_order_preserves_every_pair_and_allows_reuse() {
-        let good = "data:image/png;base64,iVBORw0KGgo=";
-        let mut first = sample("0xhub", good);
-        first.contract_b_address = "0xone".to_owned();
-        let mut repeated = sample("0xhub", good);
-        repeated.contract_b_address = "0xtwo".to_owned();
-        let mut disjoint = sample("0xthree", good);
-        disjoint.contract_b_address = "0xfour".to_owned();
-        let candidates = [first, repeated, disjoint];
-
-        let ordered = random_candidate_order(&candidates).unwrap();
-        let mut addresses = ordered
-            .iter()
-            .map(|sample| sample.contract_a_address.as_str())
-            .collect::<Vec<_>>();
-        addresses.sort_unstable();
-        assert_eq!(addresses, vec!["0xhub", "0xhub", "0xthree"]);
-    }
-
-    #[test]
     fn failed_pair_is_discarded_and_replaced_by_a_complete_pair() {
         let temp = tempfile::tempdir().unwrap();
         let good = "data:image/png;base64,iVBORw0KGgo=";
@@ -868,38 +1072,51 @@ mod tests {
             sample("0xfail", "unsupported://image"),
             sample("0xok", good),
         ];
-        let progress = CountingProgress::default();
-        let outcome =
-            download_metadata_image_samples(temp.path(), &candidates, 1, &progress).unwrap();
-        let DownloadOutcome::Complete(selected) = outcome else {
-            panic!("a complete fallback pair should have been selected");
-        };
+        let mut session = StreamingDownloadSession::new(temp.path(), 1).unwrap();
+        let batch = candidates
+            .into_iter()
+            .map(|sample| (MetadataSamplePool::IntraChain, sample))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            session.try_batch(&batch, &NoopProgress).unwrap(),
+            vec![false, true]
+        );
+        let selected = session.finish().unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].contract_a_address, "0xok");
-        assert_eq!(progress.0.load(Ordering::Relaxed), 2);
         assert!(
             temp.path()
-                .join("metadata_sample_images/1/1a.png")
+                .join("metadata_sample_images/intra_chain/1/1a.png")
                 .is_file()
         );
         assert!(
             temp.path()
-                .join("metadata_sample_images/1/1b.png")
+                .join("metadata_sample_images/intra_chain/1/1b.png")
                 .is_file()
         );
         let nft_a: serde_json::Value = serde_json::from_slice(
-            &fs::read(temp.path().join("metadata_sample_images/1/1a.json")).unwrap(),
+            &fs::read(
+                temp.path()
+                    .join("metadata_sample_images/intra_chain/1/1a.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         let nft_b: serde_json::Value = serde_json::from_slice(
-            &fs::read(temp.path().join("metadata_sample_images/1/1b.json")).unwrap(),
+            &fs::read(
+                temp.path()
+                    .join("metadata_sample_images/intra_chain/1/1b.json"),
+            )
+            .unwrap(),
         )
         .unwrap();
         assert_eq!(nft_a["contract_address"], "0xok");
+        assert_eq!(nft_a["sample_pool"], "intra_chain");
         assert_eq!(nft_a["token_id"], "1");
         assert_eq!(nft_a["image_file"], "1a.png");
         assert_eq!(nft_a["metadata"]["name"], "left");
         assert_eq!(nft_b["contract_address"], "0xok-peer");
+        assert_eq!(nft_b["sample_pool"], "intra_chain");
         assert_eq!(nft_b["token_id"], "2");
         assert_eq!(nft_b["image_file"], "1b.png");
         assert_eq!(nft_b["metadata"]["name"], "right");
@@ -925,42 +1142,138 @@ mod tests {
     #[test]
     fn insufficient_candidates_do_not_publish_partial_output() {
         let temp = tempfile::tempdir().unwrap();
-        let candidates = [sample("0xok", "data:image/png;base64,iVBORw0KGgo=")];
-        let outcome =
-            download_metadata_image_samples(temp.path(), &candidates, 2, &NoopProgress).unwrap();
-        let DownloadOutcome::Insufficient {
-            successful,
-            candidates,
-        } = outcome
-        else {
-            panic!("one candidate cannot satisfy a target of two");
-        };
-        assert_eq!(successful, 1);
-        assert_eq!(candidates, 1);
+        let candidate = sample("0xok", "data:image/png;base64,iVBORw0KGgo=");
+        let mut session = StreamingDownloadSession::new(temp.path(), 2).unwrap();
+        assert_eq!(
+            session
+                .try_batch(
+                    &[(MetadataSamplePool::IntraChain, candidate)],
+                    &NoopProgress
+                )
+                .unwrap(),
+            vec![true]
+        );
+        drop(session);
         assert!(!temp.path().join("metadata_image_samples.csv").exists());
         assert!(!temp.path().join("metadata_sample_images").exists());
     }
 
     #[test]
+    fn sample_bundle_install_failure_restores_every_previous_output() {
+        let output = tempfile::tempdir().unwrap();
+        let staging = tempfile::tempdir_in(output.path()).unwrap();
+        let items = vec![
+            "metadata_sample_images".to_owned(),
+            "metadata_image_samples.csv".to_owned(),
+            "metadata_duplicate_pairs.csv".to_owned(),
+        ];
+        fs::create_dir(output.path().join(&items[0])).unwrap();
+        fs::write(output.path().join(&items[0]).join("old.bin"), b"old-media").unwrap();
+        fs::write(output.path().join(&items[1]), b"old-manifest").unwrap();
+        fs::write(output.path().join(&items[2]), b"old-pairs").unwrap();
+        fs::create_dir(staging.path().join(&items[0])).unwrap();
+        fs::write(staging.path().join(&items[0]).join("new.bin"), b"new-media").unwrap();
+        fs::write(staging.path().join(&items[1]), b"new-manifest").unwrap();
+        fs::write(staging.path().join(&items[2]), b"new-pairs").unwrap();
+
+        let error = commit_sample_bundle_with(output.path(), staging.path(), &items, |index, _| {
+            if index == 2 {
+                Err(std::io::Error::other("injected install failure"))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("previous sample set was restored")
+        );
+        assert_eq!(
+            fs::read(output.path().join(&items[0]).join("old.bin")).unwrap(),
+            b"old-media"
+        );
+        assert_eq!(
+            fs::read(output.path().join(&items[1])).unwrap(),
+            b"old-manifest"
+        );
+        assert_eq!(
+            fs::read(output.path().join(&items[2])).unwrap(),
+            b"old-pairs"
+        );
+        assert!(!output.path().join(&items[0]).join("new.bin").exists());
+    }
+
+    #[test]
+    fn next_session_recovers_a_crashed_partial_sample_commit() {
+        let output = tempfile::tempdir().unwrap();
+        let transaction = tempfile::Builder::new()
+            .prefix(".metadata-fast-sample-")
+            .tempdir_in(output.path())
+            .unwrap();
+        let items = vec![
+            "metadata_sample_images".to_owned(),
+            "metadata_image_samples.csv".to_owned(),
+            "metadata_duplicate_pairs.csv".to_owned(),
+        ];
+        fs::create_dir(output.path().join(&items[0])).unwrap();
+        fs::write(output.path().join(&items[0]).join("old.bin"), b"old-media").unwrap();
+        fs::write(output.path().join(&items[1]), b"old-manifest").unwrap();
+        fs::create_dir(transaction.path().join(&items[0])).unwrap();
+        fs::write(
+            transaction.path().join(&items[0]).join("new.bin"),
+            b"new-media",
+        )
+        .unwrap();
+        fs::write(transaction.path().join(&items[1]), b"new-manifest").unwrap();
+        fs::write(transaction.path().join(&items[2]), b"new-pairs").unwrap();
+        atomic_write(
+            &transaction.path().join(TRANSACTION_ITEMS),
+            &serde_json::to_vec(&items).unwrap(),
+        )
+        .unwrap();
+        atomic_write(
+            &transaction.path().join(TRANSACTION_STATE),
+            TRANSACTION_COMMITTING,
+        )
+        .unwrap();
+        let backup = transaction.path().join(TRANSACTION_BACKUP);
+        fs::create_dir(&backup).unwrap();
+        fs::rename(output.path().join(&items[0]), backup.join(&items[0])).unwrap();
+        fs::rename(output.path().join(&items[1]), backup.join(&items[1])).unwrap();
+        for item in &items {
+            fs::rename(transaction.path().join(item), output.path().join(item)).unwrap();
+        }
+        let transaction_path = transaction.keep();
+
+        recover_sample_transactions(output.path()).unwrap();
+
+        assert!(!transaction_path.exists());
+        assert_eq!(
+            fs::read(output.path().join(&items[0]).join("old.bin")).unwrap(),
+            b"old-media"
+        );
+        assert_eq!(
+            fs::read(output.path().join(&items[1])).unwrap(),
+            b"old-manifest"
+        );
+        assert!(!output.path().join(&items[2]).exists());
+    }
+
+    #[test]
     fn cancellation_stops_before_starting_candidate_downloads() {
         let temp = tempfile::tempdir().unwrap();
-        let candidates = [sample("0xcancelled", "data:image/png;base64,iVBORw0KGgo=")];
-        let error = match download_metadata_image_samples(
-            temp.path(),
-            &candidates,
-            1,
+        let candidate = sample("0xcancelled", "data:image/png;base64,iVBORw0KGgo=");
+        let mut session = StreamingDownloadSession::new(temp.path(), 1).unwrap();
+        let error = match session.try_batch(
+            &[(MetadataSamplePool::IntraChain, candidate)],
             &CancelledProgress,
         ) {
             Ok(_) => panic!("cancelled download unexpectedly completed"),
             Err(error) => error,
         };
-        assert_eq!(
-            error
-                .downcast_ref::<std::io::Error>()
-                .expect("cancellation remains an I/O interruption")
-                .kind(),
-            std::io::ErrorKind::Interrupted
-        );
+        assert_eq!(error.kind(), std::io::ErrorKind::Interrupted);
         assert!(!temp.path().join("metadata_image_samples.csv").exists());
         assert!(!temp.path().join("metadata_sample_images").exists());
     }

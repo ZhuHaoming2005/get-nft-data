@@ -8,7 +8,7 @@ use crate::entity::{ChainId, ContractId, Dimension, EntityStore, NftId, ScopeKin
 use crate::error::DedupError;
 use crate::progress::ProgressObserver;
 use crate::radix::{sort_u32_pairs_while, sort_u32_triples_while, sort_u64_while};
-use crate::sampling::{DuplicatePairSamples, PairSampler, PairSamplingPlan, materialize_samples};
+use crate::sampling::{PairSampler, PairSamplingPlan};
 use crate::scope::{ScopeCounts, ScopeKey};
 use crate::stats::SummaryAccumulator;
 use ahash::{AHashMap, AHashSet};
@@ -298,23 +298,6 @@ pub fn run_name(
         PairSamplingPlan::disabled(),
     )
     .map(drop)
-}
-
-pub fn run_name_with_samples(
-    store: &EntityStore,
-    threshold: f64,
-    acc: &mut SummaryAccumulator,
-    progress: &dyn ProgressObserver,
-    sample_size: usize,
-) -> Result<DuplicatePairSamples, DedupError> {
-    let sampler = run_name_internal(
-        store,
-        threshold,
-        acc,
-        progress,
-        PairSamplingPlan::new(store, sample_size)?,
-    )?;
-    Ok(materialize_samples(store, sampler))
 }
 
 fn run_name_internal(
