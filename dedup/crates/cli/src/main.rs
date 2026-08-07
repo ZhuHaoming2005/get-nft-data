@@ -70,7 +70,7 @@ struct SampleMetadataArgs {
     #[arg(
         long,
         value_parser = parse_positive_usize,
-        help = "Complete media pairs required independently in the intra-chain and cross-chain pools"
+        help = "Complete media pairs required per pool; balanced across chains or unordered chain pairs"
     )]
     sample_pairs: usize,
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
