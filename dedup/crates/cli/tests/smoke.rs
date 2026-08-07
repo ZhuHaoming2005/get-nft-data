@@ -181,6 +181,8 @@ fn sample_metadata_fills_independent_intra_and_cross_chain_pools() {
             "ethereum,base",
             "--sample-pairs",
             "2",
+            "--seed",
+            "4242",
             "--progress",
             "off",
         ])
@@ -207,8 +209,13 @@ fn sample_metadata_fills_independent_intra_and_cross_chain_pools() {
         .iter()
         .position(|field| field == "pool_row")
         .unwrap();
+    let seed_column = headers
+        .iter()
+        .position(|field| field == "sampling_seed")
+        .unwrap();
     let records = manifest.records().collect::<Result<Vec<_>, _>>().unwrap();
     assert_eq!(records.len(), 4);
+    assert!(records.iter().all(|record| &record[seed_column] == "4242"));
     for pool in ["intra_chain", "cross_chain"] {
         let mut pool_rows = records
             .iter()

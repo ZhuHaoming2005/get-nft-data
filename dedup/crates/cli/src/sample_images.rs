@@ -135,6 +135,7 @@ struct DownloadRow {
 }
 
 struct StagedPair {
+    candidate_id: u64,
     sample: MetadataImagePairSample,
     file_a: PathBuf,
     suffix_a: &'static str,
@@ -172,6 +173,7 @@ pub struct StreamingDownloadSession {
     coalesced_uris: usize,
     network_jobs: usize,
     failed_pairs: usize,
+    sampling_seed: Option<u64>,
 }
 
 impl StreamingDownloadSession {
@@ -236,7 +238,12 @@ impl StreamingDownloadSession {
             coalesced_uris: 0,
             network_jobs: 0,
             failed_pairs: 0,
+            sampling_seed: None,
         })
+    }
+
+    pub fn set_sampling_seed(&mut self, seed: u64) {
+        self.sampling_seed = Some(seed);
     }
 
     #[cfg(test)]
@@ -284,9 +291,10 @@ impl StreamingDownloadSession {
                 .drain(..)
                 .map(|pair| (MetadataSamplePool::CrossChain, pair)),
         );
-        shuffle_staged_pairs(&mut successful)?;
+        successful.sort_unstable_by_key(|(_, pair)| pair.candidate_id);
         let staging_root = staging.keep();
-        let published = publish_staged_pairs(&output_dir, &staging_root, successful);
+        let published =
+            publish_staged_pairs(&output_dir, &staging_root, successful, self.sampling_seed);
         if published.is_ok() || !staging_root.join(TRANSACTION_STATE).exists() {
             let _ = fs::remove_dir_all(&staging_root);
         }
@@ -479,6 +487,7 @@ impl StreamingDownloadSession {
         let (file_b, suffix_b) = completed.file_b.expect("B image completed");
         let pool = completed.candidate.pool;
         let staged = StagedPair {
+            candidate_id: consumer.candidate_id,
             sample: completed.candidate.sample,
             file_a,
             suffix_a,
@@ -679,27 +688,11 @@ fn dedup_to_io(error: DedupError) -> std::io::Error {
     }
 }
 
-fn shuffle_staged_pairs<T>(values: &mut [T]) -> Result<(), std::io::Error> {
-    for upper in (2..=values.len()).rev() {
-        let limit = upper as u64;
-        let minimum = limit.wrapping_neg() % limit;
-        let selected = loop {
-            let value = getrandom::u64().map_err(|error| {
-                std::io::Error::other(format!("operating-system randomness unavailable: {error}"))
-            })?;
-            if value >= minimum {
-                break (value % limit) as usize;
-            }
-        };
-        values.swap(upper - 1, selected);
-    }
-    Ok(())
-}
-
 fn publish_staged_pairs(
     output_dir: &Path,
     staging_root: &Path,
     successful: Vec<(MetadataSamplePool, StagedPair)>,
+    sampling_seed: Option<u64>,
 ) -> Result<Vec<MetadataImagePairSample>, Box<dyn std::error::Error + Send + Sync>> {
     let target = successful.len();
     let publish_root = staging_root.join("metadata_sample_images");
@@ -774,7 +767,7 @@ fn publish_staged_pairs(
         selected.push(staged.sample);
     }
 
-    write_manifest(staging_root, &selected, &rows)?;
+    write_manifest(staging_root, &selected, &rows, sampling_seed)?;
     let pairs = metadata_sample_pair_reports(&selected);
     let report_files =
         write_duplicate_pair_sample_files(staging_root, "metadata_duplicate_pairs.csv", &pairs)?;
@@ -1394,6 +1387,7 @@ fn write_manifest(
     output_dir: &Path,
     samples: &[MetadataImagePairSample],
     rows: &[DownloadRow],
+    sampling_seed: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let path = output_dir.join("metadata_image_samples.csv");
     let mut temporary = NamedTempFile::new_in(output_dir)?;
@@ -1401,6 +1395,7 @@ fn write_manifest(
         let mut writer = csv::Writer::from_writer(&mut temporary);
         writer.write_record([
             "row",
+            "sampling_seed",
             "pool",
             "pool_row",
             "contract_a_chain",
@@ -1421,6 +1416,9 @@ fn write_manifest(
         for (sample, row) in samples.iter().zip(rows) {
             writer.write_record([
                 row.index.to_string(),
+                sampling_seed
+                    .map(|seed| seed.to_string())
+                    .unwrap_or_default(),
                 row.pool.to_owned(),
                 row.pool_index.to_string(),
                 sample.contract_a_chain.clone(),
@@ -1592,6 +1590,7 @@ mod tests {
                 .count(),
             2
         );
+        session.set_sampling_seed(42);
         let selected = session.finish().unwrap();
         assert_eq!(selected.len(), 1);
         assert_eq!(selected[0].contract_a_address, "0xok");
@@ -1647,7 +1646,15 @@ mod tests {
                 .iter()
                 .any(|field| field == "record_b")
         );
-        assert_eq!(manifest.records().count(), 1);
+        let seed_column = manifest
+            .headers()
+            .unwrap()
+            .iter()
+            .position(|field| field == "sampling_seed")
+            .unwrap();
+        let records = manifest.records().collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(&records[0][seed_column], "42");
     }
 
     #[test]

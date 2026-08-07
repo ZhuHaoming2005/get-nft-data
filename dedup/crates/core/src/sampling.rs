@@ -15,6 +15,7 @@ pub(crate) struct SamplingRandomness {
 impl SamplingRandomness {
     pub(crate) const DISABLED: Self = Self { key: [0; 32] };
 
+    #[allow(dead_code)]
     pub(crate) fn from_os() -> Result<Self, DedupError> {
         let mut key = [0_u8; 32];
         getrandom::fill(&mut key)

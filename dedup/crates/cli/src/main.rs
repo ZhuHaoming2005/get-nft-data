@@ -73,6 +73,11 @@ struct SampleMetadataArgs {
         help = "Complete media pairs required per pool; balanced across chains or unordered chain pairs"
     )]
     sample_pairs: usize,
+    #[arg(
+        long,
+        help = "Sampling seed; omission uses fresh operating-system randomness"
+    )]
+    seed: Option<u64>,
     #[arg(long, value_enum, default_value_t = ProgressMode::Auto)]
     progress: ProgressMode,
     #[arg(long, default_value_t = 1_000)]
@@ -124,6 +129,7 @@ fn run() -> Result<(), DedupError> {
                 metadata_threshold: args.metadata_threshold,
                 metadata_anchors: args.metadata_anchors,
                 sample_pairs: args.sample_pairs,
+                sample_seed: args.seed,
             },
             &reporter,
         );

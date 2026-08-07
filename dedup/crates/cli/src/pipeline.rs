@@ -36,6 +36,7 @@ pub struct SampleMetadataConfig {
     pub metadata_threshold: f64,
     pub metadata_anchors: Option<usize>,
     pub sample_pairs: usize,
+    pub sample_seed: Option<u64>,
 }
 
 pub fn run(config: RunConfig, progress: &ProgressReporter) -> Result<(), DedupError> {
@@ -208,6 +209,7 @@ pub fn sample_metadata(
         config.metadata_anchors,
         config.metadata_threshold,
         config.sample_pairs,
+        config.sample_seed,
         progress,
         &mut downloads,
     )?;
@@ -215,9 +217,9 @@ pub fn sample_metadata(
         || result.cross_chain.len() != config.sample_pairs
     {
         return Err(DedupError::Message(format!(
-            "random Metadata candidate search exhausted {}/{} pool-profile slots and scored {} candidate tasks with {} of {} intra-chain and {} of {} cross-chain complete media pairs ({})",
-            result.visited_profiles,
-            result.total_profiles,
+            "random Metadata candidate search exhausted {}/{} candidate slots and scored {} candidate tasks with {} of {} intra-chain and {} of {} cross-chain complete media pairs ({})",
+            result.drawn_candidate_slots,
+            result.total_candidate_slots,
             result.scored_candidate_tasks,
             result.intra_chain.len(),
             config.sample_pairs,
@@ -226,6 +228,7 @@ pub fn sample_metadata(
             downloads.summary(),
         )));
     }
+    downloads.set_sampling_seed(result.sample_seed);
     downloads
         .finish()
         .map_err(|error| DedupError::Message(error.to_string()))?;

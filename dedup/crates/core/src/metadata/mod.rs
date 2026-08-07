@@ -48,8 +48,9 @@ pub struct MetadataFastSampleResult {
     pub intra_chain: Vec<MetadataImagePairSample>,
     pub cross_chain: Vec<MetadataImagePairSample>,
     pub scored_candidate_tasks: u64,
-    pub visited_profiles: u64,
-    pub total_profiles: u64,
+    pub drawn_candidate_slots: u64,
+    pub total_candidate_slots: u64,
+    pub sample_seed: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -94,6 +95,7 @@ pub fn sample_metadata(
     anchors_k: Option<usize>,
     content_threshold: f64,
     target_per_pool: usize,
+    sample_seed: Option<u64>,
     progress: &dyn ProgressObserver,
     downloads: &mut dyn MetadataSampleDownloadSink,
 ) -> Result<MetadataFastSampleResult, DedupError> {
@@ -104,6 +106,7 @@ pub fn sample_metadata(
         anchors_k,
         content_threshold,
         target_per_pool,
+        sample_seed,
         progress,
         downloads,
     )
