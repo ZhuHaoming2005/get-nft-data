@@ -16,7 +16,7 @@ use crate::stats::SummaryAccumulator;
 use ahash::{AHashMap, AHashSet, AHasher};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::mem::MaybeUninit;
 use std::sync::Mutex;
@@ -42,7 +42,15 @@ const DIRECT_ACTIVITY_BATCH: u64 = 512;
 const FULL_DIRECT_PROGRESS_BATCH: u64 = 65_536;
 const DENSE_POSTING_MIN_PROFILES: usize = 1_024;
 const NO_DENSE_POSTING: u32 = u32::MAX;
-const FAST_SAMPLE_PREPARE_BATCH: usize = 8;
+const FAST_SAMPLE_PREPARE_TASKS_PER_THREAD: usize = 4;
+const FAST_SAMPLE_MIN_PREPARE_BATCH: usize = 32;
+const FAST_SAMPLE_MAX_PREPARE_BATCH: usize = 256;
+const FAST_SAMPLE_OUTSTANDING_PAIRS_PER_THREAD: usize = 8;
+const FAST_SAMPLE_MIN_OUTSTANDING_PAIRS: usize = 64;
+const FAST_SAMPLE_MAX_OUTSTANDING_PAIRS: usize = 512;
+const FAST_SAMPLE_SUBMIT_PAIRS_PER_THREAD: usize = 2;
+const FAST_SAMPLE_MIN_SUBMIT_BATCH: usize = 16;
+const FAST_SAMPLE_MAX_SUBMIT_BATCH: usize = 64;
 #[cfg(test)]
 const FAST_SAMPLE_DENSE_POSTING_TRIES: u64 = 128;
 #[cfg(test)]
@@ -1502,8 +1510,33 @@ struct FastSampleCollector<'a> {
     pending: Vec<MetadataSampleDownloadCandidate>,
     pending_buckets: AHashMap<u64, FastSampleBucket>,
     in_flight: AHashMap<u64, (FastSampleBucket, MetadataImagePairSample)>,
-    completed: BTreeMap<u64, (FastSampleBucket, MetadataImagePairSample, bool)>,
-    next_commit_id: u64,
+    completed: AHashMap<u64, (FastSampleBucket, MetadataImagePairSample, bool)>,
+    commit_order_by_bucket: AHashMap<FastSampleBucket, VecDeque<u64>>,
+    outstanding_by_bucket: AHashMap<FastSampleBucket, usize>,
+    outstanding_total: usize,
+    max_outstanding: usize,
+    submit_batch_size: usize,
+}
+
+fn fast_sample_prepare_batch() -> usize {
+    rayon::current_num_threads()
+        .saturating_mul(FAST_SAMPLE_PREPARE_TASKS_PER_THREAD)
+        .clamp(FAST_SAMPLE_MIN_PREPARE_BATCH, FAST_SAMPLE_MAX_PREPARE_BATCH)
+}
+
+fn fast_sample_max_outstanding() -> usize {
+    rayon::current_num_threads()
+        .saturating_mul(FAST_SAMPLE_OUTSTANDING_PAIRS_PER_THREAD)
+        .clamp(
+            FAST_SAMPLE_MIN_OUTSTANDING_PAIRS,
+            FAST_SAMPLE_MAX_OUTSTANDING_PAIRS,
+        )
+}
+
+fn fast_sample_submit_batch() -> usize {
+    rayon::current_num_threads()
+        .saturating_mul(FAST_SAMPLE_SUBMIT_PAIRS_PER_THREAD)
+        .clamp(FAST_SAMPLE_MIN_SUBMIT_BATCH, FAST_SAMPLE_MAX_SUBMIT_BATCH)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1609,17 +1642,10 @@ impl FastSampleCollector<'_> {
     }
 
     fn pending_count(&self, bucket: FastSampleBucket) -> usize {
-        let queued = self
-            .pending
-            .iter()
-            .filter(|candidate| self.pending_buckets.get(&candidate.id) == Some(&bucket))
-            .count();
-        queued
-            + self
-                .in_flight
-                .values()
-                .filter(|(pending_bucket, _)| *pending_bucket == bucket)
-                .count()
+        self.outstanding_by_bucket
+            .get(&bucket)
+            .copied()
+            .unwrap_or(0)
     }
 
     fn target(&self, bucket: FastSampleBucket) -> usize {
@@ -1638,12 +1664,6 @@ impl FastSampleCollector<'_> {
         let accepted = self.accepted_by_bucket.get(&bucket).copied().unwrap_or(0);
         self.target(bucket)
             .saturating_sub(accepted.saturating_add(self.pending_count(bucket)))
-    }
-
-    fn pool_needs(&self, pool: MetadataSamplePool) -> bool {
-        self.bucket_targets
-            .iter()
-            .any(|&(bucket, _)| bucket.pool() == pool && !self.covered(bucket))
     }
 
     fn redistribute_exhausted_bucket(
@@ -1733,27 +1753,59 @@ impl FastSampleCollector<'_> {
             self.completed
                 .insert(result.id, (bucket, sample, result.success));
         }
-        while let Some((bucket, sample, success)) = self.completed.remove(&self.next_commit_id) {
-            self.next_commit_id = self.next_commit_id.checked_add(1).ok_or_else(|| {
-                DedupError::invalid("sample_metadata", "media candidate ID overflow")
-            })?;
-            if !success {
-                continue;
-            }
-            let target = self.target(bucket);
-            let accepted_in_bucket = self.accepted_by_bucket.entry(bucket).or_default();
-            if *accepted_in_bucket >= target {
-                continue;
-            }
-            *accepted_in_bucket += 1;
-            match bucket.pool() {
-                MetadataSamplePool::IntraChain => {
-                    self.intra_chain.push(sample);
-                    accepted += 1;
+        for &(bucket, _) in &self.bucket_targets {
+            while let Some(next_id) = self
+                .commit_order_by_bucket
+                .get(&bucket)
+                .and_then(|order| order.front())
+                .copied()
+            {
+                let Some((completed_bucket, sample, success)) = self.completed.remove(&next_id)
+                else {
+                    break;
+                };
+                if completed_bucket != bucket {
+                    return Err(DedupError::invalid(
+                        "sample_metadata",
+                        "media candidate completed in the wrong sample bucket",
+                    ));
                 }
-                MetadataSamplePool::CrossChain => {
-                    self.cross_chain.push(sample);
-                    accepted += 1;
+                self.commit_order_by_bucket
+                    .get_mut(&bucket)
+                    .expect("sample bucket commit queue is present")
+                    .pop_front();
+                let outstanding = self
+                    .outstanding_by_bucket
+                    .get_mut(&bucket)
+                    .expect("completed sample bucket has outstanding candidates");
+                *outstanding = outstanding.checked_sub(1).ok_or_else(|| {
+                    DedupError::invalid(
+                        "sample_metadata",
+                        "sample bucket outstanding count underflow",
+                    )
+                })?;
+                self.outstanding_total =
+                    self.outstanding_total.checked_sub(1).ok_or_else(|| {
+                        DedupError::invalid("sample_metadata", "sample outstanding count underflow")
+                    })?;
+                if !success {
+                    continue;
+                }
+                let target = self.target(bucket);
+                let accepted_in_bucket = self.accepted_by_bucket.entry(bucket).or_default();
+                if *accepted_in_bucket >= target {
+                    continue;
+                }
+                *accepted_in_bucket += 1;
+                match bucket.pool() {
+                    MetadataSamplePool::IntraChain => {
+                        self.intra_chain.push(sample);
+                        accepted += 1;
+                    }
+                    MetadataSamplePool::CrossChain => {
+                        self.cross_chain.push(sample);
+                        accepted += 1;
+                    }
                 }
             }
         }
@@ -1761,17 +1813,20 @@ impl FastSampleCollector<'_> {
     }
 
     fn has_outstanding(&self) -> bool {
-        !self.pending.is_empty() || !self.in_flight.is_empty() || !self.completed.is_empty()
+        self.outstanding_total != 0
+    }
+
+    fn has_open_slot(&self) -> bool {
+        self.outstanding_total < self.max_outstanding
     }
 
     fn wait_for_open_slot(&mut self) -> Result<usize, DedupError> {
+        if self.has_open_slot() {
+            return Ok(0);
+        }
         self.flush()?;
         let mut accepted = 0_usize;
-        while !self.complete()
-            && !self.pool_needs(MetadataSamplePool::IntraChain)
-            && !self.pool_needs(MetadataSamplePool::CrossChain)
-            && !self.in_flight.is_empty()
-        {
+        while !self.complete() && !self.has_open_slot() && !self.in_flight.is_empty() {
             accepted += self.collect(true)?;
         }
         Ok(accepted)
@@ -1818,11 +1873,17 @@ impl FastSampleCollector<'_> {
         self.pending
             .push(MetadataSampleDownloadCandidate { id, pool, sample });
         self.pending_buckets.insert(id, bucket);
+        self.commit_order_by_bucket
+            .entry(bucket)
+            .or_default()
+            .push_back(id);
+        *self.outstanding_by_bucket.entry(bucket).or_default() += 1;
+        self.outstanding_total += 1;
         let all_buckets_covered = self
             .bucket_targets
             .iter()
             .all(|&(candidate, _)| self.covered(candidate));
-        if self.pending.len() >= 8 || all_buckets_covered {
+        if self.pending.len() >= self.submit_batch_size || all_buckets_covered {
             self.flush()?;
         }
         Ok(true)
@@ -2405,6 +2466,9 @@ pub fn sample_direct_releasing(
         "random_candidate_search",
         Some((target_per_pool as u64).saturating_mul(2)),
     );
+    let prepare_batch_size = fast_sample_prepare_batch();
+    let max_outstanding = fast_sample_max_outstanding();
+    let submit_batch_size = fast_sample_submit_batch();
     let mut collector = FastSampleCollector {
         store,
         bucket_targets,
@@ -2417,11 +2481,15 @@ pub fn sample_direct_releasing(
         downloads,
         next_candidate_id: 1,
         attempted_pairs: 0,
-        pending: Vec::with_capacity(8),
+        pending: Vec::with_capacity(submit_batch_size),
         pending_buckets: AHashMap::new(),
         in_flight: AHashMap::new(),
-        completed: BTreeMap::new(),
-        next_commit_id: 1,
+        completed: AHashMap::new(),
+        commit_order_by_bucket: AHashMap::new(),
+        outstanding_by_bucket: AHashMap::new(),
+        outstanding_total: 0,
+        max_outstanding,
+        submit_batch_size,
     };
     let mut scored_tasks = 0_u64;
     let mut drawn_candidate_slots = 0_u64;
@@ -2479,6 +2547,7 @@ pub fn sample_direct_releasing(
             .collect::<Vec<_>>();
         if available.is_empty() {
             if collector.has_outstanding() {
+                collector.flush()?;
                 let collected = collector.collect(true)?;
                 progress.add_completed(collected as u64);
                 continue;
@@ -2497,12 +2566,20 @@ pub fn sample_direct_releasing(
         let needs = FastSampleNeeds { bucket };
         let prepared_queue = prepared_by_bucket.entry(bucket).or_default();
         if prepared_queue.is_empty() {
-            let mut tasks = Vec::with_capacity(FAST_SAMPLE_PREPARE_BATCH);
-            while tasks.len() < FAST_SAMPLE_PREPARE_BATCH {
+            let mut tasks = Vec::with_capacity(prepare_batch_size);
+            while tasks.len() < prepare_batch_size {
                 let Some((left_id, slot)) = bucket_searches[search_index].next_slot(&task_plans)
                 else {
                     break;
                 };
+                let bucket_draw_ordinal = bucket_searches[search_index].draw_ordinal - 1;
+                let task_salt = bucket_searches[search_index].randomness.score(
+                    b"fast-sample-task-witness",
+                    &[
+                        bucket_searches[search_index].bucket_salt(),
+                        bucket_draw_ordinal,
+                    ],
+                );
                 drawn_candidate_slots += 1;
                 if drawn_candidate_slots.is_multiple_of(256) {
                     progress.add_activity(256);
@@ -2538,7 +2615,7 @@ pub fn sample_direct_releasing(
                 {
                     continue;
                 }
-                tasks.push((left_id as usize, task, splitmix64(drawn_candidate_slots)));
+                tasks.push((left_id as usize, task, task_salt));
             }
             let prepared = tasks
                 .par_iter()
@@ -2558,7 +2635,10 @@ pub fn sample_direct_releasing(
             scored_tasks = scored_tasks.saturating_add(tasks.len() as u64);
             prepared_queue.extend(prepared.into_iter().flatten());
         }
-        if let Some((mut task, draw_salt)) = prepared_queue.pop_front() {
+        while collector.has_open_slot()
+            && !collector.covered(bucket)
+            && let Some((mut task, draw_salt)) = prepared_queue.pop_front()
+        {
             let accepted_before = collector.accepted_count();
             let retain_task = match &mut task {
                 PreparedFastSampleTask::Pair {
@@ -2578,7 +2658,10 @@ pub fn sample_direct_releasing(
                 }
                 PreparedFastSampleTask::CrossPairs { left, right, order } => {
                     let mut checked = 0_u64;
-                    while let Some(ordinal) = order.next() {
+                    while collector.has_open_slot()
+                        && !collector.covered(bucket)
+                        && let Some(ordinal) = order.next()
+                    {
                         let left_index = ordinal / right.len() as u64;
                         let right_index = ordinal % right.len() as u64;
                         let (left_contract, left_nft) = left[left_index as usize];
@@ -2606,7 +2689,6 @@ pub fn sample_direct_releasing(
             progress
                 .add_completed(collector.accepted_count().saturating_sub(accepted_before) as u64);
         }
-        collector.flush()?;
     }
     collector.flush()?;
     while !collector.complete() && collector.has_outstanding() {
@@ -7998,6 +8080,33 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct ReverseOneAtATimeDownloadSink {
+        completed: Vec<crate::metadata::MetadataSampleDownloadResult>,
+    }
+
+    impl MetadataSampleDownloadSink for ReverseOneAtATimeDownloadSink {
+        fn submit(
+            &mut self,
+            candidates: &[MetadataSampleDownloadCandidate],
+        ) -> Result<(), DedupError> {
+            self.completed.extend(candidates.iter().map(|candidate| {
+                crate::metadata::MetadataSampleDownloadResult {
+                    id: candidate.id,
+                    success: true,
+                }
+            }));
+            Ok(())
+        }
+
+        fn poll(
+            &mut self,
+            _wait: bool,
+        ) -> Result<Vec<crate::metadata::MetadataSampleDownloadResult>, DedupError> {
+            Ok(self.completed.pop().into_iter().collect())
+        }
+    }
+
+    #[derive(Default)]
     struct FailFirstDownloadSink {
         failed_one: bool,
         completed: Vec<crate::metadata::MetadataSampleDownloadResult>,
@@ -9855,8 +9964,12 @@ mod tests {
             pending: Vec::new(),
             pending_buckets: AHashMap::new(),
             in_flight: AHashMap::new(),
-            completed: BTreeMap::new(),
-            next_commit_id: 1,
+            completed: AHashMap::new(),
+            commit_order_by_bucket: AHashMap::new(),
+            outstanding_by_bucket: AHashMap::new(),
+            outstanding_total: 0,
+            max_outstanding: fast_sample_max_outstanding(),
+            submit_batch_size: fast_sample_submit_batch(),
         };
         let needs = FastSampleNeeds {
             bucket: FastSampleBucket::Intra(0),
@@ -9924,8 +10037,12 @@ mod tests {
             pending: Vec::new(),
             pending_buckets: AHashMap::new(),
             in_flight: AHashMap::new(),
-            completed: BTreeMap::new(),
-            next_commit_id: 1,
+            completed: AHashMap::new(),
+            commit_order_by_bucket: AHashMap::new(),
+            outstanding_by_bucket: AHashMap::new(),
+            outstanding_total: 0,
+            max_outstanding: fast_sample_max_outstanding(),
+            submit_batch_size: fast_sample_submit_batch(),
         };
         let needs = FastSampleNeeds { bucket };
 
@@ -9976,8 +10093,12 @@ mod tests {
             pending: Vec::new(),
             pending_buckets: AHashMap::new(),
             in_flight: AHashMap::new(),
-            completed: BTreeMap::new(),
-            next_commit_id: 1,
+            completed: AHashMap::new(),
+            commit_order_by_bucket: AHashMap::new(),
+            outstanding_by_bucket: AHashMap::new(),
+            outstanding_total: 0,
+            max_outstanding: fast_sample_max_outstanding(),
+            submit_batch_size: fast_sample_submit_batch(),
         };
         let needs = FastSampleNeeds { bucket };
         assert!(collector.observe(0, 0, 1, 1, needs).unwrap());
@@ -9987,6 +10108,66 @@ mod tests {
 
         assert_eq!(collector.intra_chain[0].contract_a_address, "0x0");
         assert_eq!(collector.intra_chain[1].contract_a_address, "0x2");
+    }
+
+    #[test]
+    fn fast_sample_commit_order_is_independent_between_chain_buckets() {
+        let evm = HashSet::from(["ethereum".to_owned(), "base".to_owned()]);
+        let mut store = EntityStore::with_options(8, &evm.iter().cloned().collect());
+        for (chain, address) in [("ethereum", "0xa"), ("ethereum", "0xb"), ("base", "0xc")] {
+            store
+                .try_ingest_row(input_with_image(
+                    chain,
+                    address,
+                    "1",
+                    &format!("https://images.example/{address}.png"),
+                    r#"{"shared":"metadata"}"#,
+                ))
+                .unwrap();
+        }
+        let intra = FastSampleBucket::Intra(store.contracts[0].chain_id);
+        let cross =
+            FastSampleBucket::from_chains(store.contracts[0].chain_id, store.contracts[2].chain_id);
+        let mut downloads = ReverseOneAtATimeDownloadSink::default();
+        let mut collector = FastSampleCollector {
+            store: &store,
+            bucket_targets: vec![(intra, 1), (cross, 1)],
+            accepted_by_bucket: AHashMap::new(),
+            redistribution_ordinal: 0,
+            randomness: SamplingRandomness::for_test(97).into(),
+            seen_contract_pairs: AHashSet::new(),
+            intra_chain: Vec::new(),
+            cross_chain: Vec::new(),
+            downloads: &mut downloads,
+            next_candidate_id: 1,
+            attempted_pairs: 0,
+            pending: Vec::new(),
+            pending_buckets: AHashMap::new(),
+            in_flight: AHashMap::new(),
+            completed: AHashMap::new(),
+            commit_order_by_bucket: AHashMap::new(),
+            outstanding_by_bucket: AHashMap::new(),
+            outstanding_total: 0,
+            max_outstanding: fast_sample_max_outstanding(),
+            submit_batch_size: fast_sample_submit_batch(),
+        };
+        assert!(
+            collector
+                .observe(0, 0, 1, 1, FastSampleNeeds { bucket: intra })
+                .unwrap()
+        );
+        assert!(
+            collector
+                .observe(0, 0, 2, 2, FastSampleNeeds { bucket: cross })
+                .unwrap()
+        );
+        collector.flush().unwrap();
+
+        assert_eq!(collector.collect(false).unwrap(), 1);
+        assert!(collector.intra_chain.is_empty());
+        assert_eq!(collector.cross_chain.len(), 1);
+        assert_eq!(collector.collect(false).unwrap(), 1);
+        assert_eq!(collector.intra_chain.len(), 1);
     }
 
     #[test]
@@ -10251,7 +10432,7 @@ mod tests {
 
         assert_eq!(result.intra_chain.len(), 1);
         assert_eq!(result.cross_chain.len(), 1);
-        assert!(result.scored_candidate_tasks <= (FAST_SAMPLE_PREPARE_BATCH * 2) as u64);
+        assert!(result.scored_candidate_tasks <= (fast_sample_prepare_batch() * 2) as u64);
         assert!(result.drawn_candidate_slots <= result.total_candidate_slots);
         assert_ne!(result.total_candidate_slots, 0);
     }
@@ -10303,8 +10484,12 @@ mod tests {
             pending: Vec::new(),
             pending_buckets: AHashMap::new(),
             in_flight: AHashMap::new(),
-            completed: BTreeMap::new(),
-            next_commit_id: 1,
+            completed: AHashMap::new(),
+            commit_order_by_bucket: AHashMap::new(),
+            outstanding_by_bucket: AHashMap::new(),
+            outstanding_total: 0,
+            max_outstanding: fast_sample_max_outstanding(),
+            submit_batch_size: fast_sample_submit_batch(),
         };
 
         let logical = collector.logical_members(&members, b"test-logical-members", 0);
@@ -10370,7 +10555,7 @@ mod tests {
         assert_eq!(result.intra_chain.len(), 1);
         assert_eq!(result.cross_chain.len(), 1);
         assert!(result.drawn_candidate_slots <= result.total_candidate_slots);
-        assert!(result.scored_candidate_tasks <= (FAST_SAMPLE_PREPARE_BATCH * 2) as u64);
+        assert!(result.scored_candidate_tasks <= (fast_sample_prepare_batch() * 2) as u64);
     }
 
     #[test]

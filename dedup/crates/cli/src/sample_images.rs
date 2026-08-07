@@ -11,7 +11,8 @@ use reqwest::redirect::Policy;
 use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Ordering as CmpOrdering;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -31,7 +32,7 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const TOTAL_IMAGE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
-const DOWNLOAD_QUEUE_CAPACITY: usize = DOWNLOAD_WORKERS * 2;
+const DOWNLOAD_QUEUE_CAPACITY: usize = DOWNLOAD_WORKERS * 8;
 const IMAGE_CACHE_DIR: &str = ".metadata-image-cache";
 const TRANSACTION_ITEMS: &str = ".sample-transaction-items.json";
 const TRANSACTION_STATE: &str = ".sample-transaction-state";
@@ -88,11 +89,52 @@ enum UriState {
 struct ImageJob {
     uri: String,
     cache_key: String,
+    attempt: usize,
+    deadline: Option<Instant>,
 }
 
 struct ImageJobResult {
     uri: String,
-    result: Result<CachedImage, std::io::Error>,
+    outcome: ImageJobOutcome,
+}
+
+enum ImageJobOutcome {
+    Complete(Result<CachedImage, std::io::Error>),
+    Retry { job: ImageJob, ready_at: Instant },
+}
+
+enum ImageDownloadAttempt {
+    Complete(DownloadedImage),
+    RetryAfter(Duration),
+}
+
+struct DelayedImageJob {
+    ready_at: Instant,
+    ordinal: u64,
+    job: ImageJob,
+}
+
+impl PartialEq for DelayedImageJob {
+    fn eq(&self, other: &Self) -> bool {
+        self.ready_at == other.ready_at && self.ordinal == other.ordinal
+    }
+}
+
+impl Eq for DelayedImageJob {}
+
+impl PartialOrd for DelayedImageJob {
+    fn partial_cmp(&self, other: &Self) -> Option<CmpOrdering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for DelayedImageJob {
+    fn cmp(&self, other: &Self) -> CmpOrdering {
+        other
+            .ready_at
+            .cmp(&self.ready_at)
+            .then_with(|| other.ordinal.cmp(&self.ordinal))
+    }
 }
 
 struct PendingPair {
@@ -163,6 +205,8 @@ pub struct StreamingDownloadSession {
     job_tx: Option<SyncSender<ImageJob>>,
     result_rx: Receiver<ImageJobResult>,
     workers: Vec<JoinHandle<()>>,
+    delayed_retries: BinaryHeap<DelayedImageJob>,
+    next_retry_ordinal: u64,
     uri_states: HashMap<String, UriState>,
     pending_pairs: HashMap<u64, PendingPair>,
     completed: VecDeque<MetadataSampleDownloadResult>,
@@ -228,6 +272,8 @@ impl StreamingDownloadSession {
             job_tx: Some(job_tx),
             result_rx,
             workers,
+            delayed_retries: BinaryHeap::new(),
+            next_retry_ordinal: 0,
             uri_states: HashMap::new(),
             pending_pairs: HashMap::new(),
             completed: VecDeque::new(),
@@ -372,7 +418,12 @@ impl StreamingDownloadSession {
         self.uri_states
             .insert(uri.clone(), UriState::Loading(vec![consumer]));
         self.network_jobs = self.network_jobs.saturating_add(1);
-        self.send_job(ImageJob { uri, cache_key })
+        self.send_job(ImageJob {
+            uri,
+            cache_key,
+            attempt: 0,
+            deadline: None,
+        })
     }
 
     fn send_job(&self, mut job: ImageJob) -> Result<(), std::io::Error> {
@@ -401,13 +452,23 @@ impl StreamingDownloadSession {
         let result = if wait {
             loop {
                 check_cancelled(self.progress.as_ref())?;
-                match self.result_rx.recv_timeout(Duration::from_millis(100)) {
+                self.submit_due_retries()?;
+                let retry_wait = self
+                    .delayed_retries
+                    .peek()
+                    .map(|retry| retry.ready_at.saturating_duration_since(Instant::now()))
+                    .unwrap_or(Duration::from_millis(100));
+                match self
+                    .result_rx
+                    .recv_timeout(retry_wait.min(Duration::from_millis(100)))
+                {
                     Ok(result) => break Some(result),
                     Err(mpsc::RecvTimeoutError::Timeout) => continue,
                     Err(mpsc::RecvTimeoutError::Disconnected) => break None,
                 }
             }
         } else {
+            self.submit_due_retries()?;
             self.result_rx.try_recv().ok()
         };
         let Some(result) = result else {
@@ -417,14 +478,46 @@ impl StreamingDownloadSession {
         Ok(true)
     }
 
+    fn submit_due_retries(&mut self) -> Result<(), std::io::Error> {
+        let now = Instant::now();
+        while self
+            .delayed_retries
+            .peek()
+            .is_some_and(|retry| retry.ready_at <= now)
+        {
+            let retry = self
+                .delayed_retries
+                .pop()
+                .expect("due image retry is present");
+            self.send_job(retry.job)?;
+        }
+        Ok(())
+    }
+
     fn process_worker_result(&mut self, result: ImageJobResult) -> Result<(), std::io::Error> {
-        let Some(UriState::Loading(consumers)) = self.uri_states.remove(&result.uri) else {
+        let ImageJobResult { uri, outcome } = result;
+        let result = match outcome {
+            ImageJobOutcome::Retry { job, ready_at } => {
+                if !matches!(self.uri_states.get(&uri), Some(UriState::Loading(_))) {
+                    return Ok(());
+                }
+                let ordinal = self.next_retry_ordinal;
+                self.next_retry_ordinal = self.next_retry_ordinal.wrapping_add(1);
+                self.delayed_retries.push(DelayedImageJob {
+                    ready_at,
+                    ordinal,
+                    job,
+                });
+                return Ok(());
+            }
+            ImageJobOutcome::Complete(result) => result,
+        };
+        let Some(UriState::Loading(consumers)) = self.uri_states.remove(&uri) else {
             return Ok(());
         };
-        match result.result {
+        match result {
             Ok(image) => {
-                self.uri_states
-                    .insert(result.uri, UriState::Ready(image.clone()));
+                self.uri_states.insert(uri, UriState::Ready(image.clone()));
                 for consumer in consumers {
                     self.deliver_image(consumer, Ok(&image));
                 }
@@ -556,7 +649,7 @@ fn image_download_worker(
     result_tx: &Sender<ImageJobResult>,
 ) {
     loop {
-        let job = {
+        let mut job = {
             let Ok(receiver) = job_rx.lock() else {
                 return;
             };
@@ -568,20 +661,30 @@ fn image_download_worker(
         if progress.check_cancelled().is_err() {
             return;
         }
-        let result = load_cached_image(cache_dir, &job.cache_key).and_then(|cached| {
-            if let Some(cached) = cached {
-                return Ok(cached);
+        let deadline = *job
+            .deadline
+            .get_or_insert_with(|| Instant::now() + TOTAL_IMAGE_TIMEOUT);
+        let uri = job.uri.clone();
+        let outcome = match load_cached_image(cache_dir, &job.cache_key) {
+            Ok(Some(cached)) => ImageJobOutcome::Complete(Ok(cached)),
+            Ok(None) => {
+                match download_image_attempt(client, &job.uri, progress, deadline, job.attempt) {
+                    Ok(ImageDownloadAttempt::Complete(image)) => ImageJobOutcome::Complete(
+                        persist_cached_image(cache_dir, &job.cache_key, image),
+                    ),
+                    Ok(ImageDownloadAttempt::RetryAfter(delay)) => {
+                        job.attempt += 1;
+                        ImageJobOutcome::Retry {
+                            ready_at: (Instant::now() + delay).min(deadline),
+                            job,
+                        }
+                    }
+                    Err(error) => ImageJobOutcome::Complete(Err(error)),
+                }
             }
-            let image = download_image(client, &job.uri, progress)?;
-            persist_cached_image(cache_dir, &job.cache_key, image)
-        });
-        if result_tx
-            .send(ImageJobResult {
-                uri: job.uri,
-                result,
-            })
-            .is_err()
-        {
+            Err(error) => ImageJobOutcome::Complete(Err(error)),
+        };
+        if result_tx.send(ImageJobResult { uri, outcome }).is_err() {
             return;
         }
     }
@@ -976,85 +1079,94 @@ fn relative_image_path(pool_name: &str, pool_index: usize, path: &Path) -> Strin
     format!("metadata_sample_images/{pool_name}/{pool_index}/{file_name}")
 }
 
+#[cfg(test)]
 fn download_image(
     client: &Client,
     image_uri: &str,
     progress: &dyn ProgressObserver,
 ) -> Result<DownloadedImage, std::io::Error> {
+    let deadline = Instant::now() + TOTAL_IMAGE_TIMEOUT;
+    let mut attempt = 0;
+    loop {
+        match download_image_attempt(client, image_uri, progress, deadline, attempt)? {
+            ImageDownloadAttempt::Complete(image) => return Ok(image),
+            ImageDownloadAttempt::RetryAfter(delay) => {
+                cancellable_sleep(delay, progress, deadline)?;
+                attempt += 1;
+            }
+        }
+    }
+}
+
+fn download_image_attempt(
+    client: &Client,
+    image_uri: &str,
+    progress: &dyn ProgressObserver,
+    deadline: Instant,
+    attempt: usize,
+) -> Result<ImageDownloadAttempt, std::io::Error> {
     check_cancelled(progress)?;
+    check_deadline(deadline)?;
     if let Some(data) = image_uri.trim().strip_prefix("data:") {
-        return decode_data_image(data);
+        return decode_data_image(data).map(ImageDownloadAttempt::Complete);
     }
     let url = normalize_image_uri(image_uri)?;
-    let deadline = Instant::now() + TOTAL_IMAGE_TIMEOUT;
-    let mut last_error = None;
-    for attempt in 0..MAX_ATTEMPTS {
-        check_cancelled(progress)?;
-        check_deadline(deadline)?;
-        match send_public_get(client, &url, progress, deadline) {
-            Ok((response, final_url)) if response.status().is_success() => {
-                if response
-                    .content_length()
-                    .is_some_and(|size| size > MAX_IMAGE_BYTES)
-                {
-                    return Err(std::io::Error::other("image exceeds 50 MiB limit"));
-                }
-                let content_type = response
-                    .headers()
-                    .get(CONTENT_TYPE)
-                    .and_then(|value| value.to_str().ok())
-                    .unwrap_or("")
-                    .to_owned();
-                let bytes = read_response_body(response, progress, deadline)?;
-                if bytes.len() as u64 > MAX_IMAGE_BYTES {
-                    return Err(std::io::Error::other("image exceeds 50 MiB limit"));
-                }
-                let suffix = infer_image_suffix(&content_type, &final_url, &bytes)?;
-                return Ok(DownloadedImage { bytes, suffix });
+    match send_public_get(client, &url, progress, deadline) {
+        Ok((response, final_url)) if response.status().is_success() => {
+            if response
+                .content_length()
+                .is_some_and(|size| size > MAX_IMAGE_BYTES)
+            {
+                return Err(std::io::Error::other("image exceeds 50 MiB limit"));
             }
-            Ok((response, _)) => {
-                let status = response.status();
-                let retryable = status.as_u16() == 429 || status.is_server_error();
+            let content_type = response
+                .headers()
+                .get(CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("")
+                .to_owned();
+            let bytes = read_response_body(response, progress, deadline)?;
+            if bytes.len() as u64 > MAX_IMAGE_BYTES {
+                return Err(std::io::Error::other("image exceeds 50 MiB limit"));
+            }
+            let suffix = infer_image_suffix(&content_type, &final_url, &bytes)?;
+            Ok(ImageDownloadAttempt::Complete(DownloadedImage {
+                bytes,
+                suffix,
+            }))
+        }
+        Ok((response, _)) => {
+            let status = response.status();
+            let retryable = status.as_u16() == 429 || status.is_server_error();
+            if retryable && attempt + 1 < MAX_ATTEMPTS {
                 let retry_after = response
                     .headers()
                     .get(RETRY_AFTER)
                     .and_then(|value| value.to_str().ok())
                     .and_then(|value| value.parse::<u64>().ok());
-                last_error = Some(format!("HTTP {status}"));
-                if !retryable || attempt + 1 == MAX_ATTEMPTS {
-                    break;
-                }
-                cancellable_sleep(
-                    Duration::from_secs(
-                        retry_after
-                            .unwrap_or(1_u64 << attempt.min(2))
-                            .min(MAX_RETRY_DELAY.as_secs()),
-                    ),
-                    progress,
-                    deadline,
-                )?;
+                return Ok(ImageDownloadAttempt::RetryAfter(Duration::from_secs(
+                    retry_after
+                        .unwrap_or(1_u64 << attempt.min(2))
+                        .min(MAX_RETRY_DELAY.as_secs()),
+                )));
             }
-            Err(error) => {
-                if error.kind() == std::io::ErrorKind::PermissionDenied
-                    || error.kind() == std::io::ErrorKind::InvalidInput
-                {
-                    return Err(error);
-                }
-                last_error = Some(error.to_string());
-                if attempt + 1 == MAX_ATTEMPTS {
-                    break;
-                }
-                cancellable_sleep(
-                    Duration::from_secs(1_u64 << attempt.min(2)).min(MAX_RETRY_DELAY),
-                    progress,
-                    deadline,
-                )?;
+            Err(std::io::Error::other(format!("HTTP {status}")))
+        }
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::PermissionDenied
+                || error.kind() == std::io::ErrorKind::InvalidInput
+                || error.kind() == std::io::ErrorKind::Interrupted
+            {
+                return Err(error);
             }
+            if attempt + 1 == MAX_ATTEMPTS {
+                return Err(std::io::Error::other(error.to_string()));
+            }
+            Ok(ImageDownloadAttempt::RetryAfter(
+                Duration::from_secs(1_u64 << attempt.min(2)).min(MAX_RETRY_DELAY),
+            ))
         }
     }
-    Err(std::io::Error::other(
-        last_error.unwrap_or_else(|| "download failed".to_owned()),
-    ))
 }
 
 fn send_public_get(
@@ -1118,6 +1230,7 @@ fn read_response_body(
     Ok(bytes)
 }
 
+#[cfg(test)]
 fn cancellable_sleep(
     duration: Duration,
     progress: &dyn ProgressObserver,
@@ -1515,6 +1628,41 @@ mod tests {
             download_image(&client, "data:image/png;base64,iVBORw0KGgo=", &NoopProgress).unwrap();
         assert_eq!(image.suffix, ".png");
         assert_eq!(image.bytes, expected);
+    }
+
+    #[test]
+    fn delayed_retry_releases_worker_and_is_requeued() {
+        let output = tempfile::tempdir().unwrap();
+        let mut session = StreamingDownloadSession::new(
+            output.path(),
+            1,
+            Arc::new(NoopProgress) as Arc<dyn ProgressObserver>,
+        )
+        .unwrap();
+        let uri = "data:image/png;base64,iVBORw0KGgo=".to_owned();
+        session
+            .uri_states
+            .insert(uri.clone(), UriState::Loading(Vec::new()));
+        session
+            .process_worker_result(ImageJobResult {
+                uri: uri.clone(),
+                outcome: ImageJobOutcome::Retry {
+                    job: ImageJob {
+                        cache_key: image_cache_key(&uri),
+                        uri: uri.clone(),
+                        attempt: 1,
+                        deadline: Some(Instant::now() + Duration::from_secs(5)),
+                    },
+                    ready_at: Instant::now(),
+                },
+            })
+            .unwrap();
+
+        assert_eq!(session.delayed_retries.len(), 1);
+        while !matches!(session.uri_states.get(&uri), Some(UriState::Ready(_))) {
+            assert!(session.receive_worker_result(true).unwrap());
+        }
+        assert!(session.delayed_retries.is_empty());
     }
 
     #[test]
