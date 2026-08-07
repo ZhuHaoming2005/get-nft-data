@@ -11,6 +11,10 @@ pub trait ProgressObserver: Send + Sync {
     fn add_completed(&self, delta: u64);
     /// Record fine-grained work within a coarse completion unit.
     fn add_activity(&self, _delta: u64) {}
+    /// Give fine-grained work a phase-specific name in progress output.
+    fn set_activity_label(&self, _label: &str) {}
+    /// Publish a compact, human-readable description of pipeline state.
+    fn set_detail(&self, _detail: &str) {}
     fn check_cancelled(&self) -> Result<(), crate::DedupError> {
         Ok(())
     }

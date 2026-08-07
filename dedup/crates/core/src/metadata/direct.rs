@@ -48,9 +48,6 @@ const FAST_SAMPLE_MAX_PREPARE_BATCH: usize = 256;
 const FAST_SAMPLE_OUTSTANDING_PAIRS_PER_THREAD: usize = 8;
 const FAST_SAMPLE_MIN_OUTSTANDING_PAIRS: usize = 64;
 const FAST_SAMPLE_MAX_OUTSTANDING_PAIRS: usize = 512;
-const FAST_SAMPLE_SUBMIT_PAIRS_PER_THREAD: usize = 2;
-const FAST_SAMPLE_MIN_SUBMIT_BATCH: usize = 16;
-const FAST_SAMPLE_MAX_SUBMIT_BATCH: usize = 64;
 #[cfg(test)]
 const FAST_SAMPLE_DENSE_POSTING_TRIES: u64 = 128;
 #[cfg(test)]
@@ -1512,10 +1509,12 @@ struct FastSampleCollector<'a> {
     in_flight: AHashMap<u64, (FastSampleBucket, MetadataImagePairSample)>,
     completed: AHashMap<u64, (FastSampleBucket, MetadataImagePairSample, bool)>,
     commit_order_by_bucket: AHashMap<FastSampleBucket, VecDeque<u64>>,
-    outstanding_by_bucket: AHashMap<FastSampleBucket, usize>,
-    outstanding_total: usize,
-    max_outstanding: usize,
-    submit_batch_size: usize,
+    viable_by_bucket: AHashMap<FastSampleBucket, usize>,
+    uncommitted_by_bucket: AHashMap<FastSampleBucket, usize>,
+    uncommitted_total: usize,
+    physical_outstanding: usize,
+    max_physical_outstanding: usize,
+    accepted_candidate_ids: Vec<u64>,
 }
 
 fn fast_sample_prepare_batch() -> usize {
@@ -1524,19 +1523,13 @@ fn fast_sample_prepare_batch() -> usize {
         .clamp(FAST_SAMPLE_MIN_PREPARE_BATCH, FAST_SAMPLE_MAX_PREPARE_BATCH)
 }
 
-fn fast_sample_max_outstanding() -> usize {
+fn fast_sample_max_physical_outstanding() -> usize {
     rayon::current_num_threads()
         .saturating_mul(FAST_SAMPLE_OUTSTANDING_PAIRS_PER_THREAD)
         .clamp(
             FAST_SAMPLE_MIN_OUTSTANDING_PAIRS,
             FAST_SAMPLE_MAX_OUTSTANDING_PAIRS,
         )
-}
-
-fn fast_sample_submit_batch() -> usize {
-    rayon::current_num_threads()
-        .saturating_mul(FAST_SAMPLE_SUBMIT_PAIRS_PER_THREAD)
-        .clamp(FAST_SAMPLE_MIN_SUBMIT_BATCH, FAST_SAMPLE_MAX_SUBMIT_BATCH)
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -1642,7 +1635,7 @@ impl FastSampleCollector<'_> {
     }
 
     fn pending_count(&self, bucket: FastSampleBucket) -> usize {
-        self.outstanding_by_bucket
+        self.uncommitted_by_bucket
             .get(&bucket)
             .copied()
             .unwrap_or(0)
@@ -1657,13 +1650,56 @@ impl FastSampleCollector<'_> {
 
     fn covered(&self, bucket: FastSampleBucket) -> bool {
         let accepted = self.accepted_by_bucket.get(&bucket).copied().unwrap_or(0);
-        accepted + self.pending_count(bucket) >= self.target(bucket)
+        let viable = self.viable_by_bucket.get(&bucket).copied().unwrap_or(0);
+        accepted + viable >= self.target(bucket)
     }
 
     fn remaining(&self, bucket: FastSampleBucket) -> usize {
         let accepted = self.accepted_by_bucket.get(&bucket).copied().unwrap_or(0);
+        let viable = self.viable_by_bucket.get(&bucket).copied().unwrap_or(0);
         self.target(bucket)
-            .saturating_sub(accepted.saturating_add(self.pending_count(bucket)))
+            .saturating_sub(accepted.saturating_add(viable))
+    }
+
+    fn total_target_remaining(&self) -> usize {
+        self.bucket_targets
+            .iter()
+            .map(|&(bucket, target)| {
+                target.saturating_sub(self.accepted_by_bucket.get(&bucket).copied().unwrap_or(0))
+            })
+            .sum()
+    }
+
+    fn can_prefetch(&self) -> bool {
+        let remaining = self.total_target_remaining();
+        let slack = remaining.min(self.max_physical_outstanding);
+        self.uncommitted_total < remaining.saturating_add(slack)
+    }
+
+    fn has_commit_capacity(&self) -> bool {
+        self.uncommitted_total
+            < self
+                .total_target_remaining()
+                .saturating_add(self.max_physical_outstanding.saturating_mul(2))
+    }
+
+    fn bucket_wants_candidate(&self, bucket: FastSampleBucket) -> bool {
+        let accepted = self.accepted_by_bucket.get(&bucket).copied().unwrap_or(0);
+        if accepted >= self.target(bucket) {
+            return false;
+        }
+        if !self.has_commit_capacity() {
+            return false;
+        }
+        let has_uncovered_bucket = self
+            .bucket_targets
+            .iter()
+            .any(|&(candidate, _)| !self.covered(candidate));
+        if has_uncovered_bucket {
+            !self.covered(bucket)
+        } else {
+            self.can_prefetch()
+        }
     }
 
     fn redistribute_exhausted_bucket(
@@ -1750,6 +1786,19 @@ impl FastSampleCollector<'_> {
                     "media downloader returned an unknown candidate ID",
                 ));
             };
+            self.physical_outstanding =
+                self.physical_outstanding.checked_sub(1).ok_or_else(|| {
+                    DedupError::invalid("sample_metadata", "physical download count underflow")
+                })?;
+            if !result.success {
+                let viable = self
+                    .viable_by_bucket
+                    .get_mut(&bucket)
+                    .expect("failed sample bucket has viable candidates");
+                *viable = viable.checked_sub(1).ok_or_else(|| {
+                    DedupError::invalid("sample_metadata", "viable sample count underflow")
+                })?;
+            }
             self.completed
                 .insert(result.id, (bucket, sample, result.success));
         }
@@ -1774,29 +1823,37 @@ impl FastSampleCollector<'_> {
                     .get_mut(&bucket)
                     .expect("sample bucket commit queue is present")
                     .pop_front();
-                let outstanding = self
-                    .outstanding_by_bucket
+                let uncommitted = self
+                    .uncommitted_by_bucket
                     .get_mut(&bucket)
-                    .expect("completed sample bucket has outstanding candidates");
-                *outstanding = outstanding.checked_sub(1).ok_or_else(|| {
+                    .expect("completed sample bucket has uncommitted candidates");
+                *uncommitted = uncommitted.checked_sub(1).ok_or_else(|| {
                     DedupError::invalid(
                         "sample_metadata",
-                        "sample bucket outstanding count underflow",
+                        "sample bucket uncommitted count underflow",
                     )
                 })?;
-                self.outstanding_total =
-                    self.outstanding_total.checked_sub(1).ok_or_else(|| {
-                        DedupError::invalid("sample_metadata", "sample outstanding count underflow")
+                self.uncommitted_total =
+                    self.uncommitted_total.checked_sub(1).ok_or_else(|| {
+                        DedupError::invalid("sample_metadata", "sample uncommitted count underflow")
                     })?;
                 if !success {
                     continue;
                 }
+                let viable = self
+                    .viable_by_bucket
+                    .get_mut(&bucket)
+                    .expect("successful sample bucket has viable candidates");
+                *viable = viable.checked_sub(1).ok_or_else(|| {
+                    DedupError::invalid("sample_metadata", "viable sample count underflow")
+                })?;
                 let target = self.target(bucket);
                 let accepted_in_bucket = self.accepted_by_bucket.entry(bucket).or_default();
                 if *accepted_in_bucket >= target {
                     continue;
                 }
                 *accepted_in_bucket += 1;
+                self.accepted_candidate_ids.push(next_id);
                 match bucket.pool() {
                     MetadataSamplePool::IntraChain => {
                         self.intra_chain.push(sample);
@@ -1813,11 +1870,11 @@ impl FastSampleCollector<'_> {
     }
 
     fn has_outstanding(&self) -> bool {
-        self.outstanding_total != 0
+        self.uncommitted_total != 0
     }
 
     fn has_open_slot(&self) -> bool {
-        self.outstanding_total < self.max_outstanding
+        self.physical_outstanding < self.max_physical_outstanding
     }
 
     fn wait_for_open_slot(&mut self) -> Result<usize, DedupError> {
@@ -1854,7 +1911,9 @@ impl FastSampleCollector<'_> {
         if bucket != needs.bucket {
             return Ok(false);
         }
-        if self.covered(bucket) || !self.seen_contract_pairs.insert((contract_a, contract_b)) {
+        if !self.bucket_wants_candidate(bucket)
+            || !self.seen_contract_pairs.insert((contract_a, contract_b))
+        {
             return Ok(false);
         }
         self.attempted_pairs += 1;
@@ -1877,15 +1936,11 @@ impl FastSampleCollector<'_> {
             .entry(bucket)
             .or_default()
             .push_back(id);
-        *self.outstanding_by_bucket.entry(bucket).or_default() += 1;
-        self.outstanding_total += 1;
-        let all_buckets_covered = self
-            .bucket_targets
-            .iter()
-            .all(|&(candidate, _)| self.covered(candidate));
-        if self.pending.len() >= self.submit_batch_size || all_buckets_covered {
-            self.flush()?;
-        }
+        *self.viable_by_bucket.entry(bucket).or_default() += 1;
+        *self.uncommitted_by_bucket.entry(bucket).or_default() += 1;
+        self.uncommitted_total += 1;
+        self.physical_outstanding += 1;
+        self.flush()?;
         Ok(true)
     }
 
@@ -2466,9 +2521,9 @@ pub fn sample_direct_releasing(
         "random_candidate_search",
         Some((target_per_pool as u64).saturating_mul(2)),
     );
+    progress.set_activity_label("candidate_slots");
     let prepare_batch_size = fast_sample_prepare_batch();
-    let max_outstanding = fast_sample_max_outstanding();
-    let submit_batch_size = fast_sample_submit_batch();
+    let max_physical_outstanding = fast_sample_max_physical_outstanding();
     let mut collector = FastSampleCollector {
         store,
         bucket_targets,
@@ -2481,27 +2536,29 @@ pub fn sample_direct_releasing(
         downloads,
         next_candidate_id: 1,
         attempted_pairs: 0,
-        pending: Vec::with_capacity(submit_batch_size),
+        pending: Vec::with_capacity(1),
         pending_buckets: AHashMap::new(),
         in_flight: AHashMap::new(),
         completed: AHashMap::new(),
         commit_order_by_bucket: AHashMap::new(),
-        outstanding_by_bucket: AHashMap::new(),
-        outstanding_total: 0,
-        max_outstanding,
-        submit_batch_size,
+        viable_by_bucket: AHashMap::new(),
+        uncommitted_by_bucket: AHashMap::new(),
+        uncommitted_total: 0,
+        physical_outstanding: 0,
+        max_physical_outstanding,
+        accepted_candidate_ids: Vec::with_capacity(target_per_pool.saturating_mul(2)),
     };
     let mut scored_tasks = 0_u64;
     let mut drawn_candidate_slots = 0_u64;
+    let mut reported_candidate_slots = 0_u64;
     let mut bucket_choice_ordinal = 0_u64;
+    let mut prepare_bucket_ordinal = 0_u64;
     let mut prepared_by_bucket =
         AHashMap::<FastSampleBucket, VecDeque<(PreparedFastSampleTask, u64)>>::new();
     let mut indexed_source_cache = AHashMap::<u32, Vec<PostingView<'_>>>::new();
     while !collector.complete() {
         progress.check_cancelled()?;
         let collected = collector.collect(false)?;
-        progress.add_completed(collected as u64);
-        let collected = collector.wait_for_open_slot()?;
         progress.add_completed(collected as u64);
         if collector.complete() {
             break;
@@ -2541,7 +2598,7 @@ pub fn sample_direct_releasing(
                     || prepared_by_bucket
                         .get(&search.bucket)
                         .is_some_and(|prepared| !prepared.is_empty()))
-                    && !collector.covered(search.bucket))
+                    && collector.bucket_wants_candidate(search.bucket))
                 .then_some(index)
             })
             .collect::<Vec<_>>();
@@ -2564,82 +2621,132 @@ pub fn sample_direct_releasing(
         let search_index = available[selected];
         let bucket = bucket_searches[search_index].bucket;
         let needs = FastSampleNeeds { bucket };
-        let prepared_queue = prepared_by_bucket.entry(bucket).or_default();
-        if prepared_queue.is_empty() {
+        if available.iter().any(|&index| {
+            prepared_by_bucket
+                .get(&bucket_searches[index].bucket)
+                .is_none_or(VecDeque::is_empty)
+        }) {
+            let empty_searches = available
+                .iter()
+                .copied()
+                .filter(|&index| {
+                    prepared_by_bucket
+                        .get(&bucket_searches[index].bucket)
+                        .is_none_or(VecDeque::is_empty)
+                })
+                .collect::<Vec<_>>();
+            let tasks_per_bucket = prepare_batch_size.div_ceil(empty_searches.len().max(1));
             let mut tasks = Vec::with_capacity(prepare_batch_size);
-            while tasks.len() < prepare_batch_size {
-                let Some((left_id, slot)) = bucket_searches[search_index].next_slot(&task_plans)
-                else {
+            let mut prepare_order = RandomTaskPermutation::new(
+                empty_searches.len() as u64,
+                randomness,
+                b"fast-sample-prepare-bucket-order",
+                prepare_bucket_ordinal,
+            );
+            prepare_bucket_ordinal = prepare_bucket_ordinal.wrapping_add(1);
+            while let Some(order) = prepare_order.next() {
+                if tasks.len() >= prepare_batch_size {
                     break;
-                };
-                let bucket_draw_ordinal = bucket_searches[search_index].draw_ordinal - 1;
-                let task_salt = bucket_searches[search_index].randomness.score(
-                    b"fast-sample-task-witness",
-                    &[
-                        bucket_searches[search_index].bucket_salt(),
-                        bucket_draw_ordinal,
-                    ],
-                );
-                drawn_candidate_slots += 1;
-                if drawn_candidate_slots.is_multiple_of(256) {
-                    progress.add_activity(256);
-                    progress.check_cancelled()?;
                 }
-                let Some(task) = fast_candidate_task_from_slot(
-                    &index,
-                    &candidate_plan,
-                    &all_image_profiles,
-                    &task_plans,
-                    &mut indexed_source_cache,
-                    left_id,
-                    slot,
-                ) else {
-                    continue;
+                let candidate_search_index = empty_searches[order as usize];
+                let candidate_bucket = bucket_searches[candidate_search_index].bucket;
+                let candidate_needs = FastSampleNeeds {
+                    bucket: candidate_bucket,
                 };
-                if let FastCandidateTask::Cross(right_id) = task
-                    && (!cross_profiles_may_supply_needed_pool(
+                let mut drawn_for_bucket = 0_usize;
+                while drawn_for_bucket < tasks_per_bucket && tasks.len() < prepare_batch_size {
+                    let Some((left_id, slot)) =
+                        bucket_searches[candidate_search_index].next_slot(&task_plans)
+                    else {
+                        break;
+                    };
+                    drawn_for_bucket += 1;
+                    let bucket_draw_ordinal =
+                        bucket_searches[candidate_search_index].draw_ordinal - 1;
+                    let task_salt = bucket_searches[candidate_search_index].randomness.score(
+                        b"fast-sample-task-witness",
+                        &[
+                            bucket_searches[candidate_search_index].bucket_salt(),
+                            bucket_draw_ordinal,
+                        ],
+                    );
+                    drawn_candidate_slots += 1;
+                    if drawn_candidate_slots.is_multiple_of(256) {
+                        progress.check_cancelled()?;
+                    }
+                    let Some(task) = fast_candidate_task_from_slot(
                         &index,
-                        &index.profiles[left_id as usize],
-                        &index.profiles[right_id as usize],
-                        needs,
-                    ) || matches!(
                         &candidate_plan,
-                        CrossProfilePlan::Indexed(candidates)
-                            if !candidate_pair_may_match(
-                                &index,
-                                candidates.include_bm25,
-                                left_id,
-                                right_id,
-                            )
-                    ))
-                {
-                    continue;
+                        &all_image_profiles,
+                        &task_plans,
+                        &mut indexed_source_cache,
+                        left_id,
+                        slot,
+                    ) else {
+                        continue;
+                    };
+                    if let FastCandidateTask::Cross(right_id) = task
+                        && (!cross_profiles_may_supply_needed_pool(
+                            &index,
+                            &index.profiles[left_id as usize],
+                            &index.profiles[right_id as usize],
+                            candidate_needs,
+                        ) || matches!(
+                            &candidate_plan,
+                            CrossProfilePlan::Indexed(candidates)
+                                if !candidate_pair_may_match(
+                                    &index,
+                                    candidates.include_bm25,
+                                    left_id,
+                                    right_id,
+                                )
+                        ))
+                    {
+                        continue;
+                    }
+                    tasks.push((candidate_bucket, left_id as usize, task, task_salt));
                 }
-                tasks.push((left_id as usize, task, task_salt));
             }
+            progress.add_activity(drawn_candidate_slots - reported_candidate_slots);
+            reported_candidate_slots = drawn_candidate_slots;
             let prepared = tasks
                 .par_iter()
-                .map(|&(left_id, task, salt)| {
+                .map(|&(candidate_bucket, left_id, task, salt)| {
+                    let candidate_needs = FastSampleNeeds {
+                        bucket: candidate_bucket,
+                    };
                     prepare_fast_sample_task(
                         &index,
                         threshold,
                         left_id,
                         task,
-                        needs,
+                        candidate_needs,
                         collector.randomness,
                         salt,
                     )
-                    .map(|prepared| (prepared, salt))
+                    .map(|prepared| (candidate_bucket, prepared, salt))
                 })
                 .collect::<Vec<_>>();
             scored_tasks = scored_tasks.saturating_add(tasks.len() as u64);
-            prepared_queue.extend(prepared.into_iter().flatten());
+            for (candidate_bucket, prepared, salt) in prepared.into_iter().flatten() {
+                prepared_by_bucket
+                    .entry(candidate_bucket)
+                    .or_default()
+                    .push_back((prepared, salt));
+            }
         }
+        if !collector.has_open_slot() {
+            let collected = collector.wait_for_open_slot()?;
+            progress.add_completed(collected as u64);
+            continue;
+        }
+        let prepared_queue = prepared_by_bucket.entry(bucket).or_default();
         while collector.has_open_slot()
-            && !collector.covered(bucket)
+            && collector.bucket_wants_candidate(bucket)
             && let Some((mut task, draw_salt)) = prepared_queue.pop_front()
         {
             let accepted_before = collector.accepted_count();
+            let attempted_before = collector.attempted_pairs;
             let retain_task = match &mut task {
                 PreparedFastSampleTask::Pair {
                     left_contract,
@@ -2659,7 +2766,7 @@ pub fn sample_direct_releasing(
                 PreparedFastSampleTask::CrossPairs { left, right, order } => {
                     let mut checked = 0_u64;
                     while collector.has_open_slot()
-                        && !collector.covered(bucket)
+                        && collector.bucket_wants_candidate(bucket)
                         && let Some(ordinal) = order.next()
                     {
                         let left_index = ordinal / right.len() as u64;
@@ -2688,6 +2795,9 @@ pub fn sample_direct_releasing(
             }
             progress
                 .add_completed(collector.accepted_count().saturating_sub(accepted_before) as u64);
+            if collector.attempted_pairs != attempted_before {
+                break;
+            }
         }
     }
     collector.flush()?;
@@ -2695,7 +2805,11 @@ pub fn sample_direct_releasing(
         let collected = collector.collect(true)?;
         progress.add_completed(collected as u64);
     }
-    progress.add_activity(drawn_candidate_slots % 256);
+    progress.add_activity(drawn_candidate_slots - reported_candidate_slots);
+    let accepted_candidate_ids = collector.accepted_candidate_ids.clone();
+    collector
+        .downloads
+        .retain_candidates(&accepted_candidate_ids)?;
     let result = MetadataFastSampleResult {
         intra_chain: collector.intra_chain,
         cross_chain: collector.cross_chain,
@@ -9966,10 +10080,12 @@ mod tests {
             in_flight: AHashMap::new(),
             completed: AHashMap::new(),
             commit_order_by_bucket: AHashMap::new(),
-            outstanding_by_bucket: AHashMap::new(),
-            outstanding_total: 0,
-            max_outstanding: fast_sample_max_outstanding(),
-            submit_batch_size: fast_sample_submit_batch(),
+            viable_by_bucket: AHashMap::new(),
+            uncommitted_by_bucket: AHashMap::new(),
+            uncommitted_total: 0,
+            physical_outstanding: 0,
+            max_physical_outstanding: fast_sample_max_physical_outstanding(),
+            accepted_candidate_ids: Vec::new(),
         };
         let needs = FastSampleNeeds {
             bucket: FastSampleBucket::Intra(0),
@@ -10039,10 +10155,12 @@ mod tests {
             in_flight: AHashMap::new(),
             completed: AHashMap::new(),
             commit_order_by_bucket: AHashMap::new(),
-            outstanding_by_bucket: AHashMap::new(),
-            outstanding_total: 0,
-            max_outstanding: fast_sample_max_outstanding(),
-            submit_batch_size: fast_sample_submit_batch(),
+            viable_by_bucket: AHashMap::new(),
+            uncommitted_by_bucket: AHashMap::new(),
+            uncommitted_total: 0,
+            physical_outstanding: 0,
+            max_physical_outstanding: fast_sample_max_physical_outstanding(),
+            accepted_candidate_ids: Vec::new(),
         };
         let needs = FastSampleNeeds { bucket };
 
@@ -10095,10 +10213,12 @@ mod tests {
             in_flight: AHashMap::new(),
             completed: AHashMap::new(),
             commit_order_by_bucket: AHashMap::new(),
-            outstanding_by_bucket: AHashMap::new(),
-            outstanding_total: 0,
-            max_outstanding: fast_sample_max_outstanding(),
-            submit_batch_size: fast_sample_submit_batch(),
+            viable_by_bucket: AHashMap::new(),
+            uncommitted_by_bucket: AHashMap::new(),
+            uncommitted_total: 0,
+            physical_outstanding: 0,
+            max_physical_outstanding: fast_sample_max_physical_outstanding(),
+            accepted_candidate_ids: Vec::new(),
         };
         let needs = FastSampleNeeds { bucket };
         assert!(collector.observe(0, 0, 1, 1, needs).unwrap());
@@ -10146,10 +10266,12 @@ mod tests {
             in_flight: AHashMap::new(),
             completed: AHashMap::new(),
             commit_order_by_bucket: AHashMap::new(),
-            outstanding_by_bucket: AHashMap::new(),
-            outstanding_total: 0,
-            max_outstanding: fast_sample_max_outstanding(),
-            submit_batch_size: fast_sample_submit_batch(),
+            viable_by_bucket: AHashMap::new(),
+            uncommitted_by_bucket: AHashMap::new(),
+            uncommitted_total: 0,
+            physical_outstanding: 0,
+            max_physical_outstanding: fast_sample_max_physical_outstanding(),
+            accepted_candidate_ids: Vec::new(),
         };
         assert!(
             collector
@@ -10486,10 +10608,12 @@ mod tests {
             in_flight: AHashMap::new(),
             completed: AHashMap::new(),
             commit_order_by_bucket: AHashMap::new(),
-            outstanding_by_bucket: AHashMap::new(),
-            outstanding_total: 0,
-            max_outstanding: fast_sample_max_outstanding(),
-            submit_batch_size: fast_sample_submit_batch(),
+            viable_by_bucket: AHashMap::new(),
+            uncommitted_by_bucket: AHashMap::new(),
+            uncommitted_total: 0,
+            physical_outstanding: 0,
+            max_physical_outstanding: fast_sample_max_physical_outstanding(),
+            accepted_candidate_ids: Vec::new(),
         };
 
         let logical = collector.logical_members(&members, b"test-logical-members", 0);

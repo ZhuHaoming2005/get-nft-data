@@ -82,6 +82,8 @@ struct Meta {
     last_tick: Instant,
     eta: EwmaEta,
     activity_rate: EwmaEta,
+    activity_label: Option<String>,
+    detail: Option<String>,
     phase_history: Vec<PhaseTimingSnapshot>,
 }
 
@@ -102,6 +104,10 @@ struct ProgressLine {
     rate: Option<f64>,
     activity: u64,
     activity_rate: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    activity_label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
     active: bool,
     eta_secs: Option<f64>,
     eta_confident: bool,
@@ -137,6 +143,8 @@ impl ProgressReporter {
                 last_tick: now,
                 eta: EwmaEta::new(EWMA_ALPHA),
                 activity_rate: EwmaEta::new(EWMA_ALPHA),
+                activity_label: None,
+                detail: None,
                 phase_history: Vec::new(),
             }),
             completed: ProgressCounter::new(),
@@ -219,6 +227,8 @@ impl ProgressObserver for ProgressReporter {
         meta.last_tick = now;
         meta.eta = EwmaEta::new(EWMA_ALPHA);
         meta.activity_rate = EwmaEta::new(EWMA_ALPHA);
+        meta.activity_label = None;
+        meta.detail = None;
         self.shared.completed.store(0, Ordering::Relaxed);
         self.shared.activity.store(0, Ordering::Relaxed);
     }
@@ -235,6 +245,8 @@ impl ProgressObserver for ProgressReporter {
         meta.last_tick = now;
         meta.eta = EwmaEta::new(EWMA_ALPHA);
         meta.activity_rate = EwmaEta::new(EWMA_ALPHA);
+        meta.activity_label = None;
+        meta.detail = None;
         self.shared.completed.store(0, Ordering::Relaxed);
         self.shared.activity.store(0, Ordering::Relaxed);
     }
@@ -253,6 +265,19 @@ impl ProgressObserver for ProgressReporter {
         if self.shared.mode != EffectiveMode::Off {
             self.shared.activity.add(delta);
         }
+    }
+
+    fn set_activity_label(&self, label: &str) {
+        self.shared
+            .meta
+            .lock()
+            .expect("progress lock")
+            .activity_label = Some(label.to_owned());
+    }
+
+    fn set_detail(&self, detail: &str) {
+        self.shared.meta.lock().expect("progress lock").detail =
+            (!detail.is_empty()).then(|| detail.to_owned());
     }
 
     fn check_cancelled(&self) -> Result<(), DedupError> {
@@ -352,6 +377,8 @@ fn emit_snapshot(shared: &Shared) {
         activity_rate: (activity_delta != 0)
             .then(|| meta.activity_rate.rate())
             .flatten(),
+        activity_label: meta.activity_label.clone(),
+        detail: meta.detail.clone(),
         active,
         eta_secs,
         eta_confident: meta.eta.confident(),
@@ -392,8 +419,18 @@ fn emit_snapshot(shared: &Shared) {
                     .activity_rate
                     .map(|rate| format!(" {rate:.0}/s"))
                     .unwrap_or_default();
-                format!(" candidates={}{}", line.activity, activity_rate)
+                format!(
+                    " {}={}{}",
+                    line.activity_label.as_deref().unwrap_or("candidates"),
+                    line.activity,
+                    activity_rate
+                )
             };
+            let detail = line
+                .detail
+                .as_deref()
+                .map(|detail| format!(" {detail}"))
+                .unwrap_or_default();
             let elapsed = format_duration(line.phase_elapsed_secs);
             let eta = match line.total {
                 None => "n/a".to_owned(),
@@ -406,7 +443,7 @@ fn emit_snapshot(shared: &Shared) {
             };
             let _ = write!(
                 io::stderr(),
-                "\r[{label}] {progress} {pct} {rate}{activity} elapsed={elapsed} eta={eta}\x1b[K"
+                "\r[{label}] {progress} {pct} {rate}{activity}{detail} elapsed={elapsed} eta={eta}\x1b[K"
             );
             let _ = io::stderr().flush();
         }
@@ -487,10 +524,16 @@ mod tests {
         let mut reporter = ProgressReporter::start(ProgressMode::Json, 60_000);
         reporter.begin_phase("direct_bm25", Some(10));
         reporter.add_activity(7);
+        reporter.set_activity_label("candidate_slots");
+        reporter.set_detail("media=1/2");
         assert_eq!(reporter.shared.activity.load(Ordering::Relaxed), 7);
 
         reporter.begin_phase("next", Some(1));
         assert_eq!(reporter.shared.activity.load(Ordering::Relaxed), 0);
+        let meta = reporter.shared.meta.lock().expect("progress lock");
+        assert!(meta.activity_label.is_none());
+        assert!(meta.detail.is_none());
+        drop(meta);
         reporter.finish();
     }
 

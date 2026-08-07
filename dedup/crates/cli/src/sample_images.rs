@@ -12,7 +12,7 @@ use reqwest::{StatusCode, Url};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::cmp::Ordering as CmpOrdering;
-use std::collections::{BinaryHeap, HashMap, VecDeque};
+use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
@@ -203,6 +203,7 @@ pub struct StreamingDownloadSession {
     progress: Arc<dyn ProgressObserver>,
     shutdown: Arc<AtomicBool>,
     job_tx: Option<SyncSender<ImageJob>>,
+    unsent_jobs: VecDeque<ImageJob>,
     result_rx: Receiver<ImageJobResult>,
     workers: Vec<JoinHandle<()>>,
     delayed_retries: BinaryHeap<DelayedImageJob>,
@@ -270,6 +271,7 @@ impl StreamingDownloadSession {
             progress,
             shutdown,
             job_tx: Some(job_tx),
+            unsent_jobs: VecDeque::new(),
             result_rx,
             workers,
             delayed_retries: BinaryHeap::new(),
@@ -353,7 +355,6 @@ impl StreamingDownloadSession {
     ) -> Result<(), std::io::Error> {
         check_cancelled(self.progress.as_ref())?;
         self.attempted = self.attempted.saturating_add(1);
-        self.progress.add_activity(1);
         let staging_root = self
             .staging
             .as_ref()
@@ -418,26 +419,27 @@ impl StreamingDownloadSession {
         self.uri_states
             .insert(uri.clone(), UriState::Loading(vec![consumer]));
         self.network_jobs = self.network_jobs.saturating_add(1);
-        self.send_job(ImageJob {
+        self.unsent_jobs.push_back(ImageJob {
             uri,
             cache_key,
             attempt: 0,
             deadline: None,
-        })
+        });
+        Ok(())
     }
 
-    fn send_job(&self, mut job: ImageJob) -> Result<(), std::io::Error> {
+    fn pump_jobs(&mut self) -> Result<(), std::io::Error> {
+        check_cancelled(self.progress.as_ref())?;
         let sender = self
             .job_tx
             .as_ref()
             .ok_or_else(|| std::io::Error::other("image downloader is shutting down"))?;
-        loop {
-            check_cancelled(self.progress.as_ref())?;
+        while let Some(job) = self.unsent_jobs.pop_front() {
             match sender.try_send(job) {
-                Ok(()) => return Ok(()),
+                Ok(()) => {}
                 Err(TrySendError::Full(returned)) => {
-                    job = returned;
-                    std::thread::sleep(Duration::from_millis(20));
+                    self.unsent_jobs.push_front(returned);
+                    break;
                 }
                 Err(TrySendError::Disconnected(_)) => {
                     return Err(std::io::Error::other(
@@ -446,6 +448,7 @@ impl StreamingDownloadSession {
                 }
             }
         }
+        Ok(())
     }
 
     fn receive_worker_result(&mut self, wait: bool) -> Result<bool, std::io::Error> {
@@ -453,6 +456,7 @@ impl StreamingDownloadSession {
             loop {
                 check_cancelled(self.progress.as_ref())?;
                 self.submit_due_retries()?;
+                self.pump_jobs()?;
                 let retry_wait = self
                     .delayed_retries
                     .peek()
@@ -469,6 +473,7 @@ impl StreamingDownloadSession {
             }
         } else {
             self.submit_due_retries()?;
+            self.pump_jobs()?;
             self.result_rx.try_recv().ok()
         };
         let Some(result) = result else {
@@ -489,7 +494,7 @@ impl StreamingDownloadSession {
                 .delayed_retries
                 .pop()
                 .expect("due image retry is present");
-            self.send_job(retry.job)?;
+            self.unsent_jobs.push_back(retry.job);
         }
         Ok(())
     }
@@ -616,6 +621,21 @@ impl StreamingDownloadSession {
             self.coalesced_uris,
         )
     }
+
+    fn update_progress_detail(&self) {
+        let successful = self.intra_chain.len() + self.cross_chain.len();
+        let resolved = successful.saturating_add(self.failed_pairs);
+        self.progress.set_detail(&format!(
+            "media={}/{} pending={} queued={} failed={} net={} reused={}",
+            resolved,
+            self.attempted,
+            self.pending_pairs.len(),
+            self.unsent_jobs.len(),
+            self.failed_pairs,
+            self.network_jobs,
+            self.cache_hits.saturating_add(self.coalesced_uris),
+        ));
+    }
 }
 
 impl MetadataSampleDownloadSink for StreamingDownloadSession {
@@ -623,6 +643,8 @@ impl MetadataSampleDownloadSink for StreamingDownloadSession {
         for candidate in candidates {
             self.submit_candidate(candidate).map_err(io_to_dedup)?;
         }
+        self.pump_jobs().map_err(io_to_dedup)?;
+        self.update_progress_detail();
         Ok(())
     }
 
@@ -631,7 +653,33 @@ impl MetadataSampleDownloadSink for StreamingDownloadSession {
             self.receive_worker_result(wait).map_err(io_to_dedup)?;
         }
         while self.receive_worker_result(false).map_err(io_to_dedup)? {}
+        self.update_progress_detail();
         Ok(self.completed.drain(..).collect())
+    }
+
+    fn retain_candidates(&mut self, candidate_ids: &[u64]) -> Result<(), DedupError> {
+        let selected = candidate_ids.iter().copied().collect::<HashSet<_>>();
+        let retain_selected = |pairs: &mut Vec<StagedPair>| {
+            pairs.retain(|pair| {
+                if selected.contains(&pair.candidate_id) {
+                    return true;
+                }
+                if let Some(row_dir) = pair.file_a.parent() {
+                    let _ = fs::remove_dir_all(row_dir);
+                }
+                false
+            });
+        };
+        retain_selected(&mut self.intra_chain);
+        retain_selected(&mut self.cross_chain);
+        let retained = self.intra_chain.len() + self.cross_chain.len();
+        if retained != selected.len() {
+            return Err(DedupError::invalid(
+                "sample_metadata",
+                "selected media candidates do not match completed downloads",
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -1666,6 +1714,31 @@ mod tests {
     }
 
     #[test]
+    fn a_full_network_queue_does_not_block_candidate_submission() {
+        let output = tempfile::tempdir().unwrap();
+        let mut session = StreamingDownloadSession::new(
+            output.path(),
+            1,
+            Arc::new(NoopProgress) as Arc<dyn ProgressObserver>,
+        )
+        .unwrap();
+        let (blocked_tx, _blocked_rx) = mpsc::sync_channel(0);
+        session.job_tx = Some(blocked_tx);
+        session.unsent_jobs.push_back(ImageJob {
+            uri: "data:image/png;base64,iVBORw0KGgo=".to_owned(),
+            cache_key: "queued".to_owned(),
+            attempt: 0,
+            deadline: None,
+        });
+
+        let started = Instant::now();
+        session.pump_jobs().unwrap();
+
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(session.unsent_jobs.len(), 1);
+    }
+
+    #[test]
     fn rejects_non_public_literal_and_resolved_hosts() {
         for url in [
             "http://127.0.0.1/image.png",
@@ -1803,6 +1876,29 @@ mod tests {
         let records = manifest.records().collect::<Result<Vec<_>, _>>().unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(&records[0][seed_column], "42");
+    }
+
+    #[test]
+    fn only_random_order_winners_are_published_after_prefetch() {
+        let temp = tempfile::tempdir().unwrap();
+        let good = "data:image/png;base64,iVBORw0KGgo=";
+        let candidates = [sample("0xfirst", good), sample("0xselected", good)];
+        let mut session =
+            StreamingDownloadSession::new(temp.path(), 1, Arc::new(NoopProgress)).unwrap();
+        let batch = candidates
+            .into_iter()
+            .map(|sample| (MetadataSamplePool::IntraChain, sample))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            session.try_batch(&batch, &NoopProgress).unwrap(),
+            vec![true, true]
+        );
+
+        session.retain_candidates(&[2]).unwrap();
+        let selected = session.finish().unwrap();
+
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].contract_a_address, "0xselected");
     }
 
     #[test]

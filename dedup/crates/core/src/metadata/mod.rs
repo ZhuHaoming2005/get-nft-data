@@ -42,6 +42,10 @@ pub trait MetadataSampleDownloadSink {
     fn submit(&mut self, candidates: &[MetadataSampleDownloadCandidate]) -> Result<(), DedupError>;
 
     fn poll(&mut self, wait: bool) -> Result<Vec<MetadataSampleDownloadResult>, DedupError>;
+
+    fn retain_candidates(&mut self, _candidate_ids: &[u64]) -> Result<(), DedupError> {
+        Ok(())
+    }
 }
 
 pub struct MetadataFastSampleResult {
