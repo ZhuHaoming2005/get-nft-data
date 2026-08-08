@@ -51,9 +51,9 @@ pub trait MetadataSampleDownloadSink {
 pub struct MetadataFastSampleResult {
     pub intra_chain: Vec<MetadataImagePairSample>,
     pub cross_chain: Vec<MetadataImagePairSample>,
-    pub scored_candidate_tasks: u64,
-    pub drawn_candidate_slots: u64,
-    pub total_candidate_slots: u64,
+    pub scored_profile_pairs: u64,
+    pub profile_visits: u64,
+    pub planned_profile_visits: u64,
     pub sample_seed: u64,
 }
 

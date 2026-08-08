@@ -33,6 +33,7 @@ const REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const TOTAL_IMAGE_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_RETRY_DELAY: Duration = Duration::from_secs(5);
 const DOWNLOAD_QUEUE_CAPACITY: usize = DOWNLOAD_WORKERS * 8;
+const READY_URI_CACHE_CAPACITY: usize = DOWNLOAD_QUEUE_CAPACITY * 4;
 const IMAGE_CACHE_DIR: &str = ".metadata-image-cache";
 const TRANSACTION_ITEMS: &str = ".sample-transaction-items.json";
 const TRANSACTION_STATE: &str = ".sample-transaction-state";
@@ -209,6 +210,7 @@ pub struct StreamingDownloadSession {
     delayed_retries: BinaryHeap<DelayedImageJob>,
     next_retry_ordinal: u64,
     uri_states: HashMap<String, UriState>,
+    ready_uri_order: VecDeque<String>,
     pending_pairs: HashMap<u64, PendingPair>,
     completed: VecDeque<MetadataSampleDownloadResult>,
     intra_chain: Vec<StagedPair>,
@@ -277,6 +279,7 @@ impl StreamingDownloadSession {
             delayed_retries: BinaryHeap::new(),
             next_retry_ordinal: 0,
             uri_states: HashMap::new(),
+            ready_uri_order: VecDeque::new(),
             pending_pairs: HashMap::new(),
             completed: VecDeque::new(),
             intra_chain: Vec::with_capacity(target_per_pool),
@@ -412,7 +415,7 @@ impl StreamingDownloadSession {
         let cache_key = image_cache_key(&uri);
         if let Some(image) = load_cached_image(&self.cache_dir, &cache_key)? {
             self.cache_hits = self.cache_hits.saturating_add(1);
-            self.uri_states.insert(uri, UriState::Ready(image.clone()));
+            self.remember_ready_uri(uri, image.clone());
             self.deliver_image(consumer, Ok(&image));
             return Ok(());
         }
@@ -522,7 +525,7 @@ impl StreamingDownloadSession {
         };
         match result {
             Ok(image) => {
-                self.uri_states.insert(uri, UriState::Ready(image.clone()));
+                self.remember_ready_uri(uri, image.clone());
                 for consumer in consumers {
                     self.deliver_image(consumer, Ok(&image));
                 }
@@ -535,6 +538,20 @@ impl StreamingDownloadSession {
             }
         }
         Ok(())
+    }
+
+    fn remember_ready_uri(&mut self, uri: String, image: CachedImage) {
+        self.uri_states.insert(uri.clone(), UriState::Ready(image));
+        self.ready_uri_order.push_back(uri);
+        while self.ready_uri_order.len() > READY_URI_CACHE_CAPACITY {
+            let expired = self
+                .ready_uri_order
+                .pop_front()
+                .expect("ready URI cache exceeds its capacity");
+            if matches!(self.uri_states.get(&expired), Some(UriState::Ready(_))) {
+                self.uri_states.remove(&expired);
+            }
+        }
     }
 
     fn deliver_image(
@@ -625,16 +642,26 @@ impl StreamingDownloadSession {
     fn update_progress_detail(&self) {
         let successful = self.intra_chain.len() + self.cross_chain.len();
         let resolved = successful.saturating_add(self.failed_pairs);
-        self.progress.set_detail(&format!(
-            "media={}/{} pending={} queued={} failed={} net={} reused={}",
-            resolved,
-            self.attempted,
-            self.pending_pairs.len(),
-            self.unsent_jobs.len(),
-            self.failed_pairs,
-            self.network_jobs,
-            self.cache_hits.saturating_add(self.coalesced_uris),
-        ));
+        let mut detail = format!("media={}/{}", resolved, self.attempted);
+        let pending = self.pending_pairs.len();
+        if pending != 0 {
+            detail.push_str(&format!(" p={pending}"));
+        }
+        let queued = self.unsent_jobs.len();
+        if queued != 0 {
+            detail.push_str(&format!(" q={queued}"));
+        }
+        if self.failed_pairs != 0 {
+            detail.push_str(&format!(" f={}", self.failed_pairs));
+        }
+        if self.network_jobs != 0 {
+            detail.push_str(&format!(" net={}", self.network_jobs));
+        }
+        let reused = self.cache_hits.saturating_add(self.coalesced_uris);
+        if reused != 0 {
+            detail.push_str(&format!(" reused={reused}"));
+        }
+        self.progress.set_detail(&detail);
     }
 }
 
@@ -1736,6 +1763,35 @@ mod tests {
 
         assert!(started.elapsed() < Duration::from_secs(1));
         assert_eq!(session.unsent_jobs.len(), 1);
+    }
+
+    #[test]
+    fn completed_uri_state_is_bounded() {
+        let output = tempfile::tempdir().unwrap();
+        let mut session = StreamingDownloadSession::new(
+            output.path(),
+            1,
+            Arc::new(NoopProgress) as Arc<dyn ProgressObserver>,
+        )
+        .unwrap();
+        for index in 0..=READY_URI_CACHE_CAPACITY {
+            session.remember_ready_uri(
+                format!("uri-{index}"),
+                CachedImage {
+                    file: output.path().join(format!("cached-{index}")),
+                    suffix: ".png",
+                },
+            );
+        }
+
+        assert_eq!(session.ready_uri_order.len(), READY_URI_CACHE_CAPACITY);
+        assert_eq!(session.uri_states.len(), READY_URI_CACHE_CAPACITY);
+        assert!(!session.uri_states.contains_key("uri-0"));
+        assert!(
+            session
+                .uri_states
+                .contains_key(&format!("uri-{READY_URI_CACHE_CAPACITY}"))
+        );
     }
 
     #[test]

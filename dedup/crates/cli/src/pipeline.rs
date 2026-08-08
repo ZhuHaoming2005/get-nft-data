@@ -217,10 +217,10 @@ pub fn sample_metadata(
         || result.cross_chain.len() != config.sample_pairs
     {
         return Err(DedupError::Message(format!(
-            "random Metadata candidate search exhausted {}/{} candidate slots and scored {} candidate tasks with {} of {} intra-chain and {} of {} cross-chain complete media pairs ({})",
-            result.drawn_candidate_slots,
-            result.total_candidate_slots,
-            result.scored_candidate_tasks,
+            "random Metadata candidate search exhausted {}/{} randomized profile visits and performed {} profile-pair evaluations with {} of {} intra-chain and {} of {} cross-chain complete media pairs ({})",
+            result.profile_visits,
+            result.planned_profile_visits,
+            result.scored_profile_pairs,
             result.intra_chain.len(),
             config.sample_pairs,
             result.cross_chain.len(),
