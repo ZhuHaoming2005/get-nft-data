@@ -1490,6 +1490,14 @@ impl FastSampleCollector<'_> {
             .sum()
     }
 
+    fn deferred_task_capacity(&self) -> usize {
+        self.bucket_targets
+            .iter()
+            .map(|(_, target)| *target)
+            .sum::<usize>()
+            .saturating_add(self.max_physical_outstanding.saturating_mul(2))
+    }
+
     fn can_prefetch(&self) -> bool {
         let remaining = self.total_target_remaining();
         let slack = remaining.min(self.max_physical_outstanding);
@@ -2108,57 +2116,85 @@ fn fast_sample_profiles_match(
     decision.matched
 }
 
-fn fast_sample_profile_has_chain(
+#[derive(Clone, Copy)]
+struct FastSampleChainContracts {
+    chain: ChainId,
+    first_contract: ContractId,
+    has_distinct_contract: bool,
+}
+
+fn fast_sample_image_chain_summary(
+    members: &[(ContractId, NftId)],
+    contract_chains: &[ChainId],
+) -> Vec<FastSampleChainContracts> {
+    let mut summary = Vec::<FastSampleChainContracts>::new();
+    for &(contract, _) in members {
+        let Some(&chain) = contract_chains.get(contract as usize) else {
+            continue;
+        };
+        if let Some(entry) = summary.iter_mut().find(|entry| entry.chain == chain) {
+            entry.has_distinct_contract |= entry.first_contract != contract;
+        } else {
+            summary.push(FastSampleChainContracts {
+                chain,
+                first_contract: contract,
+                has_distinct_contract: false,
+            });
+        }
+    }
+    summary
+}
+
+fn fast_sample_profile_chain_summary(
     index: &DirectIndex,
     profile: &ContractProfile,
-    chain: ChainId,
-) -> bool {
+) -> Vec<FastSampleChainContracts> {
+    let first_contract = index
+        .members(profile)
+        .first()
+        .map(|member| member.contract_id)
+        .unwrap_or(0);
     index
         .chains(profile)
         .iter()
-        .any(|&(candidate, count)| candidate == chain && count != 0)
+        .filter(|(_, count)| *count != 0)
+        .map(|&(chain, count)| FastSampleChainContracts {
+            chain,
+            first_contract,
+            has_distinct_contract: count > 1,
+        })
+        .collect()
 }
 
-fn fast_sample_profiles_may_supply_bucket(
-    index: &DirectIndex,
-    left_id: u32,
-    right_id: u32,
-    contract_chains: &[ChainId],
+fn fast_sample_chain_contracts(
+    summary: &[FastSampleChainContracts],
+    chain: ChainId,
+) -> Option<FastSampleChainContracts> {
+    summary.iter().find(|entry| entry.chain == chain).copied()
+}
+
+fn fast_sample_summaries_may_supply_bucket(
+    left: &[FastSampleChainContracts],
+    right: &[FastSampleChainContracts],
     bucket: FastSampleBucket,
 ) -> bool {
-    let left = &index.profiles[left_id as usize];
-    let right = &index.profiles[right_id as usize];
-    let selected_members =
-        selected_image_anchors(left, index.anchors(left), right, index.anchors(right))
-            .filter(|_| index.image_witnesses.is_some())
-            .map(|(left_anchor, right_anchor)| {
-                (
-                    index.image_members(left_id as usize, left_anchor),
-                    index.image_members(right_id as usize, right_anchor),
-                )
-            });
-    let has_chain =
-        |profile: &ContractProfile, members: Option<&[(ContractId, NftId)]>, chain: ChainId| {
-            members.map_or_else(
-                || fast_sample_profile_has_chain(index, profile, chain),
-                |members| {
-                    members.iter().any(|&(contract, _)| {
-                        contract_chains.get(contract as usize).copied() == Some(chain)
-                    })
-                },
-            )
-        };
-    let (left_members, right_members) = selected_members
-        .map(|(left, right)| (Some(left), Some(right)))
-        .unwrap_or((None, None));
     match bucket {
         FastSampleBucket::Intra(chain) => {
-            has_chain(left, left_members, chain) && has_chain(right, right_members, chain)
+            let Some(left) = fast_sample_chain_contracts(left, chain) else {
+                return false;
+            };
+            let Some(right) = fast_sample_chain_contracts(right, chain) else {
+                return false;
+            };
+            left.has_distinct_contract
+                || right.has_distinct_contract
+                || left.first_contract != right.first_contract
         }
         FastSampleBucket::Cross(chain_a, chain_b) => {
-            (has_chain(left, left_members, chain_a) && has_chain(right, right_members, chain_b))
-                || (has_chain(left, left_members, chain_b)
-                    && has_chain(right, right_members, chain_a))
+            (fast_sample_chain_contracts(left, chain_a).is_some()
+                && fast_sample_chain_contracts(right, chain_b).is_some())
+                || (fast_sample_chain_contracts(left, chain_b).is_some()
+                    && fast_sample_chain_contracts(right, chain_a).is_some())
         }
     }
 }
@@ -2208,14 +2244,31 @@ fn score_fast_sample_candidate_chunk(
     candidates.clear();
 
     for right_id in matched {
+        let right = &index.profiles[right_id as usize];
+        let (left_summary, right_summary) = if index.image_witnesses.is_some() {
+            let Some((left_anchor, right_anchor)) =
+                selected_image_anchors(left, index.anchors(left), right, index.anchors(right))
+            else {
+                continue;
+            };
+            (
+                fast_sample_image_chain_summary(
+                    index.image_members(left_id as usize, left_anchor),
+                    contract_chains,
+                ),
+                fast_sample_image_chain_summary(
+                    index.image_members(right_id as usize, right_anchor),
+                    contract_chains,
+                ),
+            )
+        } else {
+            (
+                fast_sample_profile_chain_summary(index, left),
+                fast_sample_profile_chain_summary(index, right),
+            )
+        };
         for (bucket, heap) in bucket_heaps.iter_mut() {
-            if !fast_sample_profiles_may_supply_bucket(
-                index,
-                left_id,
-                right_id,
-                contract_chains,
-                *bucket,
-            ) {
+            if !fast_sample_summaries_may_supply_bucket(&left_summary, &right_summary, *bucket) {
                 continue;
             }
             let candidate = (
@@ -2553,7 +2606,7 @@ fn process_fast_sample_tasks(
     fallback_tasks: &mut VecDeque<PreparedBucketTask>,
     progress: &dyn ProgressObserver,
 ) -> Result<(), DedupError> {
-    for mut prepared in tasks {
+    'tasks: for mut prepared in tasks {
         if collector.complete() {
             break;
         }
@@ -2562,16 +2615,24 @@ fn process_fast_sample_tasks(
         if collector.bucket_is_full(bucket) {
             continue;
         }
-        if !collector.bucket_wants_candidate(bucket) {
-            continue;
-        }
-        while !collector.has_open_slot() {
+        while !collector.bucket_is_full(bucket)
+            && (!collector.bucket_wants_candidate(bucket) || !collector.has_open_slot())
+        {
+            if !collector.bucket_wants_candidate(bucket)
+                && fallback_tasks.len() < collector.deferred_task_capacity()
+            {
+                fallback_tasks.push_back(prepared);
+                continue 'tasks;
+            }
             collector.flush()?;
+            if !collector.has_outstanding() {
+                return Err(DedupError::invalid(
+                    "sample_metadata",
+                    "sample task backpressure has no outstanding media work",
+                ));
+            }
             let collected = collector.collect(true)?;
             progress.add_completed(collected as u64);
-            if collector.bucket_is_full(bucket) || !collector.bucket_wants_candidate(bucket) {
-                break;
-            }
         }
         if collector.bucket_is_full(bucket) || !collector.bucket_wants_candidate(bucket) {
             continue;
@@ -2583,7 +2644,9 @@ fn process_fast_sample_tasks(
             progress,
         )?;
         if submitted {
-            if fast_sample_task_has_remaining(&prepared.task) {
+            if fast_sample_task_has_remaining(&prepared.task)
+                && fallback_tasks.len() < collector.deferred_task_capacity()
+            {
                 fallback_tasks.push_back(prepared);
             }
             let collected = collector.collect(false)?;
@@ -2715,6 +2778,7 @@ pub fn sample_direct_releasing(
     );
     progress.set_activity_label("profile-pairs");
     let prepare_batch_size = fast_sample_prepare_batch();
+    let ready_match_capacity = prepare_batch_size.saturating_mul(2).max(1);
     let max_physical_outstanding = fast_sample_max_physical_outstanding();
     let mut collector = FastSampleCollector {
         store,
@@ -2836,20 +2900,21 @@ pub fn sample_direct_releasing(
                         Err(_) => producer_done = true,
                     }
                 }
-                while let Ok(result) = match_rx.try_recv() {
-                    if let Err(error) = enqueue_fast_sample_match(
+                if ready.len() < ready_match_capacity
+                    && let Ok(result) = match_rx.try_recv()
+                    && let Err(error) = enqueue_fast_sample_match(
                         result,
                         &mut ready,
                         &mut profile_visits,
                         &mut scored_profile_pairs,
-                    ) {
-                        consume_result = Err(error);
-                        break;
-                    }
+                    )
+                {
+                    consume_result = Err(error);
                 }
                 if consume_result.is_err() {
                     break;
                 }
+                debug_assert!(ready.len() <= ready_match_capacity);
                 let Some(mut matched) = ready.pop_front() else {
                     if producer_done {
                         break;
@@ -7836,6 +7901,37 @@ mod tests {
     }
 
     #[derive(Default)]
+    struct DeferredDownloadSink {
+        completed: Vec<crate::metadata::MetadataSampleDownloadResult>,
+    }
+
+    impl MetadataSampleDownloadSink for DeferredDownloadSink {
+        fn submit(
+            &mut self,
+            candidates: &[MetadataSampleDownloadCandidate],
+        ) -> Result<(), DedupError> {
+            self.completed.extend(candidates.iter().map(|candidate| {
+                crate::metadata::MetadataSampleDownloadResult {
+                    id: candidate.id,
+                    success: true,
+                }
+            }));
+            Ok(())
+        }
+
+        fn poll(
+            &mut self,
+            wait: bool,
+        ) -> Result<Vec<crate::metadata::MetadataSampleDownloadResult>, DedupError> {
+            Ok(if wait {
+                std::mem::take(&mut self.completed)
+            } else {
+                Vec::new()
+            })
+        }
+    }
+
+    #[derive(Default)]
     struct ReverseDownloadSink {
         completed: Vec<crate::metadata::MetadataSampleDownloadResult>,
     }
@@ -9721,6 +9817,120 @@ mod tests {
         assert_eq!(collector.attempted_pairs, 1);
         assert_eq!(collector.intra_chain.len(), 1);
         assert_eq!(fallback.len(), 1);
+    }
+
+    #[test]
+    fn fast_sample_in_flight_coverage_defers_later_task() {
+        let evm = HashSet::from(["ethereum".to_owned()]);
+        let mut store = EntityStore::with_options(8, &evm.iter().cloned().collect());
+        for contract in 0..6 {
+            store
+                .try_ingest_row(input_with_image(
+                    "ethereum",
+                    &format!("0x{contract}"),
+                    "1",
+                    &format!("https://images.example/{contract}.png"),
+                    r#"{"shared":"metadata"}"#,
+                ))
+                .unwrap();
+        }
+        let members = store
+            .nfts
+            .iter()
+            .map(|nft| (nft.contract_id, nft.id))
+            .collect::<Arc<[_]>>();
+        let bucket = FastSampleBucket::Intra(0);
+        let pair_count = choose_two(members.len() as u64);
+        let randomness: FastSamplingRandomness = SamplingRandomness::for_test(137).into();
+        let task = |salt| PreparedBucketTask {
+            bucket,
+            priority: 0,
+            task: PreparedFastSampleTask::CliquePairs {
+                members: Arc::clone(&members),
+                order: RandomTaskPermutation::new(
+                    pair_count,
+                    randomness,
+                    b"test-fast-sample-in-flight-deferral",
+                    salt,
+                ),
+            },
+        };
+        let mut downloads = DeferredDownloadSink::default();
+        let mut collector = FastSampleCollector {
+            store: &store,
+            bucket_targets: vec![(bucket, 1), (FastSampleBucket::Cross(0, 1), 1)],
+            accepted_by_bucket: AHashMap::new(),
+            redistribution_ordinal: 0,
+            randomness,
+            seen_contract_pairs: AHashSet::new(),
+            intra_chain: Vec::new(),
+            cross_chain: Vec::new(),
+            downloads: &mut downloads,
+            next_candidate_id: 1,
+            attempted_pairs: 0,
+            pending: Vec::new(),
+            pending_buckets: AHashMap::new(),
+            in_flight: AHashMap::new(),
+            completed: AHashMap::new(),
+            commit_order_by_bucket: AHashMap::new(),
+            viable_by_bucket: AHashMap::new(),
+            uncommitted_by_bucket: AHashMap::new(),
+            uncommitted_total: 0,
+            physical_outstanding: 0,
+            max_physical_outstanding: fast_sample_max_physical_outstanding(),
+            accepted_candidate_ids: Vec::new(),
+        };
+        let mut fallback = VecDeque::new();
+
+        process_fast_sample_tasks(
+            &mut collector,
+            vec![task(0), task(1)],
+            &mut fallback,
+            &NoopProgress,
+        )
+        .unwrap();
+
+        assert_eq!(collector.attempted_pairs, 1);
+        assert_eq!(collector.intra_chain.len(), 0);
+        assert_eq!(fallback.len(), 2);
+    }
+
+    #[test]
+    fn fast_sample_intra_summary_requires_distinct_contracts() {
+        let bucket = FastSampleBucket::Intra(3);
+        let same_left = [FastSampleChainContracts {
+            chain: 3,
+            first_contract: 7,
+            has_distinct_contract: false,
+        }];
+        let same_right = same_left;
+        assert!(!fast_sample_summaries_may_supply_bucket(
+            &same_left,
+            &same_right,
+            bucket
+        ));
+
+        let different_right = [FastSampleChainContracts {
+            chain: 3,
+            first_contract: 8,
+            has_distinct_contract: false,
+        }];
+        assert!(fast_sample_summaries_may_supply_bucket(
+            &same_left,
+            &different_right,
+            bucket
+        ));
+
+        let multi_contract_left = [FastSampleChainContracts {
+            chain: 3,
+            first_contract: 7,
+            has_distinct_contract: true,
+        }];
+        assert!(fast_sample_summaries_may_supply_bucket(
+            &multi_contract_left,
+            &same_right,
+            bucket
+        ));
     }
 
     #[test]
