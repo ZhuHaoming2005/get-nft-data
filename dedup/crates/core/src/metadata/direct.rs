@@ -18,7 +18,7 @@ use crate::stats::SummaryAccumulator;
 use ahash::{AHashMap, AHashSet, AHasher};
 use rayon::prelude::*;
 use serde::Serialize;
-use std::collections::{BTreeMap, BinaryHeap, HashSet, VecDeque};
+use std::collections::{BinaryHeap, HashSet, VecDeque};
 use std::hash::{Hash, Hasher};
 use std::mem::MaybeUninit;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
@@ -45,8 +45,10 @@ const FULL_DIRECT_PROGRESS_BATCH: u64 = 65_536;
 const DENSE_POSTING_MIN_PROFILES: usize = 1_024;
 const NO_DENSE_POSTING: u32 = u32::MAX;
 const FAST_SAMPLE_MAX_PREPARE_BATCH: usize = 256;
-const FAST_SAMPLE_MAX_MATCHED_PROFILES_PER_LEFT: usize = 4_096;
 const FAST_SAMPLE_SCORE_CHUNK: usize = 4_096;
+const FAST_SAMPLE_SHUFFLE_WINDOW: usize = FAST_SAMPLE_SCORE_CHUNK * 2;
+const FAST_SAMPLE_CLIQUE_CHUNK_WINDOW: u64 =
+    (FAST_SAMPLE_SHUFFLE_WINDOW / FAST_SAMPLE_SCORE_CHUNK) as u64;
 const FAST_SAMPLE_OUTSTANDING_PAIRS_PER_THREAD: usize = 8;
 const FAST_SAMPLE_MIN_OUTSTANDING_PAIRS: usize = 64;
 const FAST_SAMPLE_MAX_OUTSTANDING_PAIRS: usize = 512;
@@ -276,8 +278,17 @@ struct DirectIndex {
 }
 
 struct ImageWitnessIndex {
-    ranges: AHashMap<(u32, TokenKeyId, DocumentId), (u32, u32)>,
+    ranges: AHashMap<(u32, TokenKeyId, DocumentId), ImageWitnessRange>,
     members: Box<[(ContractId, NftId)]>,
+    chain_summaries: Box<[FastSampleChainContracts]>,
+}
+
+#[derive(Clone, Copy)]
+struct ImageWitnessRange {
+    member_start: u32,
+    member_end: u32,
+    summary_start: u32,
+    summary_end: u32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -514,13 +525,30 @@ impl DirectIndex {
         let Some(witnesses) = &self.image_witnesses else {
             return &[];
         };
-        let Some(&(start, end)) = witnesses
+        let Some(range) = witnesses
             .ranges
             .get(&(profile_id as u32, anchor.0, anchor.1))
         else {
             return &[];
         };
-        &witnesses.members[start as usize..end as usize]
+        &witnesses.members[range.member_start as usize..range.member_end as usize]
+    }
+
+    fn image_chain_summary(
+        &self,
+        profile_id: usize,
+        anchor: (TokenKeyId, DocumentId),
+    ) -> &[FastSampleChainContracts] {
+        let Some(witnesses) = &self.image_witnesses else {
+            return &[];
+        };
+        let Some(range) = witnesses
+            .ranges
+            .get(&(profile_id as u32, anchor.0, anchor.1))
+        else {
+            return &[];
+        };
+        &witnesses.chain_summaries[range.summary_start as usize..range.summary_end as usize]
     }
 
     fn profile_has_images(&self, profile_id: usize) -> bool {
@@ -1402,7 +1430,9 @@ struct FastSampleProfileMatches {
     left_id: u32,
     rights: Vec<u32>,
     right_order: RandomTaskPermutation,
-    scored: u64,
+    priority: u64,
+    include_clique: bool,
+    counts_profile_visit: bool,
 }
 
 struct PreparedBucketTask {
@@ -2008,13 +2038,13 @@ fn indexed_fast_sample_sources<'a>(
 fn visit_fast_sample_posting(
     posting: PostingView<'_>,
     seen: &mut CandidateSeen,
-    visit: &mut impl FnMut(u32) -> Result<(), DedupError>,
-) -> Result<(), DedupError> {
+    visit: &mut impl FnMut(u32) -> Result<bool, DedupError>,
+) -> Result<bool, DedupError> {
     match posting {
         PostingView::Sparse(profiles) => {
             for &profile in profiles {
-                if seen.insert(profile) {
-                    visit(profile)?;
+                if seen.insert(profile) && !visit(profile)? {
+                    return Ok(false);
                 }
             }
         }
@@ -2029,26 +2059,30 @@ fn visit_fast_sample_posting(
                     seen.insert_word(word_index, masked_dense_word(word, word_index, minimum));
                 while unseen != 0 {
                     let bit = unseen.trailing_zeros();
-                    visit(word_index * u64::BITS + bit)?;
+                    if !visit(word_index * u64::BITS + bit)? {
+                        return Ok(false);
+                    }
                     unseen &= unseen - 1;
                 }
             }
         }
     }
-    Ok(())
+    Ok(true)
 }
 
 fn visit_fast_sample_sources(
     sources: &[PostingView<'_>],
     seen: &mut CandidateSeen,
     left_id: u32,
-    mut visit: impl FnMut(u32) -> Result<(), DedupError>,
+    mut visit: impl FnMut(u32) -> Result<bool, DedupError>,
 ) -> Result<(), DedupError> {
     match sources {
         [] => Ok(()),
         [only] => {
             for right_id in only.iter() {
-                visit(right_id)?;
+                if !visit(right_id)? {
+                    break;
+                }
             }
             Ok(())
         }
@@ -2068,29 +2102,31 @@ fn visit_fast_sample_sources(
                     (None, Some(_)) => second.next(),
                     (None, None) => break,
                 };
-                visit(next.expect("a posting merge arm has a candidate"))?;
+                if !visit(next.expect("a posting merge arm has a candidate"))? {
+                    break;
+                }
             }
             Ok(())
         }
         _ => {
             seen.begin_profile(left_id);
             for &source in sources {
-                visit_fast_sample_posting(source, seen, &mut visit)?;
+                if !visit_fast_sample_posting(source, seen, &mut visit)? {
+                    break;
+                }
             }
             Ok(())
         }
     }
 }
 
-fn fast_sample_profiles_match(
+fn fast_sample_documents_match(
     index: &DirectIndex,
-    left: &ContractProfile,
-    right: &ContractProfile,
+    left_document: DocumentId,
+    right_document: DocumentId,
     threshold: f64,
     overlap_filter_passed: bool,
 ) -> bool {
-    let (left_document, right_document) =
-        selected_documents(left, index.anchors(left), right, index.anchors(right));
     if left_document == right_document {
         return true;
     }
@@ -2123,26 +2159,20 @@ struct FastSampleChainContracts {
     has_distinct_contract: bool,
 }
 
-fn fast_sample_image_chain_summary(
-    members: &[(ContractId, NftId)],
-    contract_chains: &[ChainId],
-) -> Vec<FastSampleChainContracts> {
-    let mut summary = Vec::<FastSampleChainContracts>::new();
-    for &(contract, _) in members {
-        let Some(&chain) = contract_chains.get(contract as usize) else {
-            continue;
-        };
-        if let Some(entry) = summary.iter_mut().find(|entry| entry.chain == chain) {
-            entry.has_distinct_contract |= entry.first_contract != contract;
-        } else {
-            summary.push(FastSampleChainContracts {
-                chain,
-                first_contract: contract,
-                has_distinct_contract: false,
-            });
-        }
+fn update_fast_sample_chain_summary(
+    summary: &mut Vec<FastSampleChainContracts>,
+    chain: ChainId,
+    contract: ContractId,
+) {
+    if let Some(entry) = summary.iter_mut().find(|entry| entry.chain == chain) {
+        entry.has_distinct_contract |= entry.first_contract != contract;
+    } else {
+        summary.push(FastSampleChainContracts {
+            chain,
+            first_contract: contract,
+            has_distinct_contract: false,
+        });
     }
-    summary
 }
 
 fn fast_sample_profile_chain_summary(
@@ -2205,17 +2235,15 @@ fn score_fast_sample_candidate_chunk(
     left_id: u32,
     candidate_plan: &CrossProfilePlan,
     threshold: f64,
-    randomness: FastSamplingRandomness,
-    matched_profile_limit: usize,
-    contract_chains: &[ChainId],
-    bucket_heaps: &mut [(FastSampleBucket, BinaryHeap<(u64, u32)>)],
+    buckets: &[(FastSampleBucket, usize)],
+    active_buckets: &[AtomicBool],
     candidates: &mut Vec<u32>,
-    scored: &mut u64,
+    scored_profile_pairs: &AtomicU64,
     stop: &AtomicBool,
     progress: &dyn ProgressObserver,
-) -> Result<(), DedupError> {
+) -> Result<Vec<u32>, DedupError> {
     if candidates.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
     if stop.load(Ordering::Relaxed) {
         return Err(DedupError::Interrupted);
@@ -2230,125 +2258,181 @@ fn score_fast_sample_candidate_chunk(
         .par_iter()
         .copied()
         .filter(|&right_id| {
-            fast_sample_profiles_match(
+            if !fast_sample_has_active_bucket(buckets, active_buckets) {
+                return false;
+            }
+            let right = &index.profiles[right_id as usize];
+            let (left_document, right_document) =
+                selected_documents(left, index.anchors(left), right, index.anchors(right));
+            fast_sample_documents_match(
                 index,
-                left,
-                &index.profiles[right_id as usize],
+                left_document,
+                right_document,
                 threshold,
                 overlap_filter_passed,
             )
         })
         .collect::<Vec<_>>();
-    *scored = scored.saturating_add(candidates.len() as u64);
+    scored_profile_pairs.fetch_add(candidates.len() as u64, Ordering::Relaxed);
     progress.add_activity(candidates.len() as u64);
     candidates.clear();
 
+    let mut eligible = Vec::with_capacity(matched.len());
     for right_id in matched {
         let right = &index.profiles[right_id as usize];
-        let (left_summary, right_summary) = if index.image_witnesses.is_some() {
+        let may_supply = if index.image_witnesses.is_some() {
             let Some((left_anchor, right_anchor)) =
                 selected_image_anchors(left, index.anchors(left), right, index.anchors(right))
             else {
                 continue;
             };
-            (
-                fast_sample_image_chain_summary(
-                    index.image_members(left_id as usize, left_anchor),
-                    contract_chains,
-                ),
-                fast_sample_image_chain_summary(
-                    index.image_members(right_id as usize, right_anchor),
-                    contract_chains,
-                ),
-            )
+            let left_summary = index.image_chain_summary(left_id as usize, left_anchor);
+            let right_summary = index.image_chain_summary(right_id as usize, right_anchor);
+            buckets
+                .iter()
+                .zip(active_buckets)
+                .any(|(&(bucket, _), active)| {
+                    active.load(Ordering::Relaxed)
+                        && fast_sample_summaries_may_supply_bucket(
+                            left_summary,
+                            right_summary,
+                            bucket,
+                        )
+                })
         } else {
-            (
-                fast_sample_profile_chain_summary(index, left),
-                fast_sample_profile_chain_summary(index, right),
-            )
+            let left_summary = fast_sample_profile_chain_summary(index, left);
+            let right_summary = fast_sample_profile_chain_summary(index, right);
+            buckets
+                .iter()
+                .zip(active_buckets)
+                .any(|(&(bucket, _), active)| {
+                    active.load(Ordering::Relaxed)
+                        && fast_sample_summaries_may_supply_bucket(
+                            &left_summary,
+                            &right_summary,
+                            bucket,
+                        )
+                })
         };
-        for (bucket, heap) in bucket_heaps.iter_mut() {
-            if !fast_sample_summaries_may_supply_bucket(&left_summary, &right_summary, *bucket) {
-                continue;
-            }
-            let candidate = (
-                randomness.score(
-                    b"fast-sample-matched-profile-priority",
-                    &[
-                        u64::from(left_id),
-                        u64::from(right_id),
-                        fast_sample_bucket_salt(*bucket),
-                    ],
-                ),
-                right_id,
-            );
-            if heap.len() < matched_profile_limit {
-                heap.push(candidate);
-            } else if heap.peek().is_some_and(|worst| candidate < *worst) {
-                heap.pop();
-                heap.push(candidate);
-            }
+        if may_supply {
+            eligible.push(right_id);
         }
     }
-    Ok(())
+    Ok(eligible)
+}
+
+fn fast_sample_has_active_bucket(
+    buckets: &[(FastSampleBucket, usize)],
+    active_buckets: &[AtomicBool],
+) -> bool {
+    buckets
+        .iter()
+        .zip(active_buckets)
+        .any(|(_, active)| active.load(Ordering::Relaxed))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn collect_fast_sample_profile_matches(
+fn stream_fast_sample_profile_matches(
     index: &DirectIndex,
     candidate_plan: &CrossProfilePlan,
     all_image_profiles: &[u32],
     left_id: u32,
     threshold: f64,
     randomness: FastSamplingRandomness,
-    matched_profile_limit: usize,
     buckets: &[(FastSampleBucket, usize)],
-    contract_chains: &[ChainId],
+    active_buckets: &[AtomicBool],
     seen: &mut CandidateSeen,
     stop: &AtomicBool,
+    scored_profile_pairs: &AtomicU64,
     progress: &dyn ProgressObserver,
-) -> Result<FastSampleProfileMatches, DedupError> {
+    mut emit: impl FnMut(FastSampleProfileMatches) -> Result<(), DedupError>,
+) -> Result<(), DedupError> {
     if stop.load(Ordering::Relaxed) {
         return Err(DedupError::Interrupted);
     }
-    let mut bucket_heaps = buckets
-        .iter()
-        .filter(|(_, target)| *target != 0)
-        .map(|&(bucket, _)| {
-            (
-                bucket,
-                BinaryHeap::with_capacity(matched_profile_limit.saturating_add(1)),
-            )
-        })
-        .collect::<Vec<_>>();
     let mut candidates = Vec::with_capacity(FAST_SAMPLE_SCORE_CHUNK);
-    let mut scored = 0_u64;
-    let mut consider = |right_id: u32| -> Result<(), DedupError> {
-        candidates.push(right_id);
-        if candidates.len() == FAST_SAMPLE_SCORE_CHUNK {
-            score_fast_sample_candidate_chunk(
+    let mut shuffle = Vec::with_capacity(FAST_SAMPLE_SHUFFLE_WINDOW);
+    let mut shuffle_ordinal = 0_u64;
+    let mut first_emission = true;
+    let mut clique_emitted = false;
+    let clique_chunk = randomness.score(b"fast-sample-clique-chunk", &[u64::from(left_id)])
+        % FAST_SAMPLE_CLIQUE_CHUNK_WINDOW;
+    let mut chunk_ordinal = 0_u64;
+    let mut flush_chunk =
+        |candidates: &mut Vec<u32>, force_clique: bool| -> Result<(), DedupError> {
+            if !first_emission && !fast_sample_has_active_bucket(buckets, active_buckets) {
+                candidates.clear();
+                return Ok(());
+            }
+            let rights = score_fast_sample_candidate_chunk(
                 index,
                 left_id,
                 candidate_plan,
                 threshold,
-                randomness,
-                matched_profile_limit,
-                contract_chains,
-                &mut bucket_heaps,
-                &mut candidates,
-                &mut scored,
+                buckets,
+                active_buckets,
+                candidates,
+                scored_profile_pairs,
                 stop,
                 progress,
             )?;
+            let include_clique = !clique_emitted && (force_clique || chunk_ordinal == clique_chunk);
+            clique_emitted |= include_clique;
+            if include_clique || !rights.is_empty() {
+                let right_order = RandomTaskPermutation::new(
+                    rights.len().saturating_add(usize::from(include_clique)) as u64,
+                    randomness,
+                    b"fast-sample-profile-chunk-order",
+                    (u64::from(left_id) << 32) ^ chunk_ordinal,
+                );
+                emit(FastSampleProfileMatches {
+                    left_id,
+                    rights,
+                    right_order,
+                    priority: randomness.score(
+                        b"fast-sample-profile-chunk-priority",
+                        &[u64::from(left_id), chunk_ordinal],
+                    ),
+                    include_clique,
+                    counts_profile_visit: first_emission,
+                })?;
+                first_emission = false;
+            }
+            chunk_ordinal += 1;
+            Ok(())
+        };
+    let mut consider = |right_id: u32| -> Result<bool, DedupError> {
+        if !fast_sample_has_active_bucket(buckets, active_buckets) {
+            return Ok(false);
         }
-        Ok(())
+        if shuffle.len() < FAST_SAMPLE_SHUFFLE_WINDOW {
+            shuffle.push(right_id);
+            return Ok(true);
+        }
+        let slot = randomness.score(
+            b"fast-sample-streaming-shuffle",
+            &[u64::from(left_id), shuffle_ordinal],
+        ) % (FAST_SAMPLE_SHUFFLE_WINDOW as u64 + 1);
+        shuffle_ordinal += 1;
+        let selected = if slot < FAST_SAMPLE_SHUFFLE_WINDOW as u64 {
+            std::mem::replace(&mut shuffle[slot as usize], right_id)
+        } else {
+            right_id
+        };
+        candidates.push(selected);
+        if candidates.len() == FAST_SAMPLE_SCORE_CHUNK {
+            flush_chunk(&mut candidates, false)?;
+        }
+        Ok(true)
     };
 
     match candidate_plan {
         CrossProfilePlan::Full => {
             let start = all_image_profiles.partition_point(|&profile| profile <= left_id);
             for &right_id in &all_image_profiles[start..] {
-                consider(right_id)?;
+                if !consider(right_id)? {
+                    break;
+                }
             }
         }
         CrossProfilePlan::Indexed(candidate_index) => {
@@ -2356,40 +2440,27 @@ fn collect_fast_sample_profile_matches(
             visit_fast_sample_sources(&sources, seen, left_id, consider)?;
         }
     }
-    score_fast_sample_candidate_chunk(
-        index,
-        left_id,
-        candidate_plan,
-        threshold,
-        randomness,
-        matched_profile_limit,
-        contract_chains,
-        &mut bucket_heaps,
-        &mut candidates,
-        &mut scored,
-        stop,
-        progress,
-    )?;
-    let mut retained =
-        AHashSet::with_capacity(bucket_heaps.len().saturating_mul(matched_profile_limit));
-    for (_, heap) in bucket_heaps {
-        retained.extend(heap.into_vec().into_iter().map(|(_, right_id)| right_id));
+    if !fast_sample_has_active_bucket(buckets, active_buckets) {
+        return Ok(());
     }
-    let rights = retained.into_iter().collect::<Vec<_>>();
-    // The extra slot represents the exact-profile clique. It participates in the same
-    // permutation as cross-profile matches instead of always being processed first.
-    let right_order = RandomTaskPermutation::new(
-        rights.len().saturating_add(1) as u64,
+    let mut remaining_order = RandomTaskPermutation::new(
+        shuffle.len() as u64,
         randomness,
-        b"fast-sample-profile-task-order",
+        b"fast-sample-streaming-shuffle-tail",
         u64::from(left_id),
     );
-    Ok(FastSampleProfileMatches {
-        left_id,
-        rights,
-        right_order,
-        scored,
-    })
+    while let Some(ordinal) = remaining_order.next() {
+        candidates.push(shuffle[ordinal as usize]);
+        if candidates.len() == FAST_SAMPLE_SCORE_CHUNK {
+            flush_chunk(&mut candidates, false)?;
+            if !fast_sample_has_active_bucket(buckets, active_buckets) {
+                return Ok(());
+            }
+        }
+    }
+    flush_chunk(&mut candidates, false)?;
+    flush_chunk(&mut candidates, true)?;
+    Ok(())
 }
 
 fn fast_sample_members_by_chain(
@@ -2707,13 +2778,27 @@ fn enqueue_fast_sample_match(
     result: Result<FastSampleProfileMatches, DedupError>,
     ready: &mut VecDeque<FastSampleProfileMatches>,
     profile_visits: &mut u64,
-    scored_profile_pairs: &mut u64,
 ) -> Result<(), DedupError> {
     let matched = result?;
-    *profile_visits = profile_visits.saturating_add(1);
-    *scored_profile_pairs = scored_profile_pairs.saturating_add(matched.scored);
+    if matched.counts_profile_visit {
+        *profile_visits = profile_visits.saturating_add(1);
+    }
     ready.push_back(matched);
     Ok(())
+}
+
+fn refresh_fast_sample_active_buckets(
+    collector: &FastSampleCollector<'_>,
+    buckets: &[(FastSampleBucket, usize)],
+    active_buckets: &[AtomicBool],
+) {
+    for (&(bucket, _), active) in buckets.iter().zip(active_buckets) {
+        let target = collector.target(bucket);
+        active.store(
+            target != 0 && !collector.bucket_is_full(bucket),
+            Ordering::Relaxed,
+        );
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2766,10 +2851,9 @@ pub fn sample_direct_releasing(
         randomness.derive(b"fast-sample-balanced-bucket-targets"),
     )?;
     let sampling_buckets = bucket_targets.clone();
-    let contract_chains = store
-        .contracts
+    let active_buckets = sampling_buckets
         .iter()
-        .map(|contract| contract.chain_id)
+        .map(|(_, target)| AtomicBool::new(*target != 0))
         .collect::<Box<[_]>>();
     let mut planned_profile_visits = image_profiles.len() as u64;
     progress.begin_phase(
@@ -2804,11 +2888,13 @@ pub fn sample_direct_releasing(
         max_physical_outstanding,
         accepted_candidate_ids: Vec::with_capacity(target_per_pool.saturating_mul(2)),
     };
-    let mut scored_profile_pairs = 0_u64;
+    let scored_profile_pairs = AtomicU64::new(0);
     let mut profile_visits = 0_u64;
     let mut fallback_tasks = VecDeque::new();
     let mut round = 0_usize;
     loop {
+        let attempted_before_round = collector.seen_contract_pairs.len();
+        refresh_fast_sample_active_buckets(&collector, &sampling_buckets, &active_buckets);
         let round_randomness = randomness.derive_round(b"fast-sample-profile-search-round", round);
         let producer_stop = AtomicBool::new(false);
         std::thread::scope(|scope| -> Result<(), DedupError> {
@@ -2818,8 +2904,9 @@ pub fn sample_direct_releasing(
             let producer_image_profiles = &image_profiles;
             let producer_all_image_profiles = &all_image_profiles;
             let producer_sampling_buckets = &sampling_buckets;
-            let producer_contract_chains = &contract_chains;
+            let producer_active_buckets = &active_buckets;
             let producer_stop_ref = &producer_stop;
+            let producer_scored_profile_pairs = &scored_profile_pairs;
             scope.spawn(move || {
                 let mut profile_order = RandomTaskPermutation::new(
                     producer_image_profiles.len() as u64,
@@ -2838,42 +2925,84 @@ pub fn sample_direct_releasing(
                         let _ = match_tx.send(Err(error));
                         break;
                     }
-                    let (result_tx, result_rx) = mpsc::channel();
                     let batch_match_tx = match_tx.clone();
                     rayon::scope(move |rayon_scope| {
-                        for (offset, &left_id) in left_ids.iter().enumerate() {
-                            let result_tx = result_tx.clone();
+                        let (worker_tx, worker_rx) = mpsc::sync_channel(ready_match_capacity);
+                        for &left_id in &left_ids {
+                            let worker_tx = worker_tx.clone();
                             rayon_scope.spawn(move |_| {
                                 let mut seen = CandidateSeen::new(producer_index.profiles.len());
-                                let result = collect_fast_sample_profile_matches(
+                                let result = stream_fast_sample_profile_matches(
                                     producer_index,
                                     producer_candidate_plan,
                                     producer_all_image_profiles,
                                     left_id,
                                     threshold,
                                     round_randomness,
-                                    FAST_SAMPLE_MAX_MATCHED_PROFILES_PER_LEFT,
                                     producer_sampling_buckets,
-                                    producer_contract_chains,
+                                    producer_active_buckets,
                                     &mut seen,
                                     producer_stop_ref,
+                                    producer_scored_profile_pairs,
                                     progress,
+                                    |matched| {
+                                        worker_tx
+                                            .send(Ok(matched))
+                                            .map_err(|_| DedupError::Interrupted)
+                                    },
                                 );
-                                let _ = result_tx.send((offset, result));
+                                if let Err(error) = result
+                                    && !producer_stop_ref.load(Ordering::Relaxed)
+                                {
+                                    let _ = worker_tx.send(Err(error));
+                                }
                             });
                         }
-                        drop(result_tx);
-                        let mut next = 0_usize;
-                        let mut pending = BTreeMap::new();
-                        while let Ok((offset, result)) = result_rx.recv() {
-                            pending.insert(offset, result);
-                            while let Some(result) = pending.remove(&next) {
-                                let failed = result.is_err();
-                                if batch_match_tx.send(result).is_err() || failed {
-                                    producer_stop_ref.store(true, Ordering::Relaxed);
-                                    return;
+                        drop(worker_tx);
+                        let mut ready = Vec::with_capacity(ready_match_capacity);
+                        let mut disconnected = false;
+                        'forward: while (!disconnected || !ready.is_empty())
+                            && !producer_stop_ref.load(Ordering::Relaxed)
+                        {
+                            if ready.is_empty() {
+                                match worker_rx.recv() {
+                                    Ok(Ok(matched)) => ready.push(matched),
+                                    Ok(Err(error)) => {
+                                        let _ = batch_match_tx.send(Err(error));
+                                        producer_stop_ref.store(true, Ordering::Relaxed);
+                                        break;
+                                    }
+                                    Err(_) => {
+                                        disconnected = true;
+                                        continue;
+                                    }
                                 }
-                                next += 1;
+                            }
+                            while ready.len() < ready_match_capacity {
+                                match worker_rx.try_recv() {
+                                    Ok(Ok(matched)) => ready.push(matched),
+                                    Ok(Err(error)) => {
+                                        let _ = batch_match_tx.send(Err(error));
+                                        producer_stop_ref.store(true, Ordering::Relaxed);
+                                        break 'forward;
+                                    }
+                                    Err(mpsc::TryRecvError::Empty) => break,
+                                    Err(mpsc::TryRecvError::Disconnected) => {
+                                        disconnected = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            let selected = ready
+                                .iter()
+                                .enumerate()
+                                .min_by_key(|(_, matched)| (matched.priority, matched.left_id))
+                                .map(|(index, _)| index)
+                                .expect("a non-empty ready sample buffer has a minimum");
+                            let matched = ready.swap_remove(selected);
+                            if batch_match_tx.send(Ok(matched)).is_err() {
+                                producer_stop_ref.store(true, Ordering::Relaxed);
+                                break;
                             }
                         }
                     });
@@ -2887,12 +3016,9 @@ pub fn sample_direct_releasing(
                 if ready.is_empty() && !producer_done {
                     match match_rx.recv() {
                         Ok(result) => {
-                            if let Err(error) = enqueue_fast_sample_match(
-                                result,
-                                &mut ready,
-                                &mut profile_visits,
-                                &mut scored_profile_pairs,
-                            ) {
+                            if let Err(error) =
+                                enqueue_fast_sample_match(result, &mut ready, &mut profile_visits)
+                            {
                                 consume_result = Err(error);
                                 break;
                             }
@@ -2902,12 +3028,8 @@ pub fn sample_direct_releasing(
                 }
                 if ready.len() < ready_match_capacity
                     && let Ok(result) = match_rx.try_recv()
-                    && let Err(error) = enqueue_fast_sample_match(
-                        result,
-                        &mut ready,
-                        &mut profile_visits,
-                        &mut scored_profile_pairs,
-                    )
+                    && let Err(error) =
+                        enqueue_fast_sample_match(result, &mut ready, &mut profile_visits)
                 {
                     consume_result = Err(error);
                 }
@@ -2927,8 +3049,11 @@ pub fn sample_direct_releasing(
                     let Some(ordinal) = matched.right_order.next() else {
                         return Ok(());
                     };
-                    let right_id =
-                        (ordinal != 0).then(|| matched.rights[ordinal.saturating_sub(1) as usize]);
+                    let right_id = if matched.include_clique {
+                        (ordinal != 0).then(|| matched.rights[ordinal.saturating_sub(1) as usize])
+                    } else {
+                        Some(matched.rights[ordinal as usize])
+                    };
                     let tasks = prepare_fast_sample_profile_tasks(
                         &index,
                         collector.store,
@@ -2943,6 +3068,11 @@ pub fn sample_direct_releasing(
                         &mut fallback_tasks,
                         progress,
                     )?;
+                    refresh_fast_sample_active_buckets(
+                        &collector,
+                        &sampling_buckets,
+                        &active_buckets,
+                    );
                     if matched.right_order.remaining != 0 && !collector.complete() {
                         ready.push_back(matched);
                     }
@@ -3009,7 +3139,7 @@ pub fn sample_direct_releasing(
                 .collect::<Vec<_>>();
             redistributed |= collector.redistribute_exhausted_bucket(bucket, &recipients);
         }
-        if !redistributed {
+        if !redistributed && collector.seen_contract_pairs.len() == attempted_before_round {
             break;
         }
         round += 1;
@@ -3027,7 +3157,7 @@ pub fn sample_direct_releasing(
     let result = MetadataFastSampleResult {
         intra_chain: collector.intra_chain,
         cross_chain: collector.cross_chain,
-        scored_profile_pairs,
+        scored_profile_pairs: scored_profile_pairs.load(Ordering::Relaxed),
         profile_visits,
         planned_profile_visits,
         sample_seed,
@@ -3792,6 +3922,7 @@ fn build_image_witnesses(
     progress: &dyn ProgressObserver,
 ) -> Result<ImageWitnessIndex, DedupError> {
     let mut ranges = AHashMap::new();
+    let mut chain_summaries = Vec::new();
     let mut image_members = Vec::new();
     progress.begin_phase("image_witnesses", Some(index.profiles.len() as u64));
     let mut completed = 0_u64;
@@ -3800,6 +3931,7 @@ fn build_image_witnesses(
         for (anchor_index, &anchor) in anchors.iter().enumerate() {
             let start = u32::try_from(image_members.len())
                 .map_err(|_| DedupError::invalid("metadata", "too many image witnesses"))?;
+            let mut chain_summary = Vec::new();
             for &member in index.members(profile) {
                 let nft_id = if let Some(nft_id) = member.nft_id {
                     debug_assert_eq!(anchors.len(), 1);
@@ -3830,12 +3962,32 @@ fn build_image_witnesses(
                 };
                 if store.nfts[nft_id as usize].image_uri_id.is_some() {
                     image_members.push((member.contract_id, nft_id));
+                    update_fast_sample_chain_summary(
+                        &mut chain_summary,
+                        store.contracts[member.contract_id as usize].chain_id,
+                        member.contract_id,
+                    );
                 }
             }
             let end = u32::try_from(image_members.len())
                 .map_err(|_| DedupError::invalid("metadata", "too many image witnesses"))?;
             if start != end {
-                ranges.insert((profile_id as u32, anchor.0, anchor.1), (start, end));
+                let summary_start = u32::try_from(chain_summaries.len()).map_err(|_| {
+                    DedupError::invalid("metadata", "too many image witness chain summaries")
+                })?;
+                chain_summaries.extend(chain_summary);
+                let summary_end = u32::try_from(chain_summaries.len()).map_err(|_| {
+                    DedupError::invalid("metadata", "too many image witness chain summaries")
+                })?;
+                ranges.insert(
+                    (profile_id as u32, anchor.0, anchor.1),
+                    ImageWitnessRange {
+                        member_start: start,
+                        member_end: end,
+                        summary_start,
+                        summary_end,
+                    },
+                );
             }
         }
         completed += 1;
@@ -3850,6 +4002,7 @@ fn build_image_witnesses(
     Ok(ImageWitnessIndex {
         ranges,
         members: image_members.into_boxed_slice(),
+        chain_summaries: chain_summaries.into_boxed_slice(),
     })
 }
 
@@ -8505,7 +8658,7 @@ mod tests {
         let mut visited = Vec::new();
         visit_fast_sample_sources(&sources, &mut seen, 0, |profile| {
             visited.push(profile);
-            Ok(())
+            Ok(true)
         })
         .unwrap();
         visited.sort_unstable();
@@ -8514,62 +8667,152 @@ mod tests {
     }
 
     #[test]
-    fn fast_sample_matching_profile_reservoir_is_bounded_and_randomized() {
+    fn fast_sample_matching_profiles_are_streamed_without_a_global_reservoir() {
         let index = indexed_scoring_index(&["same"], &[0, 0, 0, 0, 0, 0], &[0, 0, 0, 0, 0, 0]);
         let all_profiles = (0..index.profiles.len() as u32).collect::<Vec<_>>();
         let mut seen = CandidateSeen::new(index.profiles.len());
-        let matches = collect_fast_sample_profile_matches(
+        let buckets = [(FastSampleBucket::Intra(0), 1)];
+        let active_buckets = [AtomicBool::new(true)];
+        let scored = AtomicU64::new(0);
+        let mut chunks = Vec::new();
+        stream_fast_sample_profile_matches(
             &index,
             &CrossProfilePlan::Full,
             &all_profiles,
             0,
             1.0,
             SamplingRandomness::for_test(113).into(),
-            3,
-            &[(FastSampleBucket::Intra(0), 1)],
-            &[],
+            &buckets,
+            &active_buckets,
             &mut seen,
             &AtomicBool::new(false),
+            &scored,
             &NoopProgress,
+            |chunk| {
+                chunks.push(chunk);
+                Ok(())
+            },
         )
         .unwrap();
-
-        assert_eq!(matches.scored, 5);
-        assert_eq!(matches.rights.len(), 3);
-        assert_eq!(matches.right_order.remaining, 4);
-        assert!(matches.rights.iter().all(|&right| right > 0));
+        assert_eq!(scored.load(Ordering::Relaxed), 5);
         assert_eq!(
-            matches.rights.iter().copied().collect::<HashSet<_>>().len(),
-            3
+            chunks.iter().map(|chunk| chunk.rights.len()).sum::<usize>(),
+            5
         );
+        assert_eq!(
+            chunks.iter().filter(|chunk| chunk.include_clique).count(),
+            1
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .filter(|chunk| chunk.counts_profile_visit)
+                .count(),
+            1
+        );
+        assert!(
+            chunks
+                .iter()
+                .flat_map(|chunk| &chunk.rights)
+                .all(|&right| right > 0)
+        );
+        assert_eq!(
+            chunks
+                .iter()
+                .flat_map(|chunk| &chunk.rights)
+                .copied()
+                .collect::<HashSet<_>>()
+                .len(),
+            5
+        );
+        assert!(chunks.iter().all(|chunk| {
+            chunk.right_order.remaining
+                == chunk
+                    .rights
+                    .len()
+                    .saturating_add(usize::from(chunk.include_clique)) as u64
+        }));
     }
 
     #[test]
-    fn fast_sample_matching_profile_reservoir_preserves_rare_chain_buckets() {
+    fn fast_sample_stream_preserves_profiles_for_rare_chain_buckets() {
         let index = indexed_scoring_index(&["same"], &[0, 0, 0, 0, 0, 0], &[0, 0, 0, 0, 0, 1]);
         let all_profiles = (0..index.profiles.len() as u32).collect::<Vec<_>>();
         let mut seen = CandidateSeen::new(index.profiles.len());
-        let matches = collect_fast_sample_profile_matches(
+        let buckets = [
+            (FastSampleBucket::Intra(0), 1),
+            (FastSampleBucket::Cross(0, 1), 1),
+        ];
+        let active_buckets = [AtomicBool::new(true), AtomicBool::new(true)];
+        let scored = AtomicU64::new(0);
+        let mut chunks = Vec::new();
+        stream_fast_sample_profile_matches(
             &index,
             &CrossProfilePlan::Full,
             &all_profiles,
             0,
             1.0,
             SamplingRandomness::for_test(127).into(),
-            1,
-            &[
-                (FastSampleBucket::Intra(0), 1),
-                (FastSampleBucket::Cross(0, 1), 1),
-            ],
-            &[],
+            &buckets,
+            &active_buckets,
             &mut seen,
             &AtomicBool::new(false),
+            &scored,
             &NoopProgress,
+            |chunk| {
+                chunks.push(chunk);
+                Ok(())
+            },
         )
         .unwrap();
 
-        assert!(matches.rights.contains(&5));
-        assert!(matches.rights.len() <= 2);
+        assert!(chunks.iter().any(|chunk| chunk.rights.contains(&5)));
+    }
+
+    #[test]
+    fn fast_sample_stream_stops_large_posting_when_buckets_finish() {
+        let profile_count = FAST_SAMPLE_SHUFFLE_WINDOW + FAST_SAMPLE_SCORE_CHUNK + 257;
+        let index =
+            indexed_scoring_index(&["same"], &vec![0; profile_count], &vec![0; profile_count]);
+        let all_profiles = (0..index.profiles.len() as u32).collect::<Vec<_>>();
+        let mut seen = CandidateSeen::new(index.profiles.len());
+        let buckets = [(FastSampleBucket::Intra(0), 1)];
+        let active_buckets = [AtomicBool::new(true)];
+        let scored = AtomicU64::new(0);
+        let mut chunks = Vec::new();
+        stream_fast_sample_profile_matches(
+            &index,
+            &CrossProfilePlan::Full,
+            &all_profiles,
+            0,
+            1.0,
+            SamplingRandomness::for_test(131).into(),
+            &buckets,
+            &active_buckets,
+            &mut seen,
+            &AtomicBool::new(false),
+            &scored,
+            &NoopProgress,
+            |chunk| {
+                active_buckets[0].store(false, Ordering::Relaxed);
+                chunks.push(chunk);
+                Ok(())
+            },
+        )
+        .unwrap();
+
+        assert_eq!(chunks.len(), 1);
+        assert_eq!(
+            scored.load(Ordering::Relaxed),
+            FAST_SAMPLE_SCORE_CHUNK as u64
+        );
+        assert_eq!(chunks[0].rights.len(), FAST_SAMPLE_SCORE_CHUNK);
+        assert!(
+            chunks[0]
+                .rights
+                .iter()
+                .any(|&right| right > FAST_SAMPLE_SCORE_CHUNK as u32)
+        );
     }
 
     #[test]
@@ -9931,6 +10174,47 @@ mod tests {
             &same_right,
             bucket
         ));
+    }
+
+    #[test]
+    fn fast_sample_activates_a_bucket_that_gains_a_redistributed_target() {
+        let evm = AHashSet::new();
+        let store = EntityStore::with_options(8, &evm);
+        let bucket = FastSampleBucket::Intra(0);
+        let mut downloads = ImmediateDownloadSink::default();
+        let mut collector = FastSampleCollector {
+            store: &store,
+            bucket_targets: vec![(bucket, 1)],
+            accepted_by_bucket: AHashMap::new(),
+            redistribution_ordinal: 0,
+            randomness: SamplingRandomness::for_test(139).into(),
+            seen_contract_pairs: AHashSet::new(),
+            intra_chain: Vec::new(),
+            cross_chain: Vec::new(),
+            downloads: &mut downloads,
+            next_candidate_id: 1,
+            attempted_pairs: 0,
+            pending: Vec::new(),
+            pending_buckets: AHashMap::new(),
+            in_flight: AHashMap::new(),
+            completed: AHashMap::new(),
+            commit_order_by_bucket: AHashMap::new(),
+            viable_by_bucket: AHashMap::new(),
+            uncommitted_by_bucket: AHashMap::new(),
+            uncommitted_total: 0,
+            physical_outstanding: 0,
+            max_physical_outstanding: fast_sample_max_physical_outstanding(),
+            accepted_candidate_ids: Vec::new(),
+        };
+        let original_targets = [(bucket, 0)];
+        let active = [AtomicBool::new(false)];
+
+        refresh_fast_sample_active_buckets(&collector, &original_targets, &active);
+        assert!(active[0].load(Ordering::Relaxed));
+
+        collector.accepted_by_bucket.insert(bucket, 1);
+        refresh_fast_sample_active_buckets(&collector, &original_targets, &active);
+        assert!(!active[0].load(Ordering::Relaxed));
     }
 
     #[test]
